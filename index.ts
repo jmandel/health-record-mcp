@@ -1,34 +1,33 @@
 #!/usr/bin/env bun
 
 // --- Core MCP/Bun Imports ---
+import { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
+import { InsufficientScopeError, InvalidClientError, InvalidGrantError, InvalidRequestError, InvalidTokenError, OAuthError, ServerError, UnsupportedGrantTypeError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { AuthorizationParams, OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
+import { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import {
-    CallToolRequestSchema, CallToolResultSchema,
-    ErrorCode, ListToolsRequestSchema, ListToolsResult, McpError,
-    Tool, CreateMessageRequestSchema, ServerCapabilities, Implementation, InitializeResult,
-    ListPromptsResult, ListResourcesResult, ListResourceTemplatesResult, ReadResourceResult,
-    Result, ResultSchema, GetPromptResultSchema, CompatibilityCallToolResultSchema
-} from "@modelcontextprotocol/sdk/types.js";
-import { OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
-import { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
-import { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { InvalidGrantError, InvalidTokenError, ServerError, UnsupportedGrantTypeError, OAuthError, InvalidClientError, InvalidRequestError, InsufficientScopeError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { OAuthClientInformationFull, OAuthClientMetadata, OAuthTokenRevocationRequest, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import {
+    ErrorCode,
+    Implementation,
+    McpError,
+    ServerCapabilities
+} from "@modelcontextprotocol/sdk/types.js";
 
 import { Database } from 'bun:sqlite';
-import { convert as htmlToText } from 'html-to-text';
-import { XMLParser } from 'fast-xml-parser';
-import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
-import { v4 as uuidv4 } from 'uuid';
-import pkceChallenge from 'pkce-challenge';
-import { verifyChallenge } from 'pkce-challenge'; // Import verifyChallenge
-import dotenv from 'dotenv'; // Import dotenv
-import express, { Request, Response, NextFunction, RequestHandler } from 'express'; // Import express types
 import cors from 'cors'; // Import cors
+import dotenv from 'dotenv'; // Import dotenv
+import express, { Request, Response } from 'express'; // Import express types
+import { XMLParser } from 'fast-xml-parser';
+import { convert as htmlToText } from 'html-to-text';
 import http from 'http'; // Import http for server creation
+import _ from 'lodash'; // Import lodash
+import pkceChallenge, { verifyChallenge } from 'pkce-challenge';
+import { v4 as uuidv4 } from 'uuid';
+import vm from 'vm'; // Import Node.js vm module for sandboxing
+import { z } from 'zod';
 
 // --- Add Type Declaration for req.auth ---
 declare module "express-serve-static-core" {
@@ -52,6 +51,22 @@ let EHR_AUTH_URL = Bun.env.EHR_AUTH_URL;
 let EHR_TOKEN_URL = Bun.env.EHR_TOKEN_URL;
 let EHR_FHIR_URL = Bun.env.EHR_FHIR_URL;
 let MCP_SERVER_EHR_CLIENT_ID = Bun.env.MCP_SERVER_EHR_CLIENT_ID;
+
+// --- SQLite Persistence Configuration ---
+const SQLITE_PERSISTENCE_DIR = Bun.env.SQLITE_PERSISTENCE_DIR || "./data";
+const SQLITE_PERSISTENCE_ENABLED = Bun.env.SQLITE_PERSISTENCE_ENABLED?.toLowerCase() === 'true';
+
+// --- Create persistence directory if enabled ---
+if (SQLITE_PERSISTENCE_ENABLED) {
+    try {
+        // Use Node's fs.mkdir instead of Bun.mkdir
+        await import('fs/promises').then(fs => fs.mkdir(SQLITE_PERSISTENCE_DIR, { recursive: true }));
+        console.log(`[CONFIG] SQLite persistence directory created/verified: ${SQLITE_PERSISTENCE_DIR}`);
+    } catch (error) {
+        console.error(`[CONFIG] Error creating SQLite persistence directory: ${error}`);
+        process.exit(1);
+    }
+}
 
 const MCP_SERVER_BASE_URL = Bun.env.MCP_SERVER_BASE_URL || "http://localhost:3001";
 const MCP_SERVER_PORT = parseInt(Bun.env.MCP_SERVER_PORT || "3001");
@@ -167,6 +182,114 @@ const registeredMcpClients = new Map<string, OAuthClientInformationFull>();
 const activeSseTransports = new Map<string, { transport: SSEServerTransport; mcpAccessToken: string; authInfo: AuthInfo }>();
 
 // --- FHIR Data Fetching ---
+
+// --- START Attachment Processing Helpers (Moved here) ---
+interface AttachmentLike {
+    contentType?: string;
+    data?: string;
+    url?: string;
+    // Add other potential fields if needed, e.g., title, size, hash
+}
+
+// Structure for processed attachments returned by fetchEhrData
+interface ProcessedAttachment {
+    resourceType: string;
+    resourceId: string;
+    path: string;
+    contentType: string;
+    json: string; // JSON string of the original attachment node
+    contentRaw: Buffer | null;
+    contentPlaintext: string | null;
+}
+
+// Known FHIR paths that contain attachments
+const KNOWN_ATTACHMENT_PATHS = new Map<string, string[]>([
+    ['DocumentReference', ['content.attachment']],
+    ['Binary', ['']],  // The entire resource is an attachment
+    ['Media', ['content']],
+    ['DiagnosticReport', ['presentedForm']],
+    ['Observation', ['valueAttachment']],
+    ['Patient', ['photo']],
+    ['Practitioner', ['photo']],
+    ['Organization', ['photo']],
+    ['Communication', ['payload.content.attachment']],
+    ['CommunicationRequest', ['payload.content.attachment']],
+    ['Contract', ['legal.contentAttachment', 'rule.contentAttachment']]
+]);
+
+// Helper to fetch content from attachment URLs
+async function fetchAttachmentContent(attachmentUrl: string, fhirBaseUrl: string, accessToken: string): Promise<{ contentRaw: Buffer, contentType: string | null }> {
+    // Resolve potential relative URLs (e.g., "Binary/123")
+    const resolvedUrl = new URL(attachmentUrl, fhirBaseUrl);
+    console.log(`[ATTACHMENT Fetch] GET ${resolvedUrl}`);
+    const headers = new Headers({ "Authorization": `Bearer ${accessToken}`, "Accept": "*/*" }); // Accept any content type
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout for attachments
+
+    try {
+        const response = await fetch(resolvedUrl.toString(), { headers: headers, signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!response.ok) {
+            const errorBody = await response.text();
+            console.error(`[ATTACHMENT Fetch] Error ${response.status} from ${resolvedUrl}: ${errorBody}`);
+            throw new Error(`Attachment fetch failed with status ${response.status} for ${resolvedUrl}`);
+        }
+        const contentRaw = Buffer.from(await response.arrayBuffer());
+        const contentType = response.headers.get("Content-Type"); // Get type from header
+        console.log(`[ATTACHMENT Fetch] Success (${contentRaw.length} bytes, Type: ${contentType || 'N/A'}) for ${resolvedUrl}`);
+        return { contentRaw, contentType };
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if ((error as any).name === 'AbortError') {
+            console.error(`[ATTACHMENT Fetch] Timeout fetching ${resolvedUrl}`);
+            throw new Error(`Timeout fetching attachment: ${resolvedUrl}`);
+        }
+        console.error(`[ATTACHMENT Fetch] Network/Fetch error for ${resolvedUrl}:`, error);
+        throw error; // Re-throw original error
+    }
+}
+
+// Get value at path from object
+function getValueAtPath(obj: any, path: string): any | any[] | undefined {
+    if (!obj || !path) return undefined;
+    if (path === '') return obj; // Special case for Binary resources
+
+    const parts = path.split('.');
+    let current: any = obj;
+
+    for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        if (current === null || current === undefined) return undefined;
+
+        // Handle array indexing within path (e.g., content[0].attachment)
+        const arrayMatch = part.match(/^(.+)\[(\d+)\]$/);
+        if (arrayMatch) {
+            const arrayKey = arrayMatch[1];
+            const index = parseInt(arrayMatch[2], 10);
+            if (!current[arrayKey] || !Array.isArray(current[arrayKey]) || index >= current[arrayKey].length) {
+                return undefined; // Array or index out of bounds
+            }
+            current = current[arrayKey][index];
+        } else {
+            current = current[part];
+        }
+
+        // If we encounter an array midway and it's not the last part, it's ambiguous.
+        // However, for attachment paths, we usually expect a single object or an array of objects at the *end*.
+        // Let's refine the logic: getValueAtPath primarily targets a specific node or an array of nodes.
+        // If the target path *ends* in an array, return the filtered array.
+        if (Array.isArray(current) && i === parts.length - 1) {
+            return current.filter(item => item !== null && item !== undefined);
+        }
+    }
+
+    // If the final result is not an array, wrap it in one for consistent processing,
+    // unless it's undefined/null.
+    return current ? [current] : [];
+}
+
+// --- END Attachment Processing Helpers ---
+
 async function fetchFhirResource(url: string, accessToken: string): Promise<any> {
     console.log(`[FHIR Fetch] GET ${url}`);
     const headers = new Headers({ "Authorization": `Bearer ${accessToken}`, "Accept": "application/fhir+json" });
@@ -218,11 +341,13 @@ async function fetchAllPages(initialUrl: string, accessToken: string): Promise<a
     return resources;
 }
 
-async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patientId: string): Promise<Record<string, any[]>> {
+// Modified to fetch and process attachments internally
+async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patientId: string): Promise<{ record: Record<string, any[]>; attachments: ProcessedAttachment[] }> {
     console.log(`[DATA] Fetching specific FHIR resources from ${fhirBaseUrl} for Patient: ${patientId}`);
     if (!patientId) throw new Error("Patient ID is required to fetch data.");
 
     const record: Record<string, any[]> = {};
+    const processedAttachments: ProcessedAttachment[] = []; // Store processed attachments here
     let totalFetched = 0;
     const patientReadUrl = `${fhirBaseUrl}/Patient/${patientId}`;
     const searchQueries: { resourceType: string; params?: Record<string, string> }[] = [
@@ -263,166 +388,767 @@ async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patient
     }));
 
     console.log(`[DATA] Completed fetching. Total resources retrieved: ${totalFetched} across ${Object.keys(record).length} types.`);
-    return record;
+
+    // --- START Internal Attachment Processing Logic ---
+    console.log("[DATA:ATTACHMENT] Starting attachment processing within fetchEhrData...");
+    const xmlParser = new XMLParser({ ignoreAttributes: true, textNodeName: "_text", parseTagValue: false, trimValues: true, stopNodes: ["*.html"] });
+    let processedCount = 0;
+    let processingErrorCount = 0;
+    let fetchErrorCount = 0;
+
+    // Internal helper to process a single attachment node
+    async function processSingleAttachmentNode(node: AttachmentLike, resourceType: string, resourceId: string, path: string): Promise<void> {
+        let contentRaw: Buffer | null = null;
+        let contentPlaintext: string | null = null;
+        let finalContentType = (node.contentType || 'application/octet-stream').toLowerCase();
+
+        try {
+            if (node.url) {
+                console.log(`[DATA:ATTACHMENT Process] Found URL: ${node.url} in ${resourceType}/${resourceId} at ${path}`);
+                try {
+                    const fetched = await fetchAttachmentContent(node.url, fhirBaseUrl, ehrAccessToken);
+                    contentRaw = fetched.contentRaw;
+                    if (fetched.contentType) {
+                        finalContentType = fetched.contentType.split(';')[0].trim().toLowerCase();
+                        console.log(`[DATA:ATTACHMENT Process] Using fetched content type: ${finalContentType}`);
+                    } else {
+                        console.log(`[DATA:ATTACHMENT Process] Fetched content type missing, using type from resource: ${finalContentType}`);
+                    }
+                } catch (fetchErr) {
+                    console.error(`[DATA:ATTACHMENT Process] Failed to fetch content from ${node.url}:`, fetchErr);
+                    contentPlaintext = `[Error fetching external content at ${node.url}: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}]`;
+                    fetchErrorCount++;
+                }
+            } else if (node.data) {
+                console.log(`[DATA:ATTACHMENT Process] Found inline data in ${resourceType}/${resourceId} at ${path}`);
+                contentRaw = Buffer.from(node.data, 'base64');
+                finalContentType = (node.contentType || 'application/octet-stream').toLowerCase();
+            } else {
+                console.warn(`[DATA:ATTACHMENT Process] Attachment node in ${resourceType}/${resourceId} at ${path} has neither URL nor data.`);
+                contentPlaintext = '[Attachment has no data or URL]';
+            }
+
+            if (contentRaw !== null && contentPlaintext === null) {
+                if (finalContentType.startsWith('text/plain')) {
+                    contentPlaintext = contentRaw.toString('utf8');
+                } else if (finalContentType.startsWith('text/html')) {
+                    try {
+                        contentPlaintext = htmlToText(contentRaw.toString('utf8'), { wordwrap: false });
+                    } catch (htmlErr) {
+                        console.error(`[DATA:ATTACHMENT Process] HTML parsing error in ${resourceType}/${resourceId} at ${path}:`, htmlErr);
+                        contentPlaintext = '[Error parsing HTML]';
+                        processingErrorCount++;
+                    }
+                } else if (finalContentType.includes('xml')) {
+                    try {
+                        const parsed = xmlParser.parse(contentRaw.toString('utf8'));
+                        const extractText = (n: any): string => {
+                            if (typeof n === 'string') return n + " ";
+                            if (typeof n !== 'object' || n === null) return "";
+                            return Object.values(n).map(extractText).join("");
+                        };
+                        contentPlaintext = extractText(parsed).replace(/\s+/g, ' ').trim();
+                        if (!contentPlaintext) contentPlaintext = '[Empty XML content]';
+                    } catch (xmlErr) {
+                        console.error(`[DATA:ATTACHMENT Process] XML parsing error in ${resourceType}/${resourceId} at ${path}:`, xmlErr);
+                        contentPlaintext = '[Error parsing XML]';
+                        processingErrorCount++;
+                    }
+                } else if (finalContentType === 'application/rtf') {
+                    contentPlaintext = '[RTF content not processed]';
+                } else {
+                    contentPlaintext = `[Binary content type: ${finalContentType}]`;
+                }
+            }
+
+            // Add to the results array
+            processedAttachments.push({
+                resourceType,
+                resourceId,
+                path,
+                contentType: finalContentType,
+                json: JSON.stringify(node),
+                contentRaw,
+                contentPlaintext
+            });
+            processedCount++;
+
+        } catch (processError) {
+            console.error(`[DATA:ATTACHMENT Process] Error processing node in ${resourceType}/${resourceId} at ${path}:`, processError);
+            processingErrorCount++;
+            // Add error marker to results
+            processedAttachments.push({
+                resourceType, resourceId, path,
+                contentType: finalContentType,
+                json: JSON.stringify({ error: `Processing failed: ${processError}` }),
+                contentRaw: null,
+                contentPlaintext: `[Error during attachment processing: ${processError}]`
+            });
+        }
+    }
+
+    // Internal recursive function to find attachments
+    async function findAndProcessAttachments(obj: any, resourceType: string, resourceId: string, currentPath: string = '', processedPaths: Set<string>): Promise<void> {
+        if (!obj || typeof obj !== 'object') return;
+
+        const knownPathsForType = KNOWN_ATTACHMENT_PATHS.get(resourceType);
+        if (knownPathsForType) {
+            for (const knownPath of knownPathsForType) {
+                if (processedPaths.has(knownPath)) continue;
+                const attachments = getValueAtPath(obj, knownPath);
+                if (Array.isArray(attachments)) {
+                    for (const attachment of attachments) {
+                        if (attachment && typeof attachment === 'object') {
+                            await processSingleAttachmentNode(attachment, resourceType, resourceId, knownPath);
+                            processedPaths.add(knownPath);
+                        }
+                    }
+                }
+            }
+        }
+
+        const isAttachmentLike = (node: any): node is AttachmentLike =>
+            node && typeof node === 'object' && node.contentType && (node.data || node.url);
+
+        if (isAttachmentLike(obj) && !processedPaths.has(currentPath)) {
+            console.log(`[DATA:ATTACHMENT Heuristic] Found potential attachment at path: ${currentPath || '<root>'}`);
+            await processSingleAttachmentNode(obj, resourceType, resourceId, currentPath || 'content');
+            processedPaths.add(currentPath);
+            return;
+        }
+
+        if (Array.isArray(obj)) {
+            await Promise.all(obj.map((item, index) =>
+                findAndProcessAttachments(item, resourceType, resourceId, `${currentPath}[${index}]`, processedPaths)
+            ));
+        } else if (!isAttachmentLike(obj)) {
+            await Promise.all(Object.entries(obj).map(([key, value]) => {
+                const newPath = currentPath ? `${currentPath}.${key}` : key;
+                if (processedPaths.has(newPath)) return Promise.resolve();
+                return findAndProcessAttachments(value, resourceType, resourceId, newPath, processedPaths);
+            }));
+        }
+    }
+
+    // Iterate through the fetched record and process attachments
+    try {
+        await Promise.allSettled(Object.entries(record).map(async ([resourceType, resources]) => {
+            for (const resource of resources) {
+                if (resource && resource.id) {
+                    const processedPaths = new Set<string>();
+                    try {
+                        await findAndProcessAttachments(resource, resourceType, resource.id, '', processedPaths);
+                    } catch (resourceErr) {
+                        console.error(`[DATA:ATTACHMENT] Error processing attachments for ${resourceType}/${resource.id}:`, resourceErr);
+                        processingErrorCount++;
+                    }
+                } else {
+                    // console.warn(`[DATA:ATTACHMENT] Skipping resource of type ${resourceType} because it lacks an ID or is invalid.`);
+                }
+            }
+        }));
+        console.log(`[DATA:ATTACHMENT] Processing complete. Found: ${processedCount}, URL Fetch Errors: ${fetchErrorCount}, Other Processing Errors: ${processingErrorCount}`);
+    } catch (err) {
+        console.error("[DATA:ATTACHMENT] Fatal error during attachment processing loop:", err);
+        // Decide if this should throw or just log
+    }
+    // --- END Internal Attachment Processing Logic ---
+
+    return { record, attachments: processedAttachments };
 }
 
 // --- Attachment Processing ---
-function processAttachments(record: Record<string, any[]>): void {
-    console.log("[ATTACHMENT] Starting attachment processing...");
-    const xmlParser = new XMLParser({ ignoreAttributes: true, textNodeName: "_text", parseTagValue: false, trimValues: true, stopNodes: ["*.html"], });
-    const resourcesToProcess = record["DocumentReference"] || [];
-    let processedCount = 0; let errorCount = 0;
+/* --- DELETED: Standalone processAttachments function --- */
+/*
+interface AttachmentLike {
+    contentType?: string;
+// ... (rest of deleted function)
+}
+*/
 
-    for (const resource of resourcesToProcess) {
-        if (!resource.content || !Array.isArray(resource.content)) continue;
-        let extractedTexts: string[] = [];
-        for (const contentItem of resource.content) {
-            if (!contentItem.attachment) continue;
-            const attachment = contentItem.attachment;
-            let textContent: string | null = null; let rawData: Buffer | null = null;
-            const contentType = attachment.contentType?.toLowerCase() || '';
-            try {
-                if (attachment.data) { rawData = Buffer.from(attachment.data, 'base64'); }
-                else if (attachment.url) { console.warn(`[ATTACHMENT] URL fetching skip: ${attachment.url}`); textContent = `[Attachment URL not fetched: ${attachment.url}]`; }
-                if (rawData && textContent === null) {
-                    if (contentType.startsWith('text/plain')) { textContent = rawData.toString('utf8'); }
-                    else if (contentType.startsWith('text/html')) { try { textContent = htmlToText(rawData.toString('utf8'), { wordwrap: false }); } catch (htmlErr) { console.error(`[ATTACHMENT] HTML err ${resource.id}:`, htmlErr); textContent = `[Error parsing HTML]`; errorCount++; } }
-                    else if (contentType.includes('xml')) { try { const pXml = xmlParser.parse(rawData.toString('utf8')); const eTxt = (n: any): string => { if (typeof n === 'string') return n + " "; if (typeof n !== 'object' || n === null) return ""; return Object.values(n).map(eTxt).join(""); }; textContent = eTxt(pXml).replace(/\s+/g, ' ').trim(); } catch (xmlErr) { textContent = `[Error parsing XML]`; console.error(xmlErr); errorCount++; } }
-                    else if (contentType === 'application/rtf') { textContent = `[RTF Placeholder]`; console.warn(`RTF skipped ${resource.id}`); }
-                    else { textContent = `[Unsupported type: ${contentType}]`; console.warn(`Unsupported type: ${contentType} in ${resource.id}`); }
-                }
-            } catch (decodeError) { textContent = `[Error processing data]`; console.error(decodeError); errorCount++; }
-            if (textContent) { extractedTexts.push(textContent); processedCount++; }
-        }
-        if (extractedTexts.length > 0) resource._extractedAttachmentText = extractedTexts.join("\n\n---\n\n");
-    }
-    console.log(`[ATTACHMENT] Complete. Processed: ${processedCount}, Errors: ${errorCount}`);
+// --- SQLite Persistence Functions ---
+async function getSqliteFilePath(patientId: string): Promise<string> {
+    // Get FHIR server origin
+    const fhirUrl = new URL(EHR_FHIR_URL!);
+    // Sanitize origin: remove protocol, replace non-alphanumeric chars with underscore
+    const sanitizedOrigin = fhirUrl.origin
+        .replace(/^https?:\/\//, '')  // Remove protocol
+        .replace(/[^a-zA-Z0-9]/g, '_'); // Replace non-alphanumeric with underscore
+    
+    // Sanitize patient ID (just in case)
+    const sanitizedPatientId = patientId.replace(/[^a-zA-Z0-9]/g, '_');
+    
+    return `${SQLITE_PERSISTENCE_DIR}/${sanitizedOrigin}__${sanitizedPatientId}.sqlite`;
 }
 
-// --- SQLite Population ---
-async function populateSqlite(record: Record<string, any[]>, db: Database): Promise<void> {
-    console.log("[SQLITE] Populating in-memory SQLite DB...");
+async function loadSqliteFromDisk(patientId: string): Promise<Database | null> {
+    if (!SQLITE_PERSISTENCE_ENABLED) return null;
+    
+    const filePath = await getSqliteFilePath(patientId);
+    try {
+        const fileExists = await Bun.file(filePath).exists();
+        if (!fileExists) {
+            console.log(`[SQLITE] No existing database file found for patient ${patientId}`);
+            return null;
+        }
+
+        console.log(`[SQLITE] Loading database from disk for patient ${patientId}`);
+        const db = new Database(filePath);
+        
+        // Verify the database has expected tables
+        const tables = await db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fhir_%';").all() as { name: string }[];
+        if (tables.length === 0) {
+            console.warn(`[SQLITE] Database file exists but contains no FHIR tables. Creating new database.`);
+            db.close();
+            return null;
+        }
+        
+        return db;
+    } catch (error) {
+        console.error(`[SQLITE] Error loading database from disk:`, error);
+        return null;
+    }
+}
+
+async function saveSqliteToDisk(patientId: string, db: Database): Promise<void> {
+    if (!SQLITE_PERSISTENCE_ENABLED) return;
+    
+    const filePath = await getSqliteFilePath(patientId);
+    try {
+        console.log(`[SQLITE] Saving database to disk for patient ${patientId}`);
+        
+        // Create a new database file
+        const diskDb = new Database(filePath);
+        
+        // Copy schema and data
+        const tables = await db.query("SELECT name, sql FROM sqlite_master WHERE type='table' AND (name LIKE 'fhir_%' OR name = 'attachments');").all() as { name: string; sql: string }[];
+        
+        diskDb.exec('BEGIN TRANSACTION;');
+        try {
+            // First drop any existing tables
+            for (const table of tables) {
+                diskDb.exec(`DROP TABLE IF EXISTS "${table.name}";`);
+            }
+            
+            // Then recreate tables and copy data
+            for (const table of tables) {
+                // Recreate table
+                diskDb.exec(table.sql);
+                
+                // Copy data
+                const data = await db.query(`SELECT * FROM "${table.name}";`).all() as { id: string; resource_json: string }[];
+                if (data.length > 0) {
+                    const columnNames = Object.keys(data[0]).join(', ');
+                    const placeholders = Object.keys(data[0]).map(() => '?').join(', ');
+                    const stmt = diskDb.prepare(`INSERT INTO "${table.name}" (${columnNames}) VALUES (${placeholders})`);
+                    for (const row of data) {
+                        stmt.run(...Object.values(row));
+                    }
+                    stmt.finalize();
+                }
+            }
+            diskDb.exec('COMMIT;');
+            console.log(`[SQLITE] Successfully saved database to ${filePath}`);
+        } catch (error) {
+            console.error(`[SQLITE] Error during disk save transaction:`, error);
+            diskDb.exec('ROLLBACK;');
+            throw error;
+        } finally {
+            // Close the disk database
+            diskDb.close();
+        }
+    } catch (error) {
+        console.error(`[SQLITE] Error saving database to disk:`, error);
+        throw error;
+    }
+}
+
+// Simplified function signature: Takes processed data directly
+async function populateSqlite(data: { record: Record<string, any[]>; attachments: ProcessedAttachment[] }, db: Database, patientId?: string): Promise<void> {
+    console.log("[SQLITE] Populating SQLite DB from processed data...");
+    const { record, attachments } = data;
     const resourceTypes = Object.keys(record);
+
     db.exec('BEGIN TRANSACTION;');
     try {
+        // Drop all existing FHIR tables and attachments table
+        const tables = await db.query("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'fhir_%' OR name = 'attachments');").all() as { name: string }[];
+        for (const table of tables) {
+            db.exec(`DROP TABLE IF EXISTS "${table.name}";`);
+        }
+        console.log("[SQLITE] Dropped existing tables.");
+
+        // 1. Create tables and populate main resources
         for (const resourceType of resourceTypes) {
             const safeTableName = `fhir_${resourceType.replace(/[^a-zA-Z0-9_]/g, '_')}`;
-            db.exec(`DROP TABLE IF EXISTS "${safeTableName}";`);
             db.exec(`CREATE TABLE "${safeTableName}" (id TEXT PRIMARY KEY, resource_json TEXT NOT NULL);`);
             const stmt = db.prepare(`INSERT INTO "${safeTableName}" (id, resource_json) VALUES (?, ?)`);
             let count = 0;
             for (const resource of record[resourceType]) {
-                if (resource.id) {
-                    try { stmt.run(resource.id, JSON.stringify(resource)); count++; }
-                    catch (insertErr: any) { if (insertErr?.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') { console.warn(`[SQLITE] Duplicate ID '${resource.id}' for ${resourceType}. Skipping.`); } else { throw insertErr; } }
-                } else { console.warn(`[SQLITE] Resource ${resourceType} missing ID, skipping.`); }
+                if (resource && resource.id) { // Check resource validity
+                    try {
+                        stmt.run(resource.id, JSON.stringify(resource));
+                        count++;
+                    } catch (insertErr: any) {
+                        if (insertErr?.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+                            console.warn(`[SQLITE] Duplicate ID '${resource.id}' for ${resourceType}. Skipping.`);
+                        } else {
+                            throw insertErr;
+                        }
+                    }
+                } else {
+                    console.warn(`[SQLITE] Resource ${resourceType} missing ID or invalid, skipping.`);
+                }
             }
             stmt.finalize();
             console.log(`[SQLITE] Inserted ${count} resources into ${safeTableName}.`);
         }
+
+        // 2. Create and populate attachments table from processed data
+        console.log(`[SQLITE] Populating attachments table with ${attachments.length} entries...`);
+        db.exec(`
+            CREATE TABLE attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                content_type TEXT,
+                json TEXT NOT NULL,
+                content_raw BLOB,
+                content_plaintext TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(resource_type, resource_id, path, json)
+            )
+        `);
+
+        if (attachments.length > 0) {
+            const attachStmt = db.prepare(`
+                INSERT OR REPLACE INTO attachments (
+                    resource_type, resource_id, path, content_type, json, content_raw, content_plaintext
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            `);
+            let attachCount = 0;
+            for (const attach of attachments) {
+                try {
+                    attachStmt.run(
+                        attach.resourceType,
+                        attach.resourceId,
+                        attach.path,
+                        attach.contentType,
+                        attach.json,
+                        attach.contentRaw,
+                        attach.contentPlaintext
+                    );
+                    attachCount++;
+                } catch (attachInsertErr: any) {
+                    // Log error but continue transaction if possible
+                    console.error(`[SQLITE] Failed to insert attachment for ${attach.resourceType}/${attach.resourceId} at ${attach.path}:`, attachInsertErr);
+                    // Consider how fatal this should be. For now, just log.
+                }
+            }
+            attachStmt.finalize();
+            console.log(`[SQLITE] Inserted ${attachCount} attachments.`);
+        }
+
         db.exec('COMMIT;');
         console.log("[SQLITE] DB population complete.");
-    } catch (err) { console.error("[SQLITE] Error during population:", err); db.exec('ROLLBACK;'); throw err; }
+
+        // 3. Save to disk if persistence is enabled
+        if (SQLITE_PERSISTENCE_ENABLED && patientId) {
+            await saveSqliteToDisk(patientId, db);
+        }
+    } catch (err) {
+        console.error("[SQLITE] Error during DB population transaction:", err);
+        try {
+            db.exec('ROLLBACK;');
+            console.log("[SQLITE] Transaction rolled back.");
+        } catch (rollbackErr) {
+            console.error("[SQLITE] Error during rollback:", rollbackErr);
+        }
+        throw err;
+    }
+}
+
+// --- Modify handleResync to use new data flow ---
+async function handleResync(session: UserSession) {
+    console.log(`[RESYNC] Starting resync for session: ${session.sessionId}`);
+    if (!session.ehrAccessToken || !EHR_FHIR_URL || !session.ehrPatientId) {
+        console.error("[RESYNC] Cannot resync: Missing EHR access token, FHIR URL, or Patient ID in session.");
+        throw new Error("Cannot resync data: Session is missing required EHR context.");
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (session.ehrTokenExpiry && session.ehrTokenExpiry <= now) {
+        console.error(`[RESYNC] EHR token expired. Cannot resync.`);
+        throw new Error("EHR session token has expired. Re-auth required.");
+    }
+    console.log(`[RESYNC] Attempting resync with current EHR token.`);
+    console.log(`[RESYNC] Clearing existing data (in-memory record).`);
+    session.record = {}; // Clear in-memory representation
+
+    // Close existing database connection if it exists and is open
+    if (session.db) {
+        try {
+            session.db.close();
+            console.log("[RESYNC] Closed existing database connection.");
+        } catch (e) {
+            console.warn("[RESYNC] Error closing existing database (may already be closed):", e);
+        }
+    }
+
+    // Create new database (in memory or from disk)
+    let newDb: Database | null = null;
+    if (SQLITE_PERSISTENCE_ENABLED && session.ehrPatientId) {
+        newDb = await loadSqliteFromDisk(session.ehrPatientId);
+        if (newDb) {
+            console.log("[RESYNC] Loaded existing DB from disk.");
+        } else {
+            console.log("[RESYNC] No existing DB found on disk, creating new in-memory DB.");
+            newDb = new Database(':memory:');
+        }
+    } else {
+        console.log("[RESYNC] Persistence disabled or no patient ID, creating new in-memory DB.");
+        newDb = new Database(':memory:');
+    }
+    session.db = newDb;
+
+    try {
+        // 1. Fetch data (includes attachment processing)
+        console.log("[RESYNC] Fetching EHR data and processing attachments...");
+        const fetchedData = await fetchEhrData(session.ehrAccessToken, EHR_FHIR_URL!, session.ehrPatientId!);
+        session.record = fetchedData.record; // Update in-memory record (optional, as DB is source of truth now)
+
+        // 2. Populate the database with fetched data
+        console.log("[RESYNC] Populating database...");
+        await populateSqlite(fetchedData, session.db, session.ehrPatientId);
+
+        console.log(`[RESYNC] Data re-fetched, processed, and populated into DB.`);
+    } catch (fetchOrPopulateErr) {
+        console.error(`[RESYNC] Failed during fetch or population:`, fetchOrPopulateErr);
+        // Attempt to close the newly created DB on error
+        try { session.db?.close(); } catch(e) { console.warn("[RESYNC] Error closing DB after failed resync:", e); }
+        throw new Error(`Failed to refresh data from EHR: ${fetchOrPopulateErr instanceof Error ? fetchOrPopulateErr.message : String(fetchOrPopulateErr)}`);
+    }
 }
 
 // --- Tool Schemas & Logic ---
 
-// Input Schemas
+// Input Schema (Updated Documentation)
 const GrepRecordInputSchema = z.object({
-    query: z.string().min(1).describe("The text string to search for."),
-    resource_types: z.array(z.string()).optional().describe('List of FHIR resource types (e.g., ["Observation", "DocumentReference"]) to limit the search to. Defaults to searching all loaded resource types.'),
-    max_hits: z.number().int().positive().optional().default(20).describe("Maximum number of distinct matches to return."),
-    context_lines: z.number().int().nonnegative().optional().default(0).describe("Number of lines before/after the match to include (best effort).")
+    query: z.string().min(1).describe("The text string or JavaScript-style regular expression to search for (case-insensitive). Example: 'heart attack|myocardial infarction|mi'"),
+    resource_types: z.array(z.string()).optional().describe(
+        `List of FHIR resource types (e.g., ["DocumentReference"]) or the special keyword "Attachment" to limit the search scope.
+        - If omitted or empty: Searches all loaded resource types AND all attachments.
+        - If ["DocumentReference"]: Searches only DocumentReference resources AND attachments belonging to DocumentReferences.
+        - If ["Attachment"]: Searches ONLY the plaintext content of all attachments.
+        - If ["DocumentReference", "Attachment"]: Searches DocumentReference resources AND ALL attachments.`
+    )
 });
+
+// Output Schemas (New)
+const GrepMatchedResourceSchema = z.object({
+    resourceType: z.string(),
+    resource: z.record(z.unknown()).describe("The full FHIR resource JSON object.")
+});
+
+const GrepMatchedAttachmentSchema = z.object({
+    resourceType: z.string().describe("The FHIR resource type the attachment belongs to."),
+    resourceId: z.string().describe("The ID of the FHIR resource the attachment belongs to."),
+    path: z.string().describe("Path within the original resource where the attachment was found (e.g., 'content.attachment')."),
+    contentType: z.string().optional().describe("The content type of the attachment."),
+    plaintext: z.string().describe("The full extracted plaintext content of the attachment.")
+});
+
+const GrepRecordOutputSchema = z.object({
+    matched_resources: z.array(GrepMatchedResourceSchema).describe("Full FHIR resources where the query matched anywhere within their JSON representation."),
+    matched_attachments: z.array(GrepMatchedAttachmentSchema).describe("Attachments where the query matched within their extracted plaintext content."),
+    resources_searched_count: z.number().int().describe("Number of FHIR resources searched."),
+    attachments_searched_count: z.number().int().describe("Number of attachments searched."),
+    resources_matched_count: z.number().int().describe("Number of unique FHIR resources matched."),
+    attachments_matched_count: z.number().int().describe("Number of unique attachments matched.")
+}).describe("Results of the text search across the patient's record using a case-insensitive string or JavaScript-style regular expression, returning full matching resources or attachment text.");
+
+
+// query_record schemas remain the same...
 const QueryRecordInputSchema = z.object({
     sql: z.string().min(1).describe("The read-only SQL SELECT statement to execute against the in-memory FHIR data.")
 });
+const QueryRecordOutputSchema = z.array(z.record(z.unknown())).describe("An array of rows returned by the SQL query. Each row is an object where keys are column names.");
+// ask_question schemas remain the same...
 const AskQuestionInputSchema = z.object({
     question: z.string().min(1).describe("The natural language question to ask about the patient's record.")
 });
-const ResyncRecordInputSchema = z.object({}).describe("No arguments needed."); // Explicitly empty
-
-// Output Schemas
-const GrepMatchSchema = z.object({
-    resourceType: z.string().describe("The FHIR resource type where the match was found."),
-    resourceId: z.string().describe("The ID of the FHIR resource containing the match."),
-    path: z.string().describe("A JSON path indicating the location of the match within the resource (e.g., 'Observation.code.text')."),
-    line_number: z.number().optional().describe("The line number within the matched field, if applicable (e.g., for notes)."),
-    match_snippet: z.string().describe("The specific line or field value containing the search query."),
-    context_before: z.array(z.string()).optional().describe("Lines immediately preceding the match snippet."),
-    context_after: z.array(z.string()).optional().describe("Lines immediately following the match snippet.")
-});
-const GrepRecordOutputSchema = z.object({
-    matches: z.array(GrepMatchSchema).describe("An array of found matches."),
-    total_hits_found: z.number().int().describe("The total number of matches identified across the searched resources."),
-    hits_returned: z.number().int().describe("The number of matches included in the `matches` array (limited by `max_hits`)."),
-    warning: z.string().optional().describe("A warning message, e.g., if the maximum hit limit was reached.")
-}).describe("Results of the text search across the patient's record.");
-
-const QueryRecordOutputSchema = z.array(z.record(z.unknown())).describe("An array of rows returned by the SQL query. Each row is an object where keys are column names.");
 const AskQuestionOutputSchema = z.object({ answer: z.string() }).describe("The natural language answer generated by the LLM based on the record context."); // Simple wrapper for now
+// resync_record schemas remain the same...
+const ResyncRecordInputSchema = z.object({}).describe("No arguments needed."); // Explicitly empty
 const ResyncRecordOutputSchema = z.object({ message: z.string() }).describe("A confirmation message indicating the outcome of the resync attempt.");
 
+// Input Schema for Eval (Updated Docs)
+const EvalRecordInputSchema = z.object({
+    code: z.string().min(1).describe(
+        `A string containing the body of an async JavaScript function.
+        This function will receive 'record' (Record<string, any[]>), a limited 'console' object, and the Lodash library as '_' (underscore).
+        Console output (log, warn, error) will be captured.
+        It MUST end with a 'return' statement providing a JSON-serializable value.
+        Example: 'const conditions = record["Condition"] || []; return _.filter(conditions, c => c.clinicalStatus?.coding?.[0]?.code === "active");'`
+    )
+});
 
-function grepRecordLogic(record: Record<string, any[]>, query: string, resourceTypes?: string[], maxHits: number = 20, contextLines: number = 0): z.infer<typeof GrepRecordOutputSchema> {
-    const results: z.infer<typeof GrepMatchSchema>[] = [];
-    let totalHits = 0;
-    const queryLower = query.toLowerCase();
-    const typesToSearch = resourceTypes && resourceTypes.length > 0 ? resourceTypes : Object.keys(record);
+// Output Schema for Eval (Updated Fields)
+const EvalRecordOutputSchema = z.object({
+    result: z.any().optional().describe("The JSON-serializable result returned by the executed code (if successful)."),
+    logs: z.array(z.string()).describe("An array of messages logged via console.log or console.warn during execution."),
+    errors: z.array(z.string()).describe("An array of messages logged via console.error during execution.")
+}).describe("The result of executing the provided JavaScript code against the patient record, including captured console output.");
 
-    const searchNode = (node: any, path: string, resourceId: string, resourceType: string): boolean => {
-        if (results.length >= maxHits) return true;
-        if (node === null || node === undefined) return false;
-        let stopRecursion = false;
 
-        if (typeof node === 'string') {
-            const lines = node.split('\n');
-            lines.forEach((line, index) => {
-                if (stopRecursion) return;
-                if (line.toLowerCase().includes(queryLower)) {
-                    totalHits++;
-                    if (results.length < maxHits) {
-                        const start = Math.max(0, index - contextLines);
-                        const end = Math.min(lines.length, index + 1 + contextLines);
-                        results.push({
-                            resourceType: resourceType, resourceId: resourceId, path: path,
-                            line_number: index + 1, match_snippet: line.trim(),
-                            context_before: lines.slice(start, index).map(l => l.trim()),
-                            context_after: lines.slice(index + 1, end).map(l => l.trim()),
-                        });
-                        if (results.length >= maxHits) stopRecursion = true;
-                    } else { stopRecursion = true; }
-                }
-            });
-        } else if (Array.isArray(node)) {
-            for (let index = 0; index < node.length; index++) { if (stopRecursion) break; stopRecursion = searchNode(node[index], `${path}[${index}]`, resourceId, resourceType); }
-        } else if (typeof node === 'object') {
-            for (const key in node) {
-                 if (stopRecursion) break;
-                 if (key.toLowerCase().includes(queryLower)) {
-                     totalHits++;
-                     if (results.length < maxHits) { results.push({ resourceType, resourceId, path: `${path}.${key}`, match_snippet: `Matched key: ${key}`}); if (results.length >= maxHits) { stopRecursion = true; break; } } else { stopRecursion = true; break; }
-                 }
-                stopRecursion = searchNode(node[key], `${path}.${key}`, resourceId, resourceType);
-            }
+// --- Logic Functions ---
+
+// grepRecordLogic (Rewritten with Scope Logic)
+async function grepRecordLogic(
+    record: Record<string, any[]>,
+    db: Database,
+    query: string,
+    inputResourceTypes?: string[] // Renamed for clarity
+): Promise<z.infer<typeof GrepRecordOutputSchema>> {
+    let regex: RegExp;
+    try {
+        regex = new RegExp(query, 'i');
+        console.log(`[GREP] Using regex: ${regex}`);
+    } catch (e) {
+        console.error(`[GREP] Invalid regular expression provided: "${query}"`, e);
+        throw new Error(`Invalid regular expression provided: ${query}`);
+    }
+
+    const matchedResourceIds = new Set<string>();
+    const matchedAttachmentIds = new Set<number>();
+    const matchedResourcesResult: z.infer<typeof GrepMatchedResourceSchema>[] = [];
+    const matchedAttachmentsResult: z.infer<typeof GrepMatchedAttachmentSchema>[] = [];
+
+    let resourcesSearched = 0;
+    let attachmentsSearched = 0;
+
+    // --- Determine Search Scope ---
+    const searchAllResources = !inputResourceTypes || inputResourceTypes.length === 0 || inputResourceTypes.includes("Attachment") && inputResourceTypes.length > 1;
+    const searchAllAttachments = !inputResourceTypes || inputResourceTypes.length === 0 || inputResourceTypes.includes("Attachment");
+    const searchOnlyAttachments = inputResourceTypes?.length === 1 && inputResourceTypes[0] === "Attachment";
+
+    let typesForResourceSearch: string[] = [];
+    let typesForAttachmentFilter: string[] | null = null; // null means search all attachments
+
+    if (searchOnlyAttachments) {
+        typesForResourceSearch = []; // Don't search any resources
+        typesForAttachmentFilter = null; // Search all attachments
+        console.log("[GREP] Scope: Attachments Only");
+    } else if (!inputResourceTypes || inputResourceTypes.length === 0) {
+        typesForResourceSearch = Object.keys(record); // Default: all resource types
+        typesForAttachmentFilter = null; // Default: all attachments
+        console.log("[GREP] Scope: All Resources and All Attachments (Default)");
+    } else {
+        // Filter out "Attachment" keyword for resource search
+        typesForResourceSearch = inputResourceTypes.filter(t => t !== "Attachment");
+        if (inputResourceTypes.includes("Attachment")) {
+            // If "Attachment" is present, search *all* attachments
+            typesForAttachmentFilter = null;
+             console.log(`[GREP] Scope: Resources [${typesForResourceSearch.join(', ')}] and ALL Attachments`);
+        } else {
+            // Only search attachments belonging to the specified resource types
+            typesForAttachmentFilter = typesForResourceSearch;
+             console.log(`[GREP] Scope: Resources [${typesForResourceSearch.join(', ')}] and their Attachments`);
         }
-        return stopRecursion;
-    };
+    }
+    // --- End Determine Search Scope ---
 
-    for (const resourceType of typesToSearch) { if (record[resourceType]) { for (const resource of record[resourceType]) { if (results.length >= maxHits) break; searchNode(resource, resourceType, resource.id || 'unknown-id', resourceType); } } if (results.length >= maxHits) break; }
-    return { matches: results, total_hits_found: totalHits, hits_returned: results.length, warning: totalHits > maxHits ? `Hit limit (${maxHits}) reached. ${totalHits} total matches found.` : undefined, };
+
+    // 1. Search FHIR Resources in memory (if applicable)
+    if (typesForResourceSearch.length > 0) {
+        console.log(`[GREP] Searching ${typesForResourceSearch.length} resource types in memory...`);
+        for (const resourceType of typesForResourceSearch) {
+             // Ensure the type exists in the record before iterating
+            if (record[resourceType]) {
+                for (const resource of record[resourceType]) {
+                    if (!resource || !resource.id || !resource.resourceType) continue;
+                    resourcesSearched++;
+                    const resourceKey = `${resource.resourceType}/${resource.id}`;
+
+                    if (matchedResourceIds.has(resourceKey)) continue;
+
+                    try {
+                        const resourceString = JSON.stringify(resource);
+                        if (regex.test(resourceString)) {
+                            matchedResourceIds.add(resourceKey);
+                            matchedResourcesResult.push({
+                                resourceType: resource.resourceType,
+                                resource: resource
+                            });
+                        }
+                    } catch (e) {
+                        console.warn(`[GREP] Error stringifying resource ${resourceKey}:`, e);
+                    }
+                }
+            } else {
+                 console.warn(`[GREP] Requested resource type "${resourceType}" not found in loaded record.`);
+             }
+        }
+         console.log(`[GREP] Found ${matchedResourcesResult.length} matching resources after searching ${resourcesSearched}.`);
+    } else {
+        console.log("[GREP] Skipping resource search based on scope.");
+    }
+
+
+    // 2. Search Attachments in DB (always potentially search, but filter may apply)
+    console.log(`[GREP] Searching attachments in database (Filter: ${typesForAttachmentFilter ? `[${typesForAttachmentFilter.join(', ')}]` : 'None'})...`);
+    let attachmentRows: any[] = [];
+    try {
+        const tableCheck = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='attachments';").get();
+        if (tableCheck) {
+            // Base query
+            let sql = `SELECT id, resource_type, resource_id, path, content_type, content_plaintext
+                       FROM attachments
+                       WHERE content_plaintext IS NOT NULL AND content_plaintext != ''`;
+            const params: string[] = [];
+
+            // Add filtering if typesForAttachmentFilter is an array with items
+            if (typesForAttachmentFilter && typesForAttachmentFilter.length > 0) {
+                const placeholders = typesForAttachmentFilter.map(() => '?').join(',');
+                sql += ` AND resource_type IN (${placeholders})`;
+                params.push(...typesForAttachmentFilter);
+                console.log(`[GREP] Applying attachment filter for types: ${typesForAttachmentFilter.join(', ')}`);
+            }
+
+            // Prepare and execute the query
+             const stmt = db.prepare(sql);
+             attachmentRows = await stmt.all(...params); // Pass params using spread syntax
+             stmt.finalize();
+
+
+            for (const row of attachmentRows) {
+                 attachmentsSearched++;
+                 if (matchedAttachmentIds.has(row.id)) continue;
+
+                 if (regex.test(row.content_plaintext)) {
+                     matchedAttachmentIds.add(row.id);
+                     matchedAttachmentsResult.push({
+                         resourceType: row.resource_type,
+                         resourceId: row.resource_id,
+                         path: row.path,
+                         contentType: row.content_type,
+                         plaintext: row.content_plaintext
+                     });
+                 }
+            }
+             console.log(`[GREP] Found ${matchedAttachmentsResult.length} matching attachments after searching ${attachmentsSearched}.`);
+        } else {
+            console.log("[GREP] Attachments table not found, skipping attachment search.");
+        }
+    } catch (dbError) {
+        console.error("[GREP] Error querying attachments table:", dbError);
+    }
+
+
+    return {
+        matched_resources: matchedResourcesResult,
+        matched_attachments: matchedAttachmentsResult,
+        resources_searched_count: resourcesSearched,
+        attachments_searched_count: attachmentsSearched,
+        resources_matched_count: matchedResourcesResult.length,
+        attachments_matched_count: matchedAttachmentsResult.length,
+    };
 }
 
+// queryRecordLogic remains the same
 async function queryRecordLogic(db: Database, sql: string): Promise<z.infer<typeof QueryRecordOutputSchema>> {
     const sqlLower = sql.trim().toLowerCase();
     if (!sqlLower.startsWith('select')) throw new Error("Only SELECT queries are allowed.");
     const writeKeywords = ['insert', 'update', 'delete', 'drop', 'create', 'alter', 'attach', 'detach', 'replace', 'pragma'];
     if (writeKeywords.some(keyword => sqlLower.includes(keyword))) throw new Error("Potentially harmful SQL operation detected.");
     try {
+        // Ensure tables exist before querying? Maybe too complex. Assume caller knows schema.
         const results = await db.query(sql).all() as Record<string, unknown>[]; // Use Bun's query().all() and assert type
         if (results.length > 500) { console.warn(`[SQLITE] Query returned ${results.length} rows. Truncating to 500.`); return results.slice(0, 500); }
         return results;
     } catch (err) { console.error("[SQLITE] Execution Error:", err); throw new Error(`SQL execution failed: ${(err as Error).message}`); }
+}
+
+// evalRecordLogic (Updated for Lodash & Console Capture)
+async function evalRecordLogic(record: Record<string, any[]>, userCode: string): Promise<{ result?: any, logs: string[], errors: string[] }> {
+    const logs: string[] = [];
+    const errors: string[] = [];
+
+    // Capture console output within the sandbox
+    const sandboxConsole = {
+        log: (...args: any[]) => {
+            const message = args.map(arg => typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ');
+            logs.push(message);
+            console.log('[SANDBOX Eval LOG]', message); // Also log to server console
+        },
+        warn: (...args: any[]) => {
+            const message = args.map(arg => typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ');
+            logs.push(`WARN: ${message}`); // Distinguish warnings if needed
+            console.warn('[SANDBOX Eval WARN]', message); // Also log to server console
+        },
+        error: (...args: any[]) => {
+            const message = args.map(arg => typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ');
+            errors.push(message);
+            console.error('[SANDBOX Eval ERROR]', message); // Also log to server console
+        },
+    };
+
+    const sandbox = {
+        record: record,
+        console: sandboxConsole,
+        _: _, // Inject Lodash as '_'
+        __resultPromise__: undefined as Promise<any> | undefined
+    };
+
+    const scriptCode = `
+        async function userFunction(record, console, _) { // Add _ to function signature
+            "use strict";
+            ${userCode}
+        }
+        __resultPromise__ = userFunction(record, console, _); // Pass _ when calling
+    `;
+
+    const context = vm.createContext(sandbox);
+    const script = new vm.Script(scriptCode, { filename: 'userCode.vm' });
+    const timeoutMs = 5000;
+    let executionResult: any = undefined; // Store result separately
+
+    try {
+        console.log(`[TOOL eval_record] Executing sandboxed code (Timeout: ${timeoutMs}ms)...`);
+        script.runInContext(context, { timeout: timeoutMs, displayErrors: true });
+
+        executionResult = await Promise.race([
+            sandbox.__resultPromise__,
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Async operation timed out')), timeoutMs + 500)
+            )
+        ]);
+
+        console.log(`[TOOL eval_record] Sandboxed code finished successfully.`);
+
+        try {
+            JSON.stringify(executionResult); // Validate serializability
+             return { result: executionResult, logs, errors }; // Return result + logs/errors
+        } catch (stringifyError: any) {
+            console.error("[TOOL eval_record] Result is not JSON serializable:", stringifyError);
+             // Still return logs/errors even if result is bad
+             errors.push(`Execution Error: Result is not JSON-serializable: ${stringifyError.message}`);
+             return { result: undefined, logs, errors };
+        }
+
+    } catch (error: any) {
+        console.error("[TOOL eval_record] Error executing sandboxed code:", error);
+         let errorMessage: string;
+        if (error.message.includes('timed out') || error.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+             errorMessage = `Code execution timed out after ${timeoutMs / 1000} seconds.`;
+        } else if (error instanceof SyntaxError) {
+             errorMessage = `Syntax error in provided code: ${error.message}`;
+        } else {
+             errorMessage = `Error during code execution: ${error.message}`;
+        }
+         errors.push(`Execution Error: ${errorMessage}`); // Add execution error to errors array
+         return { result: undefined, logs, errors }; // Return undefined result + logs/errors
+    }
 }
 
 // --- OAuth Provider Implementation ---
@@ -573,28 +1299,6 @@ class MyOAuthServerProvider implements OAuthServerProvider {
     }
 }
 
-// --- Resync Logic ---
-async function handleResync(session: UserSession) {
-    console.log(`[RESYNC] Starting resync for session: ${session.sessionId}`);
-    const now = Math.floor(Date.now() / 1000);
-    if (session.ehrTokenExpiry && session.ehrTokenExpiry <= now) { console.error(`[RESYNC] EHR token expired. Cannot resync.`); throw new Error("EHR session token has expired. Re-auth required."); }
-    console.log(`[RESYNC] Attempting resync with current EHR token.`);
-    console.log(`[RESYNC] Clearing existing data.`);
-    session.record = {};
-    try {
-        const tables = await session.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fhir_%';").all();
-        session.db.exec('BEGIN TRANSACTION;');
-        for (const table of tables as { name: string }[]) { session.db.exec(`DROP TABLE IF EXISTS "${table.name}";`); }
-        session.db.exec('COMMIT;'); console.log('[SQLITE] Dropped existing tables.');
-    } catch (dbErr) { console.error("[SQLITE] Error clearing tables:", dbErr); try { session.db.exec('ROLLBACK;'); } catch(e) { console.error("Rollback failed", e); } }
-    try {
-        session.record = await fetchEhrData(session.ehrAccessToken, EHR_FHIR_URL!, session.ehrPatientId!);
-        processAttachments(session.record);
-        await populateSqlite(session.record, session.db);
-        console.log(`[RESYNC] Data re-fetched and processed.`);
-    } catch (fetchErr) { console.error(`[RESYNC] Failed to fetch/process data:`, fetchErr); throw new Error(`Failed to refresh data from EHR: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`); }
-}
-
 // --- MCP Server Instance ---
 const mcpServer = new McpServer(SERVER_INFO);
 const oauthProvider = new MyOAuthServerProvider();
@@ -607,9 +1311,8 @@ const bearerAuthMiddleware = requireBearerAuth({ provider: oauthProvider });
 
 mcpServer.tool(
     "grep_record",
-    GrepRecordInputSchema.shape, // Pass .shape for ZodRawShape
+    GrepRecordInputSchema.shape, // Use updated input schema shape
     async (args, extra) => {
-        // --- LINTER FIX: Correctly retrieve session using transport ID ---
         const transportSessionId = extra.sessionId;
         if (!transportSessionId) {
             console.error(`[TOOL grep_record] Error: Missing transport sessionId.`);
@@ -619,8 +1322,6 @@ mcpServer.tool(
         const transportEntry = activeSseTransports.get(transportSessionId);
         if (!transportEntry) {
             console.warn(`[TOOL grep_record] Received call for unknown/disconnected transport sessionId: ${transportSessionId}`);
-            // Don't throw InvalidRequest, as the request structure might be fine, but the session is gone.
-            // InternalError or a custom error might be more appropriate, but InvalidRequest is handled by MCP.
             throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
         }
 
@@ -628,20 +1329,40 @@ mcpServer.tool(
         const session = activeSessions.get(mcpAccessToken);
 
         if (!session) {
-            // This indicates an internal inconsistency (transport exists but session is gone)
             console.error(`[TOOL grep_record] Internal Error: No session found for active transport ${transportSessionId} (Token: ${mcpAccessToken.substring(0,8)}...)`);
             throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
         }
-        // --- End Linter Fix ---
 
         try {
-            // Ensure record is loaded (implicit resync)
-            if (Object.keys(session.record).length === 0) {
-                console.warn(`[TOOL grep_record] Session ${session.sessionId} record empty. Attempting implicit resync.`);
-                await handleResync(session);
+            // Ensure record is loaded (implicit resync) - also ensures DB is initialized
+            if (Object.keys(session.record).length === 0 || !session.db) { // Check db existence too
+                console.warn(`[TOOL grep_record] Session ${session.sessionId} record or DB missing. Attempting implicit resync.`);
+                await handleResync(session); // handleResync initializes/reinitializes the db
             }
-            const resultData = grepRecordLogic(session.record, args.query, args.resource_types, args.max_hits, args.context_lines);
-            return { content: [{ type: "text", text: JSON.stringify(resultData, null, 2) }] };
+            // Call the updated logic function, passing the db connection
+            const resultData = await grepRecordLogic(session.record, session.db, args.query, args.resource_types);
+
+            // Limit result size before stringifying (important now we return full resources)
+            const MAX_JSON_LENGTH = 1 * 1024 * 1024; // 1 MB limit (adjust as needed)
+            let resultString = JSON.stringify(resultData, null, 2);
+            if (resultString.length > MAX_JSON_LENGTH) {
+                console.warn(`[TOOL grep_record] Result too large (${resultString.length} bytes), truncating heavily.`);
+                // Truncate both resources and attachments arrays significantly
+                resultData.matched_resources = resultData.matched_resources.slice(0, 5); // Keep only first 5 matching resources
+                resultData.matched_attachments = resultData.matched_attachments.slice(0, 10); // Keep only first 10 matching attachments
+                // Remove plaintext from truncated attachments to save space
+                resultData.matched_attachments.forEach(att => (att as any).plaintext = "[Truncated due to size limit]"); // Use 'any' to bypass type check for this ad-hoc change
+                resultString = JSON.stringify({
+                     warning: `Result truncated due to size limit (${(MAX_JSON_LENGTH / 1024 / 1024).toFixed(1)} MB). Showing subset of matches.`,
+                     ...resultData
+                     }, null, 2);
+                 // Ensure it's *definitely* under the limit now
+                 if (resultString.length > MAX_JSON_LENGTH) {
+                     resultString = JSON.stringify({ error: "Result too large to return, even after truncation." });
+                 }
+            }
+
+            return { content: [{ type: "text", text: resultString }] };
         } catch (error: any) {
             console.error(`Error executing tool grep_record:`, error);
             return { content: [{ type: "text", text: `Error executing grep_record: ${error.message}` }], isError: true };
@@ -649,11 +1370,11 @@ mcpServer.tool(
     }
 );
 
+// query_record registration remains the same...
 mcpServer.tool(
     "query_record",
     QueryRecordInputSchema.shape, // Pass .shape
     async (args, extra) => {
-        // --- LINTER FIX: Correctly retrieve session using transport ID ---
         const transportSessionId = extra.sessionId;
         if (!transportSessionId) {
             console.error(`[TOOL query_record] Error: Missing transport sessionId.`);
@@ -673,12 +1394,11 @@ mcpServer.tool(
             console.error(`[TOOL query_record] Internal Error: No session found for active transport ${transportSessionId} (Token: ${mcpAccessToken.substring(0,8)}...)`);
             throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
         }
-        // --- End Linter Fix ---
 
         try {
-            // Ensure record is loaded (implicit resync)
-            if (Object.keys(session.record).length === 0) {
-                console.warn(`[TOOL query_record] Session ${session.sessionId} record empty. Attempting implicit resync.`);
+            // Ensure record/DB is loaded
+            if (Object.keys(session.record).length === 0 || !session.db) {
+                console.warn(`[TOOL query_record] Session ${session.sessionId} record or DB missing. Attempting implicit resync.`);
                 await handleResync(session);
             }
             const resultData = await queryRecordLogic(session.db, args.sql);
@@ -697,63 +1417,104 @@ mcpServer.tool(
     }
 );
 
-// Temporarily comment out ask_question tool as mcpServer.createMessage is not available
-/*
+// eval_record registration (Updated for Logs/Errors)
 mcpServer.tool(
-    "ask_question",
-    AskQuestionInputSchema.shape, // Pass .shape
+    "eval_record",
+    EvalRecordInputSchema.shape,
     async (args, extra) => {
-        // Manual Auth Check
-        const sessionId = extra.sessionId;
-        let authInfo: AuthInfo;
-        try {
-            if (!sessionId) throw new Error("Missing session identifier.");
-            authInfo = await oauthProvider.verifyAccessToken(sessionId);
-        } catch (e) {
-            console.error(`[TOOL AUTH ask_question] Failed: ${e instanceof Error ? e.message : e}`);
-            throw new McpError(ErrorCode.InvalidRequest, "Authentication required.");
+        // ... (session lookup and resync logic remains the same) ...
+        const transportSessionId = extra.sessionId;
+        if (!transportSessionId) {
+            console.error(`[TOOL eval_record] Error: Missing transport sessionId.`);
+            throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
         }
 
-        const session = activeSessions.get(sessionId);
+        const transportEntry = activeSseTransports.get(transportSessionId);
+        if (!transportEntry) {
+            console.warn(`[TOOL eval_record] Received call for unknown/disconnected transport sessionId: ${transportSessionId}`);
+            throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
+        }
+
+        const mcpAccessToken = transportEntry.mcpAccessToken;
+        const session = activeSessions.get(mcpAccessToken);
+
         if (!session) {
-            console.error(`[TOOL ask_question] Internal Error: No session for verified token ${sessionId.substring(0,8)}...`);
-            throw new McpError(ErrorCode.InternalError, "Session data not found for valid token.");
-        }
-        if (authInfo.clientId !== session.mcpClientInfo.client_id) {
-            console.error(`[TOOL ask_question] Forbidden: Client ID mismatch ${sessionId.substring(0,8)}...`);
-            throw new McpError(ErrorCode.InvalidRequest, "Client ID mismatch."); // Use InvalidRequest for AuthZ issues
+            console.error(`[TOOL eval_record] Internal Error: No session found for active transport ${transportSessionId} (Token: ${mcpAccessToken.substring(0,8)}...)`);
+            throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
         }
 
         try {
-             // Ensure record is loaded (implicit resync)
-             if (Object.keys(session.record).length === 0) {
-                 console.warn(`[TOOL ask_question] Session ${session.sessionId} record empty. Attempting implicit resync.`);
+            // Ensure record is loaded (implicit resync)
+            let needsResync = Object.keys(session.record).length === 0 || !session.db;
+             if (session.db) {
+                 try {
+                     session.db.query("PRAGMA user_version;").get(); // Check if DB is open
+                 } catch (dbClosedError) {
+                     console.warn(`[TOOL eval_record] Session ${session.sessionId} DB seems closed. Forcing resync.`);
+                     needsResync = true;
+                 }
+             }
+             if (needsResync) {
+                 console.warn(`[TOOL eval_record] Session ${session.sessionId} record or DB missing/closed. Attempting implicit resync.`);
                  await handleResync(session);
              }
 
-            // This needs to be handled differently, e.g., by the client calling tools then the LLM.
-            // const sysPrompt = "...";
-            // const ctxMsg = "...";
-            // const samplingResult = await mcpServer.createMessage({ ... }); // NOT AVAILABLE
-            // return { content: [{ type: "text", text: JSON.stringify({ answer: samplingResult.content.text }) }] };
-            throw new Error("ask_question tool implementation needs redesign for McpServer.");
+            // Execute the sandboxed code - returns { result?, logs, errors }
+            const evalOutput = await evalRecordLogic(session.record, args.code);
 
-        } catch (error: any) {
-            console.error(`Error executing tool ask_question:`, error);
-             if (error instanceof McpError) {
-                 return { content: [{ type: "text", text: `Error during question processing: ${error.message}` }], isError: true };
-             }
-            return { content: [{ type: "text", text: `Error executing ask_question: ${error.message}` }], isError: true };
+            // Prepare final output object including logs and errors
+            const finalOutput = {
+                result: evalOutput.result, // Might be undefined if execution failed or result wasn't serializable
+                logs: evalOutput.logs,
+                errors: evalOutput.errors,
+            };
+
+            const MAX_JSON_LENGTH = 1 * 1024 * 1024; // 1 MB limit
+            let resultString = JSON.stringify(finalOutput, null, 2);
+
+            if (resultString.length > MAX_JSON_LENGTH) {
+                console.warn(`[TOOL eval_record] Final output (result + logs/errors) too large (${resultString.length} bytes), returning error message instead.`);
+                // Return only the logs/errors and a message indicating the result was too large
+                const truncatedOutput = {
+                    result: "[Result omitted due to excessive size]",
+                    logs: evalOutput.logs, // Keep logs/errors if possible
+                    errors: [...evalOutput.errors, `Execution successful, but the JSON result combined with logs/errors is too large (${(resultString.length / 1024 / 1024).toFixed(1)} MB) to return.`],
+                };
+                 resultString = JSON.stringify(truncatedOutput, null, 2);
+
+                 // Final safety check in case logs/errors themselves are huge
+                 if (resultString.length > MAX_JSON_LENGTH) {
+                     resultString = JSON.stringify({
+                         result: "[Result omitted due to excessive size]",
+                         logs: ["Logs omitted due to excessive size"],
+                         errors: ["Errors omitted due to excessive size", "Output exceeded size limit"]
+                     });
+                 }
+            }
+             // Determine if the overall operation should be marked as an MCP error
+             // Mark as error if the eval logic caught a fatal error (represented by non-empty errors array AND undefined result)
+             const isError = finalOutput.errors.length > 0 && finalOutput.result === undefined;
+
+            return { content: [{ type: "text", text: resultString }], isError: isError }; // Set isError flag based on execution outcome
+
+        } catch (resyncError: any) { // Catch errors from handleResync specifically
+            console.error(`Error during implicit resync for eval_record:`, resyncError);
+             // If resync fails, we can't run eval. Return specific error.
+             const errorOutput = {
+                 result: undefined,
+                 logs: [],
+                 errors: [`Failed to prepare data for evaluation: ${resyncError.message}`]
+             };
+             return { content: [{ type: "text", text: JSON.stringify(errorOutput, null, 2)}], isError: true };
         }
     }
 );
-*/
 
+// resync_record registration remains the same...
 mcpServer.tool(
     "resync_record",
     ResyncRecordInputSchema.shape, // Pass .shape
     async (args, extra) => {
-        // --- LINTER FIX: Correctly retrieve session using transport ID ---
         const transportSessionId = extra.sessionId;
         if (!transportSessionId) {
             console.error(`[TOOL resync_record] Error: Missing transport sessionId.`);
@@ -773,7 +1534,6 @@ mcpServer.tool(
             console.error(`[TOOL resync_record] Internal Error: No session found for active transport ${transportSessionId} (Token: ${mcpAccessToken.substring(0,8)}...)`);
             throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
         }
-        // --- End Linter Fix ---
 
         try {
             await handleResync(session);
@@ -849,11 +1609,30 @@ app.get(MCP_SERVER_EHR_CALLBACK_PATH, async (req, res) => {
         }
                 console.log(`[AUTH] Received EHR tokens (Access Token: ${ehrTokens?.access_token?.substring(0, 8)}..., Patient: ${patientId})`);
 
-        const db = new Database(':memory:');
-                const record = await fetchEhrData(ehrTokens.access_token, EHR_FHIR_URL!, patientId);
-                processAttachments(record);
-        await populateSqlite(record, db);
-                console.log("[DATA] Initial data fetched, processed, and loaded into SQLite.");
+        // Ensure EHR_FHIR_URL is defined before proceeding
+        if (!EHR_FHIR_URL) {
+            console.error("[AUTH Callback] Configuration Error: EHR_FHIR_URL is not defined.");
+            throw new Error("Server configuration error: FHIR Base URL is missing.");
+        }
+
+        // Try to load existing database from disk first
+        let db: Database | null = null;
+        if (SQLITE_PERSISTENCE_ENABLED) {
+            db = await loadSqliteFromDisk(patientId);
+        }
+        
+        // If no database loaded from disk, create new in-memory database
+        if (!db) {
+            db = new Database(':memory:');
+        }
+
+                const fetchedData = await fetchEhrData(ehrTokens.access_token, EHR_FHIR_URL!, patientId);
+        // Populate the database
+        console.log("[AUTH Callback] Populating database...");
+        // Corrected: Pass the fetched data object, db, and patientId
+        await populateSqlite(fetchedData, db, patientId);
+
+        console.log("[DATA] Initial data fetched, processed, and loaded into SQLite.");
 
         // --- Create UserSession (without mcpAccessToken or transport sessionId yet) ---
         let mcpClientInfo: OAuthClientInformationFull | undefined;
@@ -884,7 +1663,8 @@ app.get(MCP_SERVER_EHR_CALLBACK_PATH, async (req, res) => {
             ehrTokenExpiry: ehrTokens.expires_in ? Math.floor(Date.now() / 1000) + ehrTokens.expires_in : undefined,
             ehrGrantedScopes: ehrTokens.scope,
             ehrPatientId: patientId,
-            record,
+            // Corrected: Assign the record part of fetchedData to the session record
+            record: fetchedData.record,
             db,
             mcpClientInfo, // Now guaranteed to be defined
             mcpAuthCodeChallenge: pendingAuth.mcpCodeChallenge, // Store challenge for token exchange
