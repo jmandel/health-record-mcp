@@ -29,6 +29,10 @@ import { v4 as uuidv4 } from 'uuid';
 import vm from 'vm'; // Import Node.js vm module for sandboxing
 import { z } from 'zod';
 
+// --- RTF Parser Imports ---
+import { deEncapsulateSync } from 'rtf-stream-parser';
+import * as iconvLite from 'iconv-lite';
+
 // --- Add Type Declaration for req.auth ---
 declare module "express-serve-static-core" {
   interface Request {
@@ -76,7 +80,8 @@ const REQUIRED_EHR_SCOPES = Bun.env.EHR_SCOPES || [
     "patient/Patient.read", "patient/Observation.read", "patient/Condition.read",
     "patient/DocumentReference.read", "patient/MedicationRequest.read",
     "patient/MedicationStatement.read", "patient/AllergyIntolerance.read",
-    "patient/Procedure.read", "patient/Immunization.read"
+    "patient/Procedure.read", "patient/Immunization.read",
+    "patient/CommunicationRequest", "patient/Contract"
 ].join(" ");
 
 // --- Disable Client Checks Flag ---
@@ -164,15 +169,41 @@ interface AuthPendingState {
     ehrState: string; ehrCodeVerifier: string; mcpClientId: string;
     mcpRedirectUri: string; mcpCodeChallenge: string; mcpOriginalState?: string;
 }
+
+// --- START Moved Type Definitions ---
+// Structure for processed attachments (needed by FullEHR)
+interface ProcessedAttachment {
+    resourceType: string;
+    resourceId: string;
+    path: string;
+    contentType: string;
+    json: string; // JSON string of the original attachment node
+    contentRaw: Buffer | null;
+    contentPlaintext: string | null;
+}
+
+// New structure to hold all processed EHR data (needed by UserSession)
+interface FullEHR {
+    fhir: Record<string, any[]>; // Renamed from 'record'
+    attachments: ProcessedAttachment[];
+}
+// --- END Moved Type Definitions ---
+
 const pendingEhrAuth = new Map<string, AuthPendingState>();
 
 interface UserSession {
     sessionId: string; // Transport Session ID (Added later by transport)
     mcpAccessToken: string; // The actual bearer token for this session
-    ehrAccessToken: string; ehrTokenExpiry?: number;
-    ehrGrantedScopes?: string; ehrPatientId?: string; record: Record<string, any[]>;
-    db: Database; mcpClientInfo: OAuthClientInformationFull;
-    mcpAuthCode?: string; mcpAuthCodeChallenge?: string; mcpAuthCodeRedirectUri?: string;
+    ehrAccessToken: string;
+    ehrTokenExpiry?: number;
+    ehrGrantedScopes?: string;
+    ehrPatientId?: string;
+    fullEhr: FullEHR; // NEW: Uses the FullEHR interface defined above
+    db?: Database; // NEW: Make DB optional, initialized when needed
+    mcpClientInfo: OAuthClientInformationFull;
+    mcpAuthCode?: string;
+    mcpAuthCodeChallenge?: string;
+    mcpAuthCodeRedirectUri?: string;
 }
 // Key is now the mcpAccessToken
 const activeSessions = new Map<string, UserSession>(); // Keyed by MCP Access Token
@@ -191,18 +222,7 @@ interface AttachmentLike {
     // Add other potential fields if needed, e.g., title, size, hash
 }
 
-// Structure for processed attachments returned by fetchEhrData
-interface ProcessedAttachment {
-    resourceType: string;
-    resourceId: string;
-    path: string;
-    contentType: string;
-    json: string; // JSON string of the original attachment node
-    contentRaw: Buffer | null;
-    contentPlaintext: string | null;
-}
-
-// Known FHIR paths that contain attachments
+// Known FHIR paths that contain attachments (Reinstated)
 const KNOWN_ATTACHMENT_PATHS = new Map<string, string[]>([
     ['DocumentReference', ['content.attachment']],
     ['Binary', ['']],  // The entire resource is an attachment
@@ -217,7 +237,7 @@ const KNOWN_ATTACHMENT_PATHS = new Map<string, string[]>([
     ['Contract', ['legal.contentAttachment', 'rule.contentAttachment']]
 ]);
 
-// Helper to fetch content from attachment URLs
+// Helper to fetch content from attachment URLs (Reinstated)
 async function fetchAttachmentContent(attachmentUrl: string, fhirBaseUrl: string, accessToken: string): Promise<{ contentRaw: Buffer, contentType: string | null }> {
     // Resolve potential relative URLs (e.g., "Binary/123")
     const resolvedUrl = new URL(attachmentUrl, fhirBaseUrl);
@@ -319,7 +339,7 @@ async function fetchAllPages(initialUrl: string, accessToken: string): Promise<a
     let resources: any[] = [];
     let nextUrl: string | undefined = initialUrl;
     let pageCount = 0;
-    const maxPages = 20;
+    const maxPages = 200;
 
     console.log(`[FHIR Fetch] Starting pagination for ${initialUrl}`);
     while (nextUrl && pageCount < maxPages) {
@@ -341,31 +361,32 @@ async function fetchAllPages(initialUrl: string, accessToken: string): Promise<a
     return resources;
 }
 
-// Modified to fetch and process attachments internally
-async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patientId: string): Promise<{ record: Record<string, any[]>; attachments: ProcessedAttachment[] }> {
+// Modified to fetch and process attachments internally AND return FullEHR
+async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patientId: string): Promise<FullEHR> { // Changed return type
     console.log(`[DATA] Fetching specific FHIR resources from ${fhirBaseUrl} for Patient: ${patientId}`);
     if (!patientId) throw new Error("Patient ID is required to fetch data.");
 
-    const record: Record<string, any[]> = {};
+    const fhirRecord: Record<string, any[]> = {}; // Use a local variable
     const processedAttachments: ProcessedAttachment[] = []; // Store processed attachments here
     let totalFetched = 0;
-    const patientReadUrl = `${fhirBaseUrl}/Patient/${patientId}`;
+    // Use URL constructor for robust path joining
+    const patientReadUrl = new URL(`Patient/${patientId}`, fhirBaseUrl).toString();
     const searchQueries: { resourceType: string; params?: Record<string, string> }[] = [
-        { resourceType: 'Observation', params: { 'category': 'laboratory', patient: patientId, '_count': '100' } },
-        { resourceType: 'Observation', params: { 'category': 'vital-signs', patient: patientId, '_count': '100' } },
-        { resourceType: 'Observation', params: { 'category': 'social-history', patient: patientId, '_count': '100' } },
-        { resourceType: 'Condition', params: { patient: patientId, '_count': '100' } },
-        { resourceType: 'MedicationRequest', params: { patient: patientId, '_count': '100' } },
-        { resourceType: 'MedicationStatement', params: { patient: patientId, '_count': '100' } },
-        { resourceType: 'AllergyIntolerance', params: { patient: patientId, '_count': '100' } },
-        { resourceType: 'Procedure', params: { patient: patientId, '_count': '100' } },
-        { resourceType: 'Immunization', params: { patient: patientId, '_count': '100' } },
-        { resourceType: 'DocumentReference', params: { patient: patientId, '_count': '100' } },
+        { resourceType: 'Observation', params: { 'category': 'laboratory', patient: patientId, '_count': '1000' } },
+        { resourceType: 'Observation', params: { 'category': 'vital-signs', patient: patientId, '_count': '1000' } },
+        { resourceType: 'Observation', params: { 'category': 'social-history', patient: patientId, '_count': '1000' } },
+        { resourceType: 'Condition', params: { patient: patientId, '_count': '1000' } },
+        { resourceType: 'MedicationRequest', params: { patient: patientId, '_count': '1000' } },
+        { resourceType: 'MedicationStatement', params: { patient: patientId, '_count': '1000' } },
+        { resourceType: 'AllergyIntolerance', params: { patient: patientId, '_count': '1000' } },
+        { resourceType: 'Procedure', params: { patient: patientId, '_count': '1000' } },
+        { resourceType: 'Immunization', params: { patient: patientId, '_count': '1000' } },
+        { resourceType: 'DocumentReference', params: { patient: patientId, '_count': '1000' } },
     ];
 
     try {
         const patientResource = await fetchFhirResource(patientReadUrl, ehrAccessToken);
-        record['Patient'] = [patientResource];
+        fhirRecord['Patient'] = [patientResource]; // Populate local variable
         totalFetched++;
     } catch (error) {
         console.error(`[DATA] Failed to fetch Patient resource: ${error}`);
@@ -374,20 +395,21 @@ async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patient
 
     await Promise.allSettled(searchQueries.map(async (query) => {
         try {
-            const url = new URL(`${fhirBaseUrl}/${query.resourceType}`);
+            // Use URL constructor for robust path joining
+            const url = new URL(query.resourceType, fhirBaseUrl);
             if (query.params) {
                 Object.entries(query.params).forEach(([key, value]) => url.searchParams.set(key, value));
             }
             const resources = await fetchAllPages(url.toString(), ehrAccessToken);
-            record[query.resourceType] = resources;
+            fhirRecord[query.resourceType] = resources; // Populate local variable
             totalFetched += resources.length;
         } catch (error) {
             console.warn(`[DATA] Failed to fetch ${query.resourceType} resources (continuing): ${error}`);
-            record[query.resourceType] = [];
+            fhirRecord[query.resourceType] = []; // Populate local variable
         }
     }));
 
-    console.log(`[DATA] Completed fetching. Total resources retrieved: ${totalFetched} across ${Object.keys(record).length} types.`);
+    console.log(`[DATA] Completed fetching. Total resources retrieved: ${totalFetched} across ${Object.keys(fhirRecord).length} types.`); // Use local variable
 
     // --- START Internal Attachment Processing Logic ---
     console.log("[DATA:ATTACHMENT] Starting attachment processing within fetchEhrData...");
@@ -396,143 +418,170 @@ async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patient
     let processingErrorCount = 0;
     let fetchErrorCount = 0;
 
-    // Internal helper to process a single attachment node
+    // Internal helper to process a single attachment node (remains the same)
     async function processSingleAttachmentNode(node: AttachmentLike, resourceType: string, resourceId: string, path: string): Promise<void> {
-        let contentRaw: Buffer | null = null;
-        let contentPlaintext: string | null = null;
-        let finalContentType = (node.contentType || 'application/octet-stream').toLowerCase();
+        // ... logic remains identical, pushes to processedAttachments ...
+         let contentRaw: Buffer | null = null;
+         let contentPlaintext: string | null = null;
+         let finalContentType = (node.contentType || 'application/octet-stream').toLowerCase();
 
-        try {
-            if (node.url) {
-                console.log(`[DATA:ATTACHMENT Process] Found URL: ${node.url} in ${resourceType}/${resourceId} at ${path}`);
-                try {
-                    const fetched = await fetchAttachmentContent(node.url, fhirBaseUrl, ehrAccessToken);
-                    contentRaw = fetched.contentRaw;
-                    if (fetched.contentType) {
-                        finalContentType = fetched.contentType.split(';')[0].trim().toLowerCase();
-                        console.log(`[DATA:ATTACHMENT Process] Using fetched content type: ${finalContentType}`);
-                    } else {
-                        console.log(`[DATA:ATTACHMENT Process] Fetched content type missing, using type from resource: ${finalContentType}`);
-                    }
-                } catch (fetchErr) {
-                    console.error(`[DATA:ATTACHMENT Process] Failed to fetch content from ${node.url}:`, fetchErr);
-                    contentPlaintext = `[Error fetching external content at ${node.url}: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}]`;
-                    fetchErrorCount++;
-                }
-            } else if (node.data) {
-                console.log(`[DATA:ATTACHMENT Process] Found inline data in ${resourceType}/${resourceId} at ${path}`);
-                contentRaw = Buffer.from(node.data, 'base64');
-                finalContentType = (node.contentType || 'application/octet-stream').toLowerCase();
-            } else {
-                console.warn(`[DATA:ATTACHMENT Process] Attachment node in ${resourceType}/${resourceId} at ${path} has neither URL nor data.`);
-                contentPlaintext = '[Attachment has no data or URL]';
-            }
+         try {
+             if (node.url) {
+                 console.log(`[DATA:ATTACHMENT Process] Found URL: ${node.url} in ${resourceType}/${resourceId} at ${path}`);
+                 try {
+                     const fetched = await fetchAttachmentContent(node.url, fhirBaseUrl, ehrAccessToken);
+                     contentRaw = fetched.contentRaw;
+                     if (fetched.contentType) {
+                         finalContentType = fetched.contentType.split(';')[0].trim().toLowerCase();
+                         console.log(`[DATA:ATTACHMENT Process] Using fetched content type: ${finalContentType}`);
+                     } else {
+                         console.log(`[DATA:ATTACHMENT Process] Fetched content type missing, using type from resource: ${finalContentType}`);
+                     }
+                 } catch (fetchErr) {
+                     console.error(`[DATA:ATTACHMENT Process] Failed to fetch content from ${node.url}:`, fetchErr);
+                     contentPlaintext = `[Error fetching external content at ${node.url}: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}]`;
+                     fetchErrorCount++;
+                 }
+             } else if (node.data) {
+                 console.log(`[DATA:ATTACHMENT Process] Found inline data in ${resourceType}/${resourceId} at ${path}`);
+                 contentRaw = Buffer.from(node.data, 'base64');
+                 finalContentType = (node.contentType || 'application/octet-stream').toLowerCase();
+             } else {
+                 console.warn(`[DATA:ATTACHMENT Process] Attachment node in ${resourceType}/${resourceId} at ${path} has neither URL nor data.`);
+                 contentPlaintext = '[Attachment has no data or URL]';
+             }
 
-            if (contentRaw !== null && contentPlaintext === null) {
-                if (finalContentType.startsWith('text/plain')) {
-                    contentPlaintext = contentRaw.toString('utf8');
-                } else if (finalContentType.startsWith('text/html')) {
-                    try {
-                        contentPlaintext = htmlToText(contentRaw.toString('utf8'), { wordwrap: false });
-                    } catch (htmlErr) {
-                        console.error(`[DATA:ATTACHMENT Process] HTML parsing error in ${resourceType}/${resourceId} at ${path}:`, htmlErr);
-                        contentPlaintext = '[Error parsing HTML]';
-                        processingErrorCount++;
-                    }
-                } else if (finalContentType.includes('xml')) {
-                    try {
-                        const parsed = xmlParser.parse(contentRaw.toString('utf8'));
-                        const extractText = (n: any): string => {
-                            if (typeof n === 'string') return n + " ";
-                            if (typeof n !== 'object' || n === null) return "";
-                            return Object.values(n).map(extractText).join("");
-                        };
-                        contentPlaintext = extractText(parsed).replace(/\s+/g, ' ').trim();
-                        if (!contentPlaintext) contentPlaintext = '[Empty XML content]';
-                    } catch (xmlErr) {
-                        console.error(`[DATA:ATTACHMENT Process] XML parsing error in ${resourceType}/${resourceId} at ${path}:`, xmlErr);
-                        contentPlaintext = '[Error parsing XML]';
-                        processingErrorCount++;
-                    }
-                } else if (finalContentType === 'application/rtf') {
-                    contentPlaintext = '[RTF content not processed]';
-                } else {
-                    contentPlaintext = `[Binary content type: ${finalContentType}]`;
-                }
-            }
+             if (contentRaw !== null && contentPlaintext === null) {
+                 if (finalContentType.startsWith('text/plain')) {
+                     contentPlaintext = contentRaw.toString('utf8');
+                 } else if (finalContentType === 'application/rtf') {
+                     try {
+                         console.log(`[DATA:ATTACHMENT Process] Attempting RTF de-encapsulation for ${resourceType}/${resourceId} at ${path}`);
+                         const result = deEncapsulateSync(contentRaw, { decode: iconvLite.decode });
+                         // The library might return HTML or plain text
+                         if (result.mode === 'html') {
+                             console.log(`[DATA:ATTACHMENT Process] RTF contained HTML, converting to text.`);
+                             try {
+                                 contentPlaintext = htmlToText(result.text.toString(), { wordwrap: false });
+                             } catch (htmlErr) {
+                                 console.error(`[DATA:ATTACHMENT Process] HTML parsing error after RTF extraction in ${resourceType}/${resourceId} at ${path}:`, htmlErr);
+                                 contentPlaintext = '[Error parsing HTML from RTF]';
+                                 processingErrorCount++;
+                             }
+                         } else { // Assumes 'text' mode
+                              console.log(`[DATA:ATTACHMENT Process] RTF contained text.`);
+                              contentPlaintext = result.text.toString();
+                         }
+                          if (!contentPlaintext) contentPlaintext = '[Empty RTF content after processing]';
+                     } catch (rtfErr) {
+                         console.error(`[DATA:ATTACHMENT Process] RTF de-encapsulation error in ${resourceType}/${resourceId} at ${path}:`, rtfErr);
+                         contentPlaintext = '[Error processing RTF]';
+                         processingErrorCount++;
+                     }
+                 } else if (finalContentType.startsWith('text/html')) {
+                     try {
+                         contentPlaintext = htmlToText(contentRaw.toString('utf8'), { wordwrap: false });
+                     } catch (htmlErr) {
+                         console.error(`[DATA:ATTACHMENT Process] HTML parsing error in ${resourceType}/${resourceId} at ${path}:`, htmlErr);
+                         contentPlaintext = '[Error parsing HTML]';
+                         processingErrorCount++;
+                     }
+                 } else if (finalContentType.includes('xml')) {
+                     try {
+                         const parsed = xmlParser.parse(contentRaw.toString('utf8'));
+                         const extractText = (n: any): string => {
+                             // Add newline instead of space to separate text from different elements
+                             if (typeof n === 'string') return n + "\n";
+                             if (typeof n !== 'object' || n === null) return "";
+                             return Object.values(n).map(extractText).join("");
+                         };
+                         // Preserve single newlines, collapse multiple spaces/newlines
+                         contentPlaintext = extractText(parsed).replace(/ +/g, ' ').replace(/\n+/g, '\n').trim();
+                         if (!contentPlaintext) contentPlaintext = '[Empty XML content]';
+                     } catch (xmlErr) {
+                         console.error(`[DATA:ATTACHMENT Process] XML parsing error in ${resourceType}/${resourceId} at ${path}:`, xmlErr);
+                         contentPlaintext = '[Error parsing XML]';
+                         processingErrorCount++;
+                     }
+                 } else {
+                     contentPlaintext = `[Binary content type: ${finalContentType}]`;
+                 }
+             }
 
-            // Add to the results array
-            processedAttachments.push({
-                resourceType,
-                resourceId,
-                path,
-                contentType: finalContentType,
-                json: JSON.stringify(node),
-                contentRaw,
-                contentPlaintext
-            });
-            processedCount++;
+             // Add to the results array
+             processedAttachments.push({
+                 resourceType,
+                 resourceId,
+                 path,
+                 contentType: finalContentType,
+                 json: JSON.stringify(node),
+                 contentRaw,
+                 contentPlaintext
+             });
+             processedCount++;
 
-        } catch (processError) {
-            console.error(`[DATA:ATTACHMENT Process] Error processing node in ${resourceType}/${resourceId} at ${path}:`, processError);
-            processingErrorCount++;
-            // Add error marker to results
-            processedAttachments.push({
-                resourceType, resourceId, path,
-                contentType: finalContentType,
-                json: JSON.stringify({ error: `Processing failed: ${processError}` }),
-                contentRaw: null,
-                contentPlaintext: `[Error during attachment processing: ${processError}]`
-            });
-        }
+         } catch (processError) {
+             console.error(`[DATA:ATTACHMENT Process] Error processing node in ${resourceType}/${resourceId} at ${path}:`, processError);
+             processingErrorCount++;
+             // Add error marker to results
+             processedAttachments.push({
+                 resourceType, resourceId, path,
+                 contentType: finalContentType,
+                 json: JSON.stringify({ error: `Processing failed: ${processError}` }),
+                 contentRaw: null,
+                 contentPlaintext: `[Error during attachment processing: ${processError}]`
+             });
+         }
     }
 
-    // Internal recursive function to find attachments
+    // Internal recursive function to find attachments (remains the same)
     async function findAndProcessAttachments(obj: any, resourceType: string, resourceId: string, currentPath: string = '', processedPaths: Set<string>): Promise<void> {
-        if (!obj || typeof obj !== 'object') return;
+        // ... logic remains identical ...
+         if (!obj || typeof obj !== 'object') return;
 
-        const knownPathsForType = KNOWN_ATTACHMENT_PATHS.get(resourceType);
-        if (knownPathsForType) {
-            for (const knownPath of knownPathsForType) {
-                if (processedPaths.has(knownPath)) continue;
-                const attachments = getValueAtPath(obj, knownPath);
-                if (Array.isArray(attachments)) {
-                    for (const attachment of attachments) {
-                        if (attachment && typeof attachment === 'object') {
-                            await processSingleAttachmentNode(attachment, resourceType, resourceId, knownPath);
-                            processedPaths.add(knownPath);
-                        }
-                    }
-                }
-            }
-        }
+         const knownPathsForType = KNOWN_ATTACHMENT_PATHS.get(resourceType);
+         if (knownPathsForType) {
+             for (const knownPath of knownPathsForType) {
+                 if (processedPaths.has(knownPath)) continue;
+                 const attachments = getValueAtPath(obj, knownPath);
+                 if (Array.isArray(attachments)) {
+                     for (const attachment of attachments) {
+                         if (attachment && typeof attachment === 'object') {
+                             await processSingleAttachmentNode(attachment, resourceType, resourceId, knownPath);
+                             processedPaths.add(knownPath);
+                         }
+                     }
+                 }
+             }
+         }
 
-        const isAttachmentLike = (node: any): node is AttachmentLike =>
-            node && typeof node === 'object' && node.contentType && (node.data || node.url);
+         const isAttachmentLike = (node: any): node is AttachmentLike =>
+             node && typeof node === 'object' && node.contentType && (node.data || node.url);
 
-        if (isAttachmentLike(obj) && !processedPaths.has(currentPath)) {
-            console.log(`[DATA:ATTACHMENT Heuristic] Found potential attachment at path: ${currentPath || '<root>'}`);
-            await processSingleAttachmentNode(obj, resourceType, resourceId, currentPath || 'content');
-            processedPaths.add(currentPath);
-            return;
-        }
+         if (isAttachmentLike(obj) && !processedPaths.has(currentPath)) {
+             console.log(`[DATA:ATTACHMENT Heuristic] Found potential attachment at path: ${currentPath || '<root>'}`);
+             await processSingleAttachmentNode(obj, resourceType, resourceId, currentPath || 'content');
+             processedPaths.add(currentPath);
+             return;
+         }
 
-        if (Array.isArray(obj)) {
-            await Promise.all(obj.map((item, index) =>
-                findAndProcessAttachments(item, resourceType, resourceId, `${currentPath}[${index}]`, processedPaths)
-            ));
-        } else if (!isAttachmentLike(obj)) {
-            await Promise.all(Object.entries(obj).map(([key, value]) => {
-                const newPath = currentPath ? `${currentPath}.${key}` : key;
-                if (processedPaths.has(newPath)) return Promise.resolve();
-                return findAndProcessAttachments(value, resourceType, resourceId, newPath, processedPaths);
-            }));
-        }
+         if (Array.isArray(obj)) {
+             await Promise.all(obj.map((item, index) =>
+                 findAndProcessAttachments(item, resourceType, resourceId, `${currentPath}[${index}]`, processedPaths)
+             ));
+         } else if (!isAttachmentLike(obj)) {
+             await Promise.all(Object.entries(obj).map(([key, value]) => {
+                 const newPath = currentPath ? `${currentPath}.${key}` : key;
+                 if (processedPaths.has(newPath)) return Promise.resolve();
+                 return findAndProcessAttachments(value, resourceType, resourceId, newPath, processedPaths);
+             }));
+         }
     }
 
     // Iterate through the fetched record and process attachments
     try {
-        await Promise.allSettled(Object.entries(record).map(async ([resourceType, resources]) => {
+        // Use local variable fhirRecord here
+        await Promise.allSettled(Object.entries(fhirRecord).map(async ([resourceType, resources]) => {
             for (const resource of resources) {
                 if (resource && resource.id) {
                     const processedPaths = new Set<string>();
@@ -554,17 +603,12 @@ async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patient
     }
     // --- END Internal Attachment Processing Logic ---
 
-    return { record, attachments: processedAttachments };
+    // Return the combined FullEHR object
+    return { fhir: fhirRecord, attachments: processedAttachments };
 }
 
 // --- Attachment Processing ---
 /* --- DELETED: Standalone processAttachments function --- */
-/*
-interface AttachmentLike {
-    contentType?: string;
-// ... (rest of deleted function)
-}
-*/
 
 // --- SQLite Persistence Functions ---
 async function getSqliteFilePath(patientId: string): Promise<string> {
@@ -612,61 +656,87 @@ async function loadSqliteFromDisk(patientId: string): Promise<Database | null> {
 
 async function saveSqliteToDisk(patientId: string, db: Database): Promise<void> {
     if (!SQLITE_PERSISTENCE_ENABLED) return;
-    
+
     const filePath = await getSqliteFilePath(patientId);
+    let diskDb: Database | null = null;
+    let allData: { name: string; sql: string; data: any[] }[] = [];
+
     try {
-        console.log(`[SQLITE] Saving database to disk for patient ${patientId}`);
-        
-        // Create a new database file
-        const diskDb = new Database(filePath);
-        
-        // Copy schema and data
+        console.log(`[SQLITE] Reading data from in-memory DB for patient ${patientId} before saving to disk...`);
+
+        // 1. Read all schema and data from the source DB first
         const tables = await db.query("SELECT name, sql FROM sqlite_master WHERE type='table' AND (name LIKE 'fhir_%' OR name = 'attachments');").all() as { name: string; sql: string }[];
-        
-        diskDb.exec('BEGIN TRANSACTION;');
+
+        for (const table of tables) {
+            const tableData = await db.query(`SELECT * FROM "${table.name}";`).all();
+            allData.push({ name: table.name, sql: table.sql, data: tableData });
+            console.log(`[SQLITE Pre-Read] Read ${tableData.length} rows from ${table.name}.`);
+        }
+
+        console.log(`[SQLITE] Opening database file for writing: ${filePath}`);
+        // 2. Create/Open the disk database
+        diskDb = new Database(filePath);
+
+        // 3. Perform write operations in a transaction on the disk DB
+        console.log(`[SQLITE] Starting disk write transaction...`);
+        diskDb.exec('BEGIN IMMEDIATE TRANSACTION;'); // Use IMMEDIATE for faster locking
         try {
-            // First drop any existing tables
-            for (const table of tables) {
-                diskDb.exec(`DROP TABLE IF EXISTS "${table.name}";`);
+            // First drop any existing tables in the disk DB
+            for (const tableInfo of allData) {
+                diskDb.exec(`DROP TABLE IF EXISTS "${tableInfo.name}";`);
             }
-            
-            // Then recreate tables and copy data
-            for (const table of tables) {
+
+            // Then recreate tables and insert data
+            for (const tableInfo of allData) {
                 // Recreate table
-                diskDb.exec(table.sql);
-                
-                // Copy data
-                const data = await db.query(`SELECT * FROM "${table.name}";`).all() as { id: string; resource_json: string }[];
-                if (data.length > 0) {
-                    const columnNames = Object.keys(data[0]).join(', ');
-                    const placeholders = Object.keys(data[0]).map(() => '?').join(', ');
-                    const stmt = diskDb.prepare(`INSERT INTO "${table.name}" (${columnNames}) VALUES (${placeholders})`);
-                    for (const row of data) {
-                        stmt.run(...Object.values(row));
-                    }
+                diskDb.exec(tableInfo.sql);
+
+                // Insert data
+                if (tableInfo.data.length > 0) {
+                    const columnNames = Object.keys(tableInfo.data[0]).join(', ');
+                    const placeholders = Object.keys(tableInfo.data[0]).map(() => '?').join(', ');
+                    const stmt = diskDb.prepare(`INSERT INTO "${tableInfo.name}" (${columnNames}) VALUES (${placeholders})`);
+                    // Consider using transaction for inserts if many rows
+                    // diskDb.transaction(() => {
+                        for (const row of tableInfo.data) {
+                            // Ensure values are in the correct order matching columns
+                            const values = Object.keys(tableInfo.data[0]).map(col => (row as any)[col]);
+                            stmt.run(...values);
+                        }
+                    // })(); // End transaction for inserts
                     stmt.finalize();
+                    console.log(`[SQLITE Disk Write] Inserted ${tableInfo.data.length} rows into ${tableInfo.name}.`);
                 }
             }
             diskDb.exec('COMMIT;');
             console.log(`[SQLITE] Successfully saved database to ${filePath}`);
         } catch (error) {
             console.error(`[SQLITE] Error during disk save transaction:`, error);
-            diskDb.exec('ROLLBACK;');
-            throw error;
-        } finally {
-            // Close the disk database
-            diskDb.close();
+            diskDb.exec('ROLLBACK;'); // Rollback on error
+            throw error; // Re-throw the error
         }
     } catch (error) {
         console.error(`[SQLITE] Error saving database to disk:`, error);
-        throw error;
+        // No need to rollback here as the outer try/catch handles the overall process error
+        throw error; // Re-throw the error
+    } finally {
+        // 4. Always close the disk database connection
+        if (diskDb) {
+            try {
+                diskDb.close();
+                console.log(`[SQLITE] Closed disk database connection.`);
+            } catch (closeError) {
+                console.error(`[SQLITE] Error closing disk database connection:`, closeError);
+            }
+        }
+        // NOTE: We are NOT closing the source 'db' here. Its lifecycle is managed elsewhere (e.g., in the session).
     }
 }
 
-// Simplified function signature: Takes processed data directly
-async function populateSqlite(data: { record: Record<string, any[]>; attachments: ProcessedAttachment[] }, db: Database, patientId?: string): Promise<void> {
-    console.log("[SQLITE] Populating SQLite DB from processed data...");
-    const { record, attachments } = data;
+// Simplified function signature: Takes FullEHR directly
+async function populateSqlite(fullEhr: FullEHR, db: Database, patientId?: string): Promise<void> { // Changed parameter
+    console.log("[SQLITE] Populating SQLite DB from FullEHR data...");
+    const { fhir: record, attachments } = fullEhr; // Destructure the input
     const resourceTypes = Object.keys(record);
 
     db.exec('BEGIN TRANSACTION;');
@@ -678,12 +748,13 @@ async function populateSqlite(data: { record: Record<string, any[]>; attachments
         }
         console.log("[SQLITE] Dropped existing tables.");
 
-        // 1. Create tables and populate main resources
+        // 1. Create tables and populate main resources (using 'record' from destructuring)
         for (const resourceType of resourceTypes) {
             const safeTableName = `fhir_${resourceType.replace(/[^a-zA-Z0-9_]/g, '_')}`;
             db.exec(`CREATE TABLE "${safeTableName}" (id TEXT PRIMARY KEY, resource_json TEXT NOT NULL);`);
             const stmt = db.prepare(`INSERT INTO "${safeTableName}" (id, resource_json) VALUES (?, ?)`);
             let count = 0;
+            // Use 'record' here
             for (const resource of record[resourceType]) {
                 if (resource && resource.id) { // Check resource validity
                     try {
@@ -704,7 +775,7 @@ async function populateSqlite(data: { record: Record<string, any[]>; attachments
             console.log(`[SQLITE] Inserted ${count} resources into ${safeTableName}.`);
         }
 
-        // 2. Create and populate attachments table from processed data
+        // 2. Create and populate attachments table from processed data (using 'attachments' from destructuring)
         console.log(`[SQLITE] Populating attachments table with ${attachments.length} entries...`);
         db.exec(`
             CREATE TABLE attachments (
@@ -728,6 +799,7 @@ async function populateSqlite(data: { record: Record<string, any[]>; attachments
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
             `);
             let attachCount = 0;
+            // Use 'attachments' here
             for (const attach of attachments) {
                 try {
                     attachStmt.run(
@@ -782,52 +854,108 @@ async function handleResync(session: UserSession) {
         throw new Error("EHR session token has expired. Re-auth required.");
     }
     console.log(`[RESYNC] Attempting resync with current EHR token.`);
-    console.log(`[RESYNC] Clearing existing data (in-memory record).`);
-    session.record = {}; // Clear in-memory representation
+    console.log(`[RESYNC] Clearing existing data (in-memory fullEhr).`);
+    // Clear the FullEHR structure
+    session.fullEhr = { fhir: {}, attachments: [] };
 
+    // --- Database Handling during Resync ---
     // Close existing database connection if it exists and is open
     if (session.db) {
         try {
             session.db.close();
+            session.db = undefined; // Remove reference
             console.log("[RESYNC] Closed existing database connection.");
         } catch (e) {
             console.warn("[RESYNC] Error closing existing database (may already be closed):", e);
+            session.db = undefined; // Still remove reference
         }
     }
 
-    // Create new database (in memory or from disk)
+    // Create new database connection ONLY if needed (persistence or query tool usage)
+    // It will be lazy-loaded by getSessionDb or created during populateSqlite if persistence enabled
+    let dbForPopulation: Database | null = null;
+    if (SQLITE_PERSISTENCE_ENABLED && session.ehrPatientId) {
+        dbForPopulation = await loadSqliteFromDisk(session.ehrPatientId);
+        if (dbForPopulation) {
+            console.log("[RESYNC] Loaded existing DB from disk for repopulation.");
+            session.db = dbForPopulation; // Store the loaded DB back in the session
+        } else {
+            console.log("[RESYNC] No existing DB found on disk, creating new in-memory DB for population.");
+            dbForPopulation = new Database(':memory:');
+            session.db = dbForPopulation; // Store the new DB in the session
+        }
+    } else {
+        console.log("[RESYNC] Persistence disabled or no patient ID. DB will be created in-memory if needed later by query_record.");
+        // Don't create session.db here unless explicitly needed
+    }
+    // --- End Database Handling ---
+
+
+    try {
+        // 1. Fetch data (includes attachment processing, returns FullEHR)
+        console.log("[RESYNC] Fetching EHR data and processing attachments...");
+        const fetchedFullEhr = await fetchEhrData(session.ehrAccessToken, EHR_FHIR_URL!, session.ehrPatientId!);
+        session.fullEhr = fetchedFullEhr; // Update session with the new FullEHR
+
+        // 2. Populate the database IF a connection exists (i.e., persistence enabled)
+        if (session.db) {
+            console.log("[RESYNC] Populating database...");
+             // Pass the fetched data and the existing/newly created DB connection
+            await populateSqlite(session.fullEhr, session.db, session.ehrPatientId);
+        } else {
+            console.log("[RESYNC] Skipping database population (persistence disabled or DB not loaded).");
+        }
+
+        console.log(`[RESYNC] Data re-fetched and processed into memory (fullEhr). DB populated if applicable.`);
+    } catch (fetchOrPopulateErr) {
+        console.error(`[RESYNC] Failed during fetch or population:`, fetchOrPopulateErr);
+        // Attempt to close the DB if it was opened during this resync attempt
+        try { session.db?.close(); session.db = undefined; } catch(e) { console.warn("[RESYNC] Error closing DB after failed resync:", e); }
+        throw new Error(`Failed to refresh data from EHR: ${fetchOrPopulateErr instanceof Error ? fetchOrPopulateErr.message : String(fetchOrPopulateErr)}`);
+    }
+}
+
+// Helper function to ensure DB is initialized when needed (e.g., for query_record)
+async function getSessionDb(session: UserSession): Promise<Database> {
+    if (session.db) {
+        // Check if DB is actually open (Bun throws if closed)
+        try {
+            session.db.query("PRAGMA user_version;").get(); // Simple query
+            return session.db;
+        } catch (e) {
+            console.warn(`[DB GET] Session DB for patient ${session.ehrPatientId} was closed. Reinitializing.`);
+            session.db = undefined; // Clear closed reference
+        }
+    }
+
+    console.log(`[DB GET] Initializing DB connection for session (Patient: ${session.ehrPatientId}).`);
     let newDb: Database | null = null;
     if (SQLITE_PERSISTENCE_ENABLED && session.ehrPatientId) {
         newDb = await loadSqliteFromDisk(session.ehrPatientId);
         if (newDb) {
-            console.log("[RESYNC] Loaded existing DB from disk.");
+            console.log("[DB GET] Loaded existing DB from disk.");
         } else {
-            console.log("[RESYNC] No existing DB found on disk, creating new in-memory DB.");
+            console.log("[DB GET] No existing DB on disk, creating new in-memory DB and populating.");
             newDb = new Database(':memory:');
+            // Populate the newly created DB from the in-memory fullEhr data
+            if (session.fullEhr && (Object.keys(session.fullEhr.fhir).length > 0 || session.fullEhr.attachments.length > 0)) {
+                await populateSqlite(session.fullEhr, newDb, session.ehrPatientId);
+            } else {
+                 console.warn("[DB GET] In-memory fullEhr data is empty, cannot populate new DB.");
+             }
         }
     } else {
-        console.log("[RESYNC] Persistence disabled or no patient ID, creating new in-memory DB.");
+        console.log("[DB GET] Persistence disabled or no patient ID, creating new in-memory DB and populating.");
         newDb = new Database(':memory:');
+        // Populate the newly created DB from the in-memory fullEhr data
+        if (session.fullEhr && (Object.keys(session.fullEhr.fhir).length > 0 || session.fullEhr.attachments.length > 0)) {
+            await populateSqlite(session.fullEhr, newDb, session.ehrPatientId);
+        } else {
+             console.warn("[DB GET] In-memory fullEhr data is empty, cannot populate new DB.");
+         }
     }
-    session.db = newDb;
-
-    try {
-        // 1. Fetch data (includes attachment processing)
-        console.log("[RESYNC] Fetching EHR data and processing attachments...");
-        const fetchedData = await fetchEhrData(session.ehrAccessToken, EHR_FHIR_URL!, session.ehrPatientId!);
-        session.record = fetchedData.record; // Update in-memory record (optional, as DB is source of truth now)
-
-        // 2. Populate the database with fetched data
-        console.log("[RESYNC] Populating database...");
-        await populateSqlite(fetchedData, session.db, session.ehrPatientId);
-
-        console.log(`[RESYNC] Data re-fetched, processed, and populated into DB.`);
-    } catch (fetchOrPopulateErr) {
-        console.error(`[RESYNC] Failed during fetch or population:`, fetchOrPopulateErr);
-        // Attempt to close the newly created DB on error
-        try { session.db?.close(); } catch(e) { console.warn("[RESYNC] Error closing DB after failed resync:", e); }
-        throw new Error(`Failed to refresh data from EHR: ${fetchOrPopulateErr instanceof Error ? fetchOrPopulateErr.message : String(fetchOrPopulateErr)}`);
-    }
+    session.db = newDb; // Store the initialized DB in the session
+    return session.db;
 }
 
 // --- Tool Schemas & Logic ---
@@ -848,7 +976,7 @@ const GrepRecordInputSchema = z.object({
 const GrepMatchedResourceSchema = z.object({
     resourceType: z.string(),
     resource: z.record(z.unknown()).describe("The full FHIR resource JSON object.")
-});
+}).describe("Results of the text search across the patient's record using a case-insensitive string or JavaScript-style regular expression, returning full matching resources or attachment text.");
 
 const GrepMatchedAttachmentSchema = z.object({
     resourceType: z.string().describe("The FHIR resource type the attachment belongs to."),
@@ -886,10 +1014,10 @@ const ResyncRecordOutputSchema = z.object({ message: z.string() }).describe("A c
 const EvalRecordInputSchema = z.object({
     code: z.string().min(1).describe(
         `A string containing the body of an async JavaScript function.
-        This function will receive 'record' (Record<string, any[]>), a limited 'console' object, and the Lodash library as '_' (underscore).
+        This function will receive 'fullEhr' ({ fhir: Record<string, any[]>, attachments: ProcessedAttachment[] }), a limited 'console' object, and the Lodash library as '_' (underscore).
         Console output (log, warn, error) will be captured.
         It MUST end with a 'return' statement providing a JSON-serializable value.
-        Example: 'const conditions = record["Condition"] || []; return _.filter(conditions, c => c.clinicalStatus?.coding?.[0]?.code === "active");'`
+        Example: 'const conditions = fullEhr.fhir["Condition"] || []; return _.filter(conditions, c => c.clinicalStatus?.coding?.[0]?.code === "active");'`
     )
 });
 
@@ -903,12 +1031,11 @@ const EvalRecordOutputSchema = z.object({
 
 // --- Logic Functions ---
 
-// grepRecordLogic (Rewritten with Scope Logic)
+// grepRecordLogic (Rewritten to use FullEHR, no DB)
 async function grepRecordLogic(
-    record: Record<string, any[]>,
-    db: Database,
+    fullEhr: FullEHR, // Takes FullEHR as input
     query: string,
-    inputResourceTypes?: string[] // Renamed for clarity
+    inputResourceTypes?: string[]
 ): Promise<z.infer<typeof GrepRecordOutputSchema>> {
     let regex: RegExp;
     try {
@@ -920,14 +1047,15 @@ async function grepRecordLogic(
     }
 
     const matchedResourceIds = new Set<string>();
-    const matchedAttachmentIds = new Set<number>();
+    // Use a composite key for attachments now (resType/resId/path) as DB ID is gone
+    const matchedAttachmentKeys = new Set<string>();
     const matchedResourcesResult: z.infer<typeof GrepMatchedResourceSchema>[] = [];
     const matchedAttachmentsResult: z.infer<typeof GrepMatchedAttachmentSchema>[] = [];
 
     let resourcesSearched = 0;
     let attachmentsSearched = 0;
 
-    // --- Determine Search Scope ---
+    // --- Determine Search Scope (Logic remains the same) ---
     const searchAllResources = !inputResourceTypes || inputResourceTypes.length === 0 || inputResourceTypes.includes("Attachment") && inputResourceTypes.length > 1;
     const searchAllAttachments = !inputResourceTypes || inputResourceTypes.length === 0 || inputResourceTypes.includes("Attachment");
     const searchOnlyAttachments = inputResourceTypes?.length === 1 && inputResourceTypes[0] === "Attachment";
@@ -940,7 +1068,7 @@ async function grepRecordLogic(
         typesForAttachmentFilter = null; // Search all attachments
         console.log("[GREP] Scope: Attachments Only");
     } else if (!inputResourceTypes || inputResourceTypes.length === 0) {
-        typesForResourceSearch = Object.keys(record); // Default: all resource types
+        typesForResourceSearch = Object.keys(fullEhr.fhir); // Default: all resource types from fullEhr.fhir
         typesForAttachmentFilter = null; // Default: all attachments
         console.log("[GREP] Scope: All Resources and All Attachments (Default)");
     } else {
@@ -961,11 +1089,11 @@ async function grepRecordLogic(
 
     // 1. Search FHIR Resources in memory (if applicable)
     if (typesForResourceSearch.length > 0) {
-        console.log(`[GREP] Searching ${typesForResourceSearch.length} resource types in memory...`);
+        console.log(`[GREP] Searching ${typesForResourceSearch.length} resource types in memory (fullEhr.fhir)...`);
         for (const resourceType of typesForResourceSearch) {
              // Ensure the type exists in the record before iterating
-            if (record[resourceType]) {
-                for (const resource of record[resourceType]) {
+            if (fullEhr.fhir[resourceType]) { // Use fullEhr.fhir
+                for (const resource of fullEhr.fhir[resourceType]) { // Use fullEhr.fhir
                     if (!resource || !resource.id || !resource.resourceType) continue;
                     resourcesSearched++;
                     const resourceKey = `${resource.resourceType}/${resource.id}`;
@@ -978,7 +1106,7 @@ async function grepRecordLogic(
                             matchedResourceIds.add(resourceKey);
                             matchedResourcesResult.push({
                                 resourceType: resource.resourceType,
-                                resource: resource
+                                resource: resource // Pass the full resource object
                             });
                         }
                     } catch (e) {
@@ -986,7 +1114,7 @@ async function grepRecordLogic(
                     }
                 }
             } else {
-                 console.warn(`[GREP] Requested resource type "${resourceType}" not found in loaded record.`);
+                 console.warn(`[GREP] Requested resource type "${resourceType}" not found in loaded fullEhr.fhir.`);
              }
         }
          console.log(`[GREP] Found ${matchedResourcesResult.length} matching resources after searching ${resourcesSearched}.`);
@@ -995,87 +1123,70 @@ async function grepRecordLogic(
     }
 
 
-    // 2. Search Attachments in DB (always potentially search, but filter may apply)
-    console.log(`[GREP] Searching attachments in database (Filter: ${typesForAttachmentFilter ? `[${typesForAttachmentFilter.join(', ')}]` : 'None'})...`);
-    let attachmentRows: any[] = [];
-    try {
-        const tableCheck = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='attachments';").get();
-        if (tableCheck) {
-            // Base query
-            let sql = `SELECT id, resource_type, resource_id, path, content_type, content_plaintext
-                       FROM attachments
-                       WHERE content_plaintext IS NOT NULL AND content_plaintext != ''`;
-            const params: string[] = [];
+    // 2. Search Attachments in memory (fullEhr.attachments)
+    console.log(`[GREP] Searching ${fullEhr.attachments.length} attachments in memory (fullEhr.attachments) (Filter: ${typesForAttachmentFilter ? `[${typesForAttachmentFilter.join(', ')}]` : 'None'})...`);
+    for (const attachment of fullEhr.attachments) {
+        attachmentsSearched++;
+        const attachmentKey = `${attachment.resourceType}/${attachment.resourceId}#${attachment.path}`; // Unique key
 
-            // Add filtering if typesForAttachmentFilter is an array with items
-            if (typesForAttachmentFilter && typesForAttachmentFilter.length > 0) {
-                const placeholders = typesForAttachmentFilter.map(() => '?').join(',');
-                sql += ` AND resource_type IN (${placeholders})`;
-                params.push(...typesForAttachmentFilter);
-                console.log(`[GREP] Applying attachment filter for types: ${typesForAttachmentFilter.join(', ')}`);
-            }
-
-            // Prepare and execute the query
-             const stmt = db.prepare(sql);
-             attachmentRows = await stmt.all(...params); // Pass params using spread syntax
-             stmt.finalize();
-
-
-            for (const row of attachmentRows) {
-                 attachmentsSearched++;
-                 if (matchedAttachmentIds.has(row.id)) continue;
-
-                 if (regex.test(row.content_plaintext)) {
-                     matchedAttachmentIds.add(row.id);
-                     matchedAttachmentsResult.push({
-                         resourceType: row.resource_type,
-                         resourceId: row.resource_id,
-                         path: row.path,
-                         contentType: row.content_type,
-                         plaintext: row.content_plaintext
-                     });
-                 }
-            }
-             console.log(`[GREP] Found ${matchedAttachmentsResult.length} matching attachments after searching ${attachmentsSearched}.`);
-        } else {
-            console.log("[GREP] Attachments table not found, skipping attachment search.");
+        // Apply resource type filter if needed
+        if (typesForAttachmentFilter && !typesForAttachmentFilter.includes(attachment.resourceType)) {
+            continue; // Skip attachment if its parent resource type is not in the filter list
         }
-    } catch (dbError) {
-        console.error("[GREP] Error querying attachments table:", dbError);
+
+        if (matchedAttachmentKeys.has(attachmentKey)) continue;
+
+        // Check if plaintext exists and is non-empty before testing
+        if (attachment.contentPlaintext && attachment.contentPlaintext.length > 0) {
+            if (regex.test(attachment.contentPlaintext)) {
+                matchedAttachmentKeys.add(attachmentKey);
+                // Construct the output object (no database ID anymore)
+                matchedAttachmentsResult.push({
+                    resourceType: attachment.resourceType,
+                    resourceId: attachment.resourceId,
+                    path: attachment.path,
+                    contentType: attachment.contentType, // Already have this from ProcessedAttachment
+                    plaintext: attachment.contentPlaintext // Include full plaintext
+                });
+            }
+        }
     }
+    console.log(`[GREP] Found ${matchedAttachmentsResult.length} matching attachments after searching ${attachmentsSearched} in memory.`);
 
 
     return {
         matched_resources: matchedResourcesResult,
         matched_attachments: matchedAttachmentsResult,
         resources_searched_count: resourcesSearched,
-        attachments_searched_count: attachmentsSearched,
+        attachments_searched_count: attachmentsSearched, // Count of attachments iterated over in memory
         resources_matched_count: matchedResourcesResult.length,
         attachments_matched_count: matchedAttachmentsResult.length,
     };
 }
 
-// queryRecordLogic remains the same
+
+// queryRecordLogic still needs the DB - ensure getSessionDb is called before this
 async function queryRecordLogic(db: Database, sql: string): Promise<z.infer<typeof QueryRecordOutputSchema>> {
-    const sqlLower = sql.trim().toLowerCase();
-    if (!sqlLower.startsWith('select')) throw new Error("Only SELECT queries are allowed.");
-    const writeKeywords = ['insert', 'update', 'delete', 'drop', 'create', 'alter', 'attach', 'detach', 'replace', 'pragma'];
-    if (writeKeywords.some(keyword => sqlLower.includes(keyword))) throw new Error("Potentially harmful SQL operation detected.");
-    try {
-        // Ensure tables exist before querying? Maybe too complex. Assume caller knows schema.
-        const results = await db.query(sql).all() as Record<string, unknown>[]; // Use Bun's query().all() and assert type
-        if (results.length > 500) { console.warn(`[SQLITE] Query returned ${results.length} rows. Truncating to 500.`); return results.slice(0, 500); }
-        return results;
-    } catch (err) { console.error("[SQLITE] Execution Error:", err); throw new Error(`SQL execution failed: ${(err as Error).message}`); }
+    // ... implementation remains the same ...
+     const sqlLower = sql.trim().toLowerCase();
+     if (!sqlLower.startsWith('select')) throw new Error("Only SELECT queries are allowed.");
+     const writeKeywords = ['insert', 'update', 'delete', 'drop', 'create', 'alter', 'attach', 'detach', 'replace', 'pragma'];
+     if (writeKeywords.some(keyword => sqlLower.includes(keyword))) throw new Error("Potentially harmful SQL operation detected.");
+     try {
+         // Ensure tables exist before querying? Maybe too complex. Assume caller knows schema.
+         const results = await db.query(sql).all() as Record<string, unknown>[]; // Use Bun's query().all() and assert type
+         if (results.length > 500) { console.warn(`[SQLITE] Query returned ${results.length} rows. Truncating to 500.`); return results.slice(0, 500); }
+         return results;
+     } catch (err) { console.error("[SQLITE] Execution Error:", err); throw new Error(`SQL execution failed: ${(err as Error).message}`); }
 }
 
-// evalRecordLogic (Updated for Lodash & Console Capture)
-async function evalRecordLogic(record: Record<string, any[]>, userCode: string): Promise<{ result?: any, logs: string[], errors: string[] }> {
+// evalRecordLogic (Updated for FullEHR & Console Capture)
+async function evalRecordLogic(fullEhr: FullEHR, userCode: string): Promise<{ result?: any, logs: string[], errors: string[] }> { // Takes FullEHR
     const logs: string[] = [];
     const errors: string[] = [];
 
     // Capture console output within the sandbox
-    const sandboxConsole = {
+    const sandboxConsole = { /* ... same as before ... */
         log: (...args: any[]) => {
             const message = args.map(arg => typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ');
             logs.push(message);
@@ -1094,61 +1205,62 @@ async function evalRecordLogic(record: Record<string, any[]>, userCode: string):
     };
 
     const sandbox = {
-        record: record,
+        fullEhr: fullEhr, // Pass fullEhr instead of record
         console: sandboxConsole,
         _: _, // Inject Lodash as '_'
         __resultPromise__: undefined as Promise<any> | undefined
     };
 
     const scriptCode = `
-        async function userFunction(record, console, _) { // Add _ to function signature
+        async function userFunction(fullEhr, console, _) { // Use fullEhr in function signature
             "use strict";
             ${userCode}
         }
-        __resultPromise__ = userFunction(record, console, _); // Pass _ when calling
+        __resultPromise__ = userFunction(fullEhr, console, _); // Pass fullEhr when calling
     `;
 
-    const context = vm.createContext(sandbox);
-    const script = new vm.Script(scriptCode, { filename: 'userCode.vm' });
-    const timeoutMs = 5000;
-    let executionResult: any = undefined; // Store result separately
+    // ... rest of the execution logic remains the same ...
+     const context = vm.createContext(sandbox);
+     const script = new vm.Script(scriptCode, { filename: 'userCode.vm' });
+     const timeoutMs = 5000;
+     let executionResult: any = undefined; // Store result separately
 
-    try {
-        console.log(`[TOOL eval_record] Executing sandboxed code (Timeout: ${timeoutMs}ms)...`);
-        script.runInContext(context, { timeout: timeoutMs, displayErrors: true });
+     try {
+         console.log(`[TOOL eval_record] Executing sandboxed code (Timeout: ${timeoutMs}ms)...`);
+         script.runInContext(context, { timeout: timeoutMs, displayErrors: true });
 
-        executionResult = await Promise.race([
-            sandbox.__resultPromise__,
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Async operation timed out')), timeoutMs + 500)
-            )
-        ]);
+         executionResult = await Promise.race([
+             sandbox.__resultPromise__,
+             new Promise((_, reject) =>
+                 setTimeout(() => reject(new Error('Async operation timed out')), timeoutMs + 500)
+             )
+         ]);
 
-        console.log(`[TOOL eval_record] Sandboxed code finished successfully.`);
+         console.log(`[TOOL eval_record] Sandboxed code finished successfully.`);
 
-        try {
-            JSON.stringify(executionResult); // Validate serializability
-             return { result: executionResult, logs, errors }; // Return result + logs/errors
-        } catch (stringifyError: any) {
-            console.error("[TOOL eval_record] Result is not JSON serializable:", stringifyError);
-             // Still return logs/errors even if result is bad
-             errors.push(`Execution Error: Result is not JSON-serializable: ${stringifyError.message}`);
-             return { result: undefined, logs, errors };
-        }
+         try {
+             JSON.stringify(executionResult); // Validate serializability
+              return { result: executionResult, logs, errors }; // Return result + logs/errors
+         } catch (stringifyError: any) {
+             console.error("[TOOL eval_record] Result is not JSON serializable:", stringifyError);
+              // Still return logs/errors even if result is bad
+              errors.push(`Execution Error: Result is not JSON-serializable: ${stringifyError.message}`);
+              return { result: undefined, logs, errors };
+         }
 
-    } catch (error: any) {
-        console.error("[TOOL eval_record] Error executing sandboxed code:", error);
-         let errorMessage: string;
-        if (error.message.includes('timed out') || error.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
-             errorMessage = `Code execution timed out after ${timeoutMs / 1000} seconds.`;
-        } else if (error instanceof SyntaxError) {
-             errorMessage = `Syntax error in provided code: ${error.message}`;
-        } else {
-             errorMessage = `Error during code execution: ${error.message}`;
-        }
-         errors.push(`Execution Error: ${errorMessage}`); // Add execution error to errors array
-         return { result: undefined, logs, errors }; // Return undefined result + logs/errors
-    }
+     } catch (error: any) {
+         console.error("[TOOL eval_record] Error executing sandboxed code:", error);
+          let errorMessage: string;
+         if (error.message.includes('timed out') || error.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+              errorMessage = `Code execution timed out after ${timeoutMs / 1000} seconds.`;
+         } else if (error instanceof SyntaxError) {
+              errorMessage = `Syntax error in provided code: ${error.message}`;
+         } else {
+              errorMessage = `Error during code execution: ${error.message}`;
+         }
+          errors.push(`Execution Error: ${errorMessage}`); // Add execution error to errors array
+          return { result: undefined, logs, errors }; // Return undefined result + logs/errors
+     }
 }
 
 // --- OAuth Provider Implementation ---
@@ -1261,10 +1373,14 @@ class MyOAuthServerProvider implements OAuthServerProvider {
                 // throw new InvalidRequestError("Client does not own the token");
             }
 
-            try {
-                session.db.close(); // Close the associated SQLite DB
-            } catch(e) {
-                console.error(`Error closing DB for session on revoke (Token: ${tokenToRevoke.substring(0, 8)}...):`, e);
+            // Close the associated SQLite DB IF IT EXISTS (Fix for optional db)
+            if (session.db) {
+                try {
+                    session.db.close();
+                    console.log(`[AUTH] Closed database connection for revoked session (Token: ${tokenToRevoke.substring(0, 8)}...).`);
+                } catch(e) {
+                    console.error(`Error closing DB for session on revoke (Token: ${tokenToRevoke.substring(0, 8)}...):`, e);
+                }
             }
 
             // Remove from active sessions map (keyed by token)
@@ -1292,7 +1408,7 @@ class MyOAuthServerProvider implements OAuthServerProvider {
             }
 
 
-            console.log(`[AUTH] MCP Token ${tokenToRevoke.substring(0, 8)}... revoked, session cleared, and DB closed.`);
+            console.log(`[AUTH] MCP Token ${tokenToRevoke.substring(0, 8)}... revoked, session cleared, and DB closed (if existed).`);
         } else {
             console.log(`[AUTH] MCP Token ${tokenToRevoke.substring(0, 8)}... not found or already revoked.`);
         }
@@ -1334,33 +1450,39 @@ mcpServer.tool(
         }
 
         try {
-            // Ensure record is loaded (implicit resync) - also ensures DB is initialized
-            if (Object.keys(session.record).length === 0 || !session.db) { // Check db existence too
-                console.warn(`[TOOL grep_record] Session ${session.sessionId} record or DB missing. Attempting implicit resync.`);
-                await handleResync(session); // handleResync initializes/reinitializes the db
-            }
-            // Call the updated logic function, passing the db connection
-            const resultData = await grepRecordLogic(session.record, session.db, args.query, args.resource_types);
-
-            // Limit result size before stringifying (important now we return full resources)
-            const MAX_JSON_LENGTH = 1 * 1024 * 1024; // 1 MB limit (adjust as needed)
-            let resultString = JSON.stringify(resultData, null, 2);
-            if (resultString.length > MAX_JSON_LENGTH) {
-                console.warn(`[TOOL grep_record] Result too large (${resultString.length} bytes), truncating heavily.`);
-                // Truncate both resources and attachments arrays significantly
-                resultData.matched_resources = resultData.matched_resources.slice(0, 5); // Keep only first 5 matching resources
-                resultData.matched_attachments = resultData.matched_attachments.slice(0, 10); // Keep only first 10 matching attachments
-                // Remove plaintext from truncated attachments to save space
-                resultData.matched_attachments.forEach(att => (att as any).plaintext = "[Truncated due to size limit]"); // Use 'any' to bypass type check for this ad-hoc change
-                resultString = JSON.stringify({
-                     warning: `Result truncated due to size limit (${(MAX_JSON_LENGTH / 1024 / 1024).toFixed(1)} MB). Showing subset of matches.`,
-                     ...resultData
-                     }, null, 2);
-                 // Ensure it's *definitely* under the limit now
-                 if (resultString.length > MAX_JSON_LENGTH) {
-                     resultString = JSON.stringify({ error: "Result too large to return, even after truncation." });
+            // Ensure fullEhr is loaded (implicit resync) - DB check removed for grep
+            if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
+                console.warn(`[TOOL grep_record] Session ${session.sessionId} fullEhr missing or empty. Attempting implicit resync.`);
+                await handleResync(session);
+                // After resync, check again if data is present
+                if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
+                     throw new Error("Data could not be loaded after resync attempt.");
                  }
             }
+            // Call the updated logic function, passing fullEhr
+            const resultData = await grepRecordLogic(session.fullEhr, args.query, args.resource_types); // Pass fullEhr, no db
+
+            // Limit result size before stringifying (important now we return full resources)
+             // ... (Size limiting logic remains the same) ...
+             const MAX_JSON_LENGTH = 1 * 1024 * 1024; // 1 MB limit (adjust as needed)
+             let resultString = JSON.stringify(resultData, null, 2);
+             if (resultString.length > MAX_JSON_LENGTH) {
+                 console.warn(`[TOOL grep_record] Result too large (${resultString.length} bytes), truncating heavily.`);
+                 // Truncate both resources and attachments arrays significantly
+                 resultData.matched_resources = resultData.matched_resources.slice(0, 5); // Keep only first 5 matching resources
+                 resultData.matched_attachments = resultData.matched_attachments.slice(0, 10); // Keep only first 10 matching attachments
+                 // Remove plaintext from truncated attachments to save space
+                 resultData.matched_attachments.forEach(att => (att as any).plaintext = "[Truncated due to size limit]"); // Use 'any' to bypass type check for this ad-hoc change
+                 resultString = JSON.stringify({
+                      warning: `Result truncated due to size limit (${(MAX_JSON_LENGTH / 1024 / 1024).toFixed(1)} MB). Showing subset of matches.`,
+                      ...resultData
+                      }, null, 2);
+                  // Ensure it's *definitely* under the limit now
+                  if (resultString.length > MAX_JSON_LENGTH) {
+                      resultString = JSON.stringify({ error: "Result too large to return, even after truncation." });
+                  }
+             }
+
 
             return { content: [{ type: "text", text: resultString }] };
         } catch (error: any) {
@@ -1396,19 +1518,28 @@ mcpServer.tool(
         }
 
         try {
-            // Ensure record/DB is loaded
-            if (Object.keys(session.record).length === 0 || !session.db) {
-                console.warn(`[TOOL query_record] Session ${session.sessionId} record or DB missing. Attempting implicit resync.`);
+            // Ensure fullEhr is loaded (implicit resync) - still useful before DB access
+            if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
+                console.warn(`[TOOL query_record] Session ${session.sessionId} fullEhr missing or empty. Attempting implicit resync.`);
                 await handleResync(session);
+                // After resync, check again if data is present
+                if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
+                     throw new Error("Data could not be loaded after resync attempt.");
+                 }
             }
-            const resultData = await queryRecordLogic(session.db, args.sql);
-            // Limit result size before stringifying
-            const MAX_JSON_LENGTH = 500 * 1024; // 500 KB limit
-            let resultString = JSON.stringify(resultData, null, 2);
-            if (resultString.length > MAX_JSON_LENGTH) {
-                console.warn(`[TOOL query_record] Result too large (${resultString.length} bytes), truncating.`);
-                resultString = JSON.stringify({ warning: "Result truncated due to size limit.", truncated_results: resultData.slice(0, 100) }, null, 2);
-            }
+
+            // Ensure DB is initialized for this session using the helper
+            const db = await getSessionDb(session);
+
+            const resultData = await queryRecordLogic(db, args.sql); // Pass the initialized DB
+             // ... (Size limiting logic remains the same) ...
+             const MAX_JSON_LENGTH = 500 * 1024; // 500 KB limit
+             let resultString = JSON.stringify(resultData, null, 2);
+             if (resultString.length > MAX_JSON_LENGTH) {
+                 console.warn(`[TOOL query_record] Result too large (${resultString.length} bytes), truncating.`);
+                 resultString = JSON.stringify({ warning: "Result truncated due to size limit.", truncated_results: resultData.slice(0, 100) }, null, 2);
+             }
+
             return { content: [{ type: "text", text: resultString }] };
         } catch (error: any) {
             console.error(`Error executing tool query_record:`, error);
@@ -1417,100 +1548,101 @@ mcpServer.tool(
     }
 );
 
-// eval_record registration (Updated for Logs/Errors)
+// eval_record registration (Updated for FullEHR)
 mcpServer.tool(
     "eval_record",
     EvalRecordInputSchema.shape,
     async (args, extra) => {
-        // ... (session lookup and resync logic remains the same) ...
-        const transportSessionId = extra.sessionId;
-        if (!transportSessionId) {
-            console.error(`[TOOL eval_record] Error: Missing transport sessionId.`);
-            throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
-        }
+        // ... (session lookup logic remains the same) ...
+         const transportSessionId = extra.sessionId;
+         if (!transportSessionId) {
+             console.error(`[TOOL eval_record] Error: Missing transport sessionId.`);
+             throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
+         }
 
-        const transportEntry = activeSseTransports.get(transportSessionId);
-        if (!transportEntry) {
-            console.warn(`[TOOL eval_record] Received call for unknown/disconnected transport sessionId: ${transportSessionId}`);
-            throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
-        }
+         const transportEntry = activeSseTransports.get(transportSessionId);
+         if (!transportEntry) {
+             console.warn(`[TOOL eval_record] Received call for unknown/disconnected transport sessionId: ${transportSessionId}`);
+             throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
+         }
 
-        const mcpAccessToken = transportEntry.mcpAccessToken;
-        const session = activeSessions.get(mcpAccessToken);
+         const mcpAccessToken = transportEntry.mcpAccessToken;
+         const session = activeSessions.get(mcpAccessToken);
 
-        if (!session) {
-            console.error(`[TOOL eval_record] Internal Error: No session found for active transport ${transportSessionId} (Token: ${mcpAccessToken.substring(0,8)}...)`);
-            throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
-        }
+         if (!session) {
+             console.error(`[TOOL eval_record] Internal Error: No session found for active transport ${transportSessionId} (Token: ${mcpAccessToken.substring(0,8)}...)`);
+             throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
+         }
+
 
         try {
-            // Ensure record is loaded (implicit resync)
-            let needsResync = Object.keys(session.record).length === 0 || !session.db;
-             if (session.db) {
-                 try {
-                     session.db.query("PRAGMA user_version;").get(); // Check if DB is open
-                 } catch (dbClosedError) {
-                     console.warn(`[TOOL eval_record] Session ${session.sessionId} DB seems closed. Forcing resync.`);
-                     needsResync = true;
-                 }
+             // Ensure fullEhr is loaded (implicit resync)
+             let needsResync = !session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0;
+             // No DB check needed here unless the eval code itself needs it (which is unlikely/discouraged)
+              if (needsResync) {
+                  console.warn(`[TOOL eval_record] Session ${session.sessionId} fullEhr missing or empty. Attempting implicit resync.`);
+                  await handleResync(session);
+                  // Check again after resync
+                  if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
+                       throw new Error("Data could not be loaded after resync attempt for eval.");
+                   }
+              }
+
+
+            // Execute the sandboxed code - passing fullEhr
+            const evalOutput = await evalRecordLogic(session.fullEhr, args.code); // Pass fullEhr
+
+            // ... (Output processing and size limiting remains the same) ...
+             const finalOutput = {
+                 result: evalOutput.result, // Might be undefined if execution failed or result wasn't serializable
+                 logs: evalOutput.logs,
+                 errors: evalOutput.errors,
+             };
+
+             const MAX_JSON_LENGTH = 1 * 1024 * 1024; // 1 MB limit
+             let resultString = JSON.stringify(finalOutput, null, 2);
+
+             if (resultString.length > MAX_JSON_LENGTH) {
+                 console.warn(`[TOOL eval_record] Final output (result + logs/errors) too large (${resultString.length} bytes), returning error message instead.`);
+                 // Return only the logs/errors and a message indicating the result was too large
+                 const truncatedOutput = {
+                     result: "[Result omitted due to excessive size]",
+                     logs: evalOutput.logs, // Keep logs/errors if possible
+                     errors: [...evalOutput.errors, `Execution successful, but the JSON result combined with logs/errors is too large (${(resultString.length / 1024 / 1024).toFixed(1)} MB) to return.`],
+                 };
+                  resultString = JSON.stringify(truncatedOutput, null, 2);
+
+                  // Final safety check in case logs/errors themselves are huge
+                  if (resultString.length > MAX_JSON_LENGTH) {
+                      resultString = JSON.stringify({
+                          result: "[Result omitted due to excessive size]",
+                          logs: ["Logs omitted due to excessive size"],
+                          errors: ["Errors omitted due to excessive size", "Output exceeded size limit"]
+                      });
+                  }
              }
-             if (needsResync) {
-                 console.warn(`[TOOL eval_record] Session ${session.sessionId} record or DB missing/closed. Attempting implicit resync.`);
-                 await handleResync(session);
-             }
+              // Determine if the overall operation should be marked as an MCP error
+              // Mark as error if the eval logic caught a fatal error (represented by non-empty errors array AND undefined result)
+              const isError = finalOutput.errors.length > 0 && finalOutput.result === undefined;
 
-            // Execute the sandboxed code - returns { result?, logs, errors }
-            const evalOutput = await evalRecordLogic(session.record, args.code);
+             return { content: [{ type: "text", text: resultString }], isError: isError }; // Set isError flag based on execution outcome
 
-            // Prepare final output object including logs and errors
-            const finalOutput = {
-                result: evalOutput.result, // Might be undefined if execution failed or result wasn't serializable
-                logs: evalOutput.logs,
-                errors: evalOutput.errors,
-            };
-
-            const MAX_JSON_LENGTH = 1 * 1024 * 1024; // 1 MB limit
-            let resultString = JSON.stringify(finalOutput, null, 2);
-
-            if (resultString.length > MAX_JSON_LENGTH) {
-                console.warn(`[TOOL eval_record] Final output (result + logs/errors) too large (${resultString.length} bytes), returning error message instead.`);
-                // Return only the logs/errors and a message indicating the result was too large
-                const truncatedOutput = {
-                    result: "[Result omitted due to excessive size]",
-                    logs: evalOutput.logs, // Keep logs/errors if possible
-                    errors: [...evalOutput.errors, `Execution successful, but the JSON result combined with logs/errors is too large (${(resultString.length / 1024 / 1024).toFixed(1)} MB) to return.`],
-                };
-                 resultString = JSON.stringify(truncatedOutput, null, 2);
-
-                 // Final safety check in case logs/errors themselves are huge
-                 if (resultString.length > MAX_JSON_LENGTH) {
-                     resultString = JSON.stringify({
-                         result: "[Result omitted due to excessive size]",
-                         logs: ["Logs omitted due to excessive size"],
-                         errors: ["Errors omitted due to excessive size", "Output exceeded size limit"]
-                     });
-                 }
-            }
-             // Determine if the overall operation should be marked as an MCP error
-             // Mark as error if the eval logic caught a fatal error (represented by non-empty errors array AND undefined result)
-             const isError = finalOutput.errors.length > 0 && finalOutput.result === undefined;
-
-            return { content: [{ type: "text", text: resultString }], isError: isError }; // Set isError flag based on execution outcome
 
         } catch (resyncError: any) { // Catch errors from handleResync specifically
-            console.error(`Error during implicit resync for eval_record:`, resyncError);
-             // If resync fails, we can't run eval. Return specific error.
-             const errorOutput = {
-                 result: undefined,
-                 logs: [],
-                 errors: [`Failed to prepare data for evaluation: ${resyncError.message}`]
-             };
-             return { content: [{ type: "text", text: JSON.stringify(errorOutput, null, 2)}], isError: true };
+             // ... (Resync error handling remains the same) ...
+             console.error(`Error during implicit resync for eval_record:`, resyncError);
+              // If resync fails, we can't run eval. Return specific error.
+              const errorOutput = {
+                  result: undefined,
+                  logs: [],
+                  errors: [`Failed to prepare data for evaluation: ${resyncError.message}`]
+              };
+              return { content: [{ type: "text", text: JSON.stringify(errorOutput, null, 2)}], isError: true };
         }
     }
 );
 
-// resync_record registration remains the same...
+// resync_record registration (No changes needed inside the handler itself, handleResync does the work)
 mcpServer.tool(
     "resync_record",
     ResyncRecordInputSchema.shape, // Pass .shape
@@ -1663,9 +1795,8 @@ app.get(MCP_SERVER_EHR_CALLBACK_PATH, async (req, res) => {
             ehrTokenExpiry: ehrTokens.expires_in ? Math.floor(Date.now() / 1000) + ehrTokens.expires_in : undefined,
             ehrGrantedScopes: ehrTokens.scope,
             ehrPatientId: patientId,
-            // Corrected: Assign the record part of fetchedData to the session record
-            record: fetchedData.record,
-            db,
+            fullEhr: fetchedData, // Assign the fetched FullEHR data
+            db, // Assign the potentially initialized DB connection
             mcpClientInfo, // Now guaranteed to be defined
             mcpAuthCodeChallenge: pendingAuth.mcpCodeChallenge, // Store challenge for token exchange
             mcpAuthCodeRedirectUri: pendingAuth.mcpRedirectUri, // Store redirect URI for token exchange
@@ -2119,20 +2250,23 @@ const shutdown = async () => {
         } else {
             console.log("Express server closed.");
         }
+    }); // Make server close async if needed, but often it's sync
+
     await mcpServer.close().catch(e => console.error("Error closing MCP server:", e));
+
     for (const [id, session] of activeSessions.entries()) {
-        try { session.db.close(); } catch(e) { console.error(`Error closing DB for session ${id}:`, e); }
+        // Close DB if it exists for the session
+        if (session.db) { // Check if db exists before closing
+            try {
+                session.db.close();
+            } catch (e) {
+                console.error(`Error closing DB for session ${id}:`, e);
+            }
+        }
     }
     activeSessions.clear();
-    console.log("Closed active sessions and DBs.");
-        process.exit(err ? 1 : 0);
-    });
-
-    // Force close remaining connections after a timeout
-    setTimeout(() => {
-        console.error("Could not close connections gracefully, forcing shutdown.");
-        process.exit(1);
-    }, 10000); // 10 seconds timeout
+    console.log("Closed active sessions and DBs (if existed).");
+    process.exit(0); // Assume success unless Express closing failed earlier (handle that if needed)
 };
 
 // Replace process listeners to use new shutdown
