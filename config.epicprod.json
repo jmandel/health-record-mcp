@@ -1,0 +1,28 @@
+
+{
+  "ehr": {
+    "fhirBaseUrl": "https://epicfhir.unitypoint.org/ProdFHIR/api/FHIR/R4",
+    "clientId": "4b080c5a-bc22-409f-9078-2f4828905562",
+    "authUrl": null,
+    "tokenUrl": null,
+    "requiredScopes": [ "patient/*.rs" ]
+  },
+  "server": {
+    "host": "localhost",
+    "port": 8443,
+    "baseUrl": "https://healthsearch.snarked.com:8443",
+    "https": {
+      "enabled": true,
+      "keyPath": "./healthsearch.snarked.com+3-key.pem",
+      "certPath": "./healthsearch.snarked.com+3.pem"
+    },
+    "ehrCallbackPath": "/ehr-callback"
+  },
+  "persistence": {
+    "enabled": true,
+    "directory": "./data"
+  },
+  "security": {
+    "disableClientChecks": true
+  }
+} 
