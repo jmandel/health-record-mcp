@@ -29,6 +29,7 @@ import pkceChallenge, { verifyChallenge } from 'pkce-challenge';
 import { v4 as uuidv4 } from 'uuid';
 import vm from 'vm';
 import { z } from 'zod';
+import { Command } from 'commander';
 
 // --- RTF Parser Imports ---
 import { deEncapsulateSync } from 'rtf-stream-parser';
@@ -123,32 +124,53 @@ const KNOWN_ATTACHMENT_PATHS = new Map<string, string[]>([
     ['Contract', ['legal.contentAttachment', 'rule.contentAttachment']]
 ]);
 
+/**
+ * Resolves a relative or absolute path against the FHIR base URL.
+ * Ensures correct joining regardless of trailing slash on the base URL.
+ * Handles both relative paths (e.g., "Patient/123", "Observation?category=...") and absolute URLs.
+ * @param relativeOrAbsolutePath - The relative path (e.g., "Patient/123", "Observation?category=...") or an absolute URL.
+ * @param fhirBaseUrl - The base URL of the FHIR server.
+ * @returns The fully resolved URL object.
+ */
+function resolveFhirUrl(relativeOrAbsolutePath: string, fhirBaseUrl: string): URL {
+    try {
+        // Ensure the base URL itself is valid before using it
+        const baseWithSlash = fhirBaseUrl.endsWith("/") ? fhirBaseUrl : fhirBaseUrl + "/";
+        const base = new URL(baseWithSlash);
+        // Now resolve the relative/absolute path against the valid base
+        return new URL(relativeOrAbsolutePath, base);
+    } catch (error) {
+        console.error(`[URL RESOLVE] Error creating URL: relativeOrAbsolute='${relativeOrAbsolutePath}', base='${fhirBaseUrl}'`, error);
+        throw new Error(`Failed to resolve URL: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
 async function fetchAttachmentContent(attachmentUrl: string, fhirBaseUrl: string, accessToken: string): Promise<{ contentRaw: Buffer, contentType: string | null }> {
-    const resolvedUrl = new URL(attachmentUrl, fhirBaseUrl);
-    console.log(`[ATTACHMENT Fetch] GET ${resolvedUrl}`);
+    const resolvedUrl = resolveFhirUrl(attachmentUrl, fhirBaseUrl); // Use helper
+    console.log(`[ATTACHMENT Fetch] GET ${resolvedUrl.toString()}`); // Use toString()
     const headers = new Headers({ "Authorization": `Bearer ${accessToken}`, "Accept": "*/*" });
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
 
     try {
-        const response = await fetch(resolvedUrl.toString(), { headers: headers, signal: controller.signal });
+        const response = await fetch(resolvedUrl.toString(), { headers: headers, signal: controller.signal }); // Use toString()
         clearTimeout(timeoutId);
         if (!response.ok) {
             const errorBody = await response.text();
-            console.error(`[ATTACHMENT Fetch] Error ${response.status} from ${resolvedUrl}: ${errorBody}`);
-            throw new Error(`Attachment fetch failed with status ${response.status} for ${resolvedUrl}`);
+            console.error(`[ATTACHMENT Fetch] Error ${response.status} from ${resolvedUrl.toString()}: ${errorBody}`); // Use toString()
+            throw new Error(`Attachment fetch failed with status ${response.status} for ${resolvedUrl.toString()}`); // Use toString()
         }
         const contentRaw = Buffer.from(await response.arrayBuffer());
         const contentType = response.headers.get("Content-Type");
-        console.log(`[ATTACHMENT Fetch] Success (${contentRaw.length} bytes, Type: ${contentType || 'N/A'}) for ${resolvedUrl}`);
+        console.log(`[ATTACHMENT Fetch] Success (${contentRaw.length} bytes, Type: ${contentType || 'N/A'}) for ${resolvedUrl.toString()}`); // Use toString()
         return { contentRaw, contentType };
     } catch (error) {
         clearTimeout(timeoutId);
         if ((error as any).name === 'AbortError') {
-            console.error(`[ATTACHMENT Fetch] Timeout fetching ${resolvedUrl}`);
-            throw new Error(`Timeout fetching attachment: ${resolvedUrl}`);
+            console.error(`[ATTACHMENT Fetch] Timeout fetching ${resolvedUrl.toString()}`); // Use toString()
+            throw new Error(`Timeout fetching attachment: ${resolvedUrl.toString()}`); // Use toString()
         }
-        console.error(`[ATTACHMENT Fetch] Network/Fetch error for ${resolvedUrl}:`, error);
+        console.error(`[ATTACHMENT Fetch] Network/Fetch error for ${resolvedUrl.toString()}:`, error); // Use toString()
         throw error;
     }
 }
@@ -241,7 +263,7 @@ async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patient
     const fhirRecord: Record<string, any[]> = {};
     const processedAttachments: ProcessedAttachment[] = [];
     let totalFetched = 0;
-    const patientReadUrl = new URL(`Patient/${patientId}`, fhirBaseUrl).toString();
+    const patientReadUrl = resolveFhirUrl(`Patient/${patientId}`, fhirBaseUrl).toString(); // Use helper
     const searchQueries: { resourceType: string; params?: Record<string, string> }[] = [
         { resourceType: 'Observation', params: { 'category': 'laboratory', patient: patientId, '_count': '1000' } },
         { resourceType: 'Observation', params: { 'category': 'vital-signs', patient: patientId, '_count': '1000' } },
@@ -266,11 +288,11 @@ async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patient
 
     await Promise.allSettled(searchQueries.map(async (query) => {
         try {
-            const url = new URL(query.resourceType, fhirBaseUrl);
+            const url = resolveFhirUrl(query.resourceType, fhirBaseUrl); // Use helper
             if (query.params) {
                 Object.entries(query.params).forEach(([key, value]) => url.searchParams.set(key, value));
             }
-            const resources = await fetchAllPages(url.toString(), ehrAccessToken);
+            const resources = await fetchAllPages(url.toString(), ehrAccessToken); // Use toString()
             fhirRecord[query.resourceType] = resources;
             totalFetched += resources.length;
         } catch (error) {
@@ -297,7 +319,7 @@ async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patient
              if (node.url) {
                  console.log(`[DATA:ATTACHMENT Process] Found URL: ${node.url} in ${resourceType}/${resourceId} at ${path}`);
                  try {
-                     const fetched = await fetchAttachmentContent(node.url, fhirBaseUrl, ehrAccessToken);
+                     const fetched = await fetchAttachmentContent(node.url, fhirBaseUrl, ehrAccessToken); // Pass base URL directly
                      contentRaw = fetched.contentRaw;
                      if (fetched.contentType) {
                          finalContentType = fetched.contentType.split(';')[0].trim().toLowerCase();
@@ -462,125 +484,60 @@ async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patient
 }
 
 
-// --- SQLite Persistence Functions ---
+// --- SQLite Persistence Functions (NEW & REVISED) ---
+
+// Helper to get the file path (Unchanged logic, just moved)
 async function getSqliteFilePath(patientId: string): Promise<string> {
     if (!config.ehr.fhirBaseUrl) throw new Error("EHR FHIR Base URL not configured");
     const fhirUrl = new URL(config.ehr.fhirBaseUrl);
     const sanitizedOrigin = fhirUrl.origin
         .replace(/^https?:\/\//, '')
         .replace(/[^a-zA-Z0-9]/g, '_');
-
+    
     const sanitizedPatientId = patientId.replace(/[^a-zA-Z0-9]/g, '_');
-
-    // Use the configured persistence directory
+    
     return `${config.persistence.directory}/${sanitizedOrigin}__${sanitizedPatientId}.sqlite`;
 }
 
-async function loadSqliteFromDisk(patientId: string): Promise<Database | null> {
-    // Check config if persistence is enabled
-    if (!config.persistence.enabled) return null;
-
+// Initializes either a file-backed or in-memory DB based on config
+async function initializeDatabase(patientId: string): Promise<Database> {
+    if (config.persistence.enabled) {
     const filePath = await getSqliteFilePath(patientId);
-    try {
-        const fileExists = await Bun.file(filePath).exists();
-        if (!fileExists) {
-            console.log(`[SQLITE] No existing database file found for patient ${patientId}`);
-            return null;
-        }
-
-        console.log(`[SQLITE] Loading database from disk for patient ${patientId}`);
+        console.log(`[SQLITE Init] Initializing persistent database at: ${filePath}`);
+        // Bun automatically creates the file if it doesn't exist
+        // and handles persistence for file-backed DBs.
+        try {
         const db = new Database(filePath);
-
-        const tables = await db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fhir_%';").all() as { name: string }[];
-        if (tables.length === 0) {
-            console.warn(`[SQLITE] Database file exists but contains no FHIR tables. Treating as new.`);
-            db.close();
-            return null;
-        }
-
+            // Optional: Add PRAGMAs for performance/safety if needed
+            // db.exec("PRAGMA journal_mode = WAL;");
+            // db.exec("PRAGMA synchronous = NORMAL;");
         return db;
     } catch (error) {
-        console.error(`[SQLITE] Error loading database from disk:`, error);
-        return null;
+            console.error(`[SQLITE Init] Error initializing persistent database at ${filePath}:`, error);
+            throw new Error(`Failed to initialize persistent database: ${error}`);
+        }
+    } else {
+        console.log("[SQLITE Init] Initializing in-memory database.");
+        return new Database(':memory:');
     }
 }
 
-async function saveSqliteToDisk(patientId: string, db: Database): Promise<void> {
-    // Check config if persistence is enabled
-    if (!config.persistence.enabled) return;
-
-    const filePath = await getSqliteFilePath(patientId);
-    let diskDb: Database | null = null;
-    let allData: { name: string; sql: string; data: any[] }[] = [];
-
-    try {
-        console.log(`[SQLITE] Reading data from in-memory DB for patient ${patientId} before saving to disk...`);
-        const tables = await db.query("SELECT name, sql FROM sqlite_master WHERE type='table' AND (name LIKE 'fhir_%' OR name = 'attachments');").all() as { name: string; sql: string }[];
-
-        for (const table of tables) {
-            const tableData = await db.query(`SELECT * FROM "${table.name}";`).all();
-            allData.push({ name: table.name, sql: table.sql, data: tableData });
-            console.log(`[SQLITE Pre-Read] Read ${tableData.length} rows from ${table.name}.`);
-        }
-
-        console.log(`[SQLITE] Opening database file for writing: ${filePath}`);
-        diskDb = new Database(filePath);
-
-        console.log(`[SQLITE] Starting disk write transaction...`);
-        diskDb.exec('BEGIN IMMEDIATE TRANSACTION;');
-        try {
-            for (const tableInfo of allData) {
-                diskDb.exec(`DROP TABLE IF EXISTS "${tableInfo.name}";`);
-            }
-            for (const tableInfo of allData) {
-                diskDb.exec(tableInfo.sql);
-                if (tableInfo.data.length > 0) {
-                    const columnNames = Object.keys(tableInfo.data[0]).join(', ');
-                    const placeholders = Object.keys(tableInfo.data[0]).map(() => '?').join(', ');
-                    const stmt = diskDb.prepare(`INSERT INTO "${tableInfo.name}" (${columnNames}) VALUES (${placeholders})`);
-                    for (const row of tableInfo.data) {
-                        const values = Object.keys(tableInfo.data[0]).map(col => (row as any)[col]);
-                        stmt.run(...values);
-                    }
-                    stmt.finalize();
-                    console.log(`[SQLITE Disk Write] Inserted ${tableInfo.data.length} rows into ${tableInfo.name}.`);
-                }
-            }
-            diskDb.exec('COMMIT;');
-            console.log(`[SQLITE] Successfully saved database to ${filePath}`);
-        } catch (error) {
-            console.error(`[SQLITE] Error during disk save transaction:`, error);
-            diskDb.exec('ROLLBACK;');
-            throw error;
-        }
-    } catch (error) {
-        console.error(`[SQLITE] Error saving database to disk:`, error);
-        throw error;
-    } finally {
-        if (diskDb) {
-            try {
-                diskDb.close();
-                console.log(`[SQLITE] Closed disk database connection.`);
-            } catch (closeError) {
-                console.error(`[SQLITE] Error closing disk database connection:`, closeError);
-            }
-        }
-    }
-}
-
-async function populateSqlite(fullEhr: FullEHR, db: Database, patientId?: string): Promise<void> {
-    console.log("[SQLITE] Populating SQLite DB from FullEHR data...");
+// Populates the given DB instance (memory or file) - NO SAVE NEEDED
+async function populateSqlite(fullEhr: FullEHR, db: Database): Promise<void> {
+    console.log("[SQLITE Populate] Populating database from FullEHR data...");
     const { fhir: record, attachments } = fullEhr;
     const resourceTypes = Object.keys(record);
 
     db.exec('BEGIN TRANSACTION;');
     try {
+        // Drop existing tables first to ensure clean slate
         const tables = await db.query("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'fhir_%' OR name = 'attachments');").all() as { name: string }[];
         for (const table of tables) {
             db.exec(`DROP TABLE IF EXISTS "${table.name}";`);
         }
-        console.log("[SQLITE] Dropped existing tables.");
+        console.log("[SQLITE Populate] Dropped existing FHIR/attachment tables.");
 
+        // 1. Create/Populate FHIR resource tables
         for (const resourceType of resourceTypes) {
             const safeTableName = `fhir_${resourceType.replace(/[^a-zA-Z0-9_]/g, '_')}`;
             db.exec(`CREATE TABLE "${safeTableName}" (id TEXT PRIMARY KEY, resource_json TEXT NOT NULL);`);
@@ -593,20 +550,22 @@ async function populateSqlite(fullEhr: FullEHR, db: Database, patientId?: string
                         count++;
                     } catch (insertErr: any) {
                         if (insertErr?.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
-                            console.warn(`[SQLITE] Duplicate ID '${resource.id}' for ${resourceType}. Skipping.`);
+                            console.warn(`[SQLITE Populate] Duplicate ID '${resource.id}' for ${resourceType}. Skipping.`);
                         } else {
-                            throw insertErr;
+                            console.error(`[SQLITE Populate] Error inserting ${resourceType}/${resource.id}:`, insertErr);
+                            // Decide whether to throw or continue
                         }
                     }
                 } else {
-                    console.warn(`[SQLITE] Resource ${resourceType} missing ID or invalid, skipping.`);
+                    console.warn(`[SQLITE Populate] Resource ${resourceType} missing ID or invalid, skipping.`);
                 }
             }
             stmt.finalize();
-            console.log(`[SQLITE] Inserted ${count} resources into ${safeTableName}.`);
+            console.log(`[SQLITE Populate] Inserted ${count} resources into ${safeTableName}.`);
         }
 
-        console.log(`[SQLITE] Populating attachments table with ${attachments.length} entries...`);
+        // 2. Create/Populate attachments table
+        console.log(`[SQLITE Populate] Populating attachments table with ${attachments.length} entries...`);
         db.exec(`
             CREATE TABLE attachments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -614,11 +573,11 @@ async function populateSqlite(fullEhr: FullEHR, db: Database, patientId?: string
                 resource_id TEXT NOT NULL,
                 path TEXT NOT NULL,
                 content_type TEXT,
-                json TEXT NOT NULL,
-                content_raw BLOB,
-                content_plaintext TEXT,
+                json TEXT NOT NULL, -- Store the original JSON node
+                content_raw BLOB,    -- Store raw bytes if available
+                content_plaintext TEXT, -- Store extracted text if available
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(resource_type, resource_id, path, json)
+                UNIQUE(resource_type, resource_id, path, json) -- Use json in uniqueness constraint
             )
         `);
 
@@ -631,142 +590,173 @@ async function populateSqlite(fullEhr: FullEHR, db: Database, patientId?: string
             let attachCount = 0;
             for (const attach of attachments) {
                 try {
+                    // Ensure contentRaw is passed correctly (Buffer or null)
+                    const rawBuffer = attach.contentRaw instanceof Buffer ? attach.contentRaw : null;
                     attachStmt.run(
                         attach.resourceType,
                         attach.resourceId,
                         attach.path,
                         attach.contentType,
                         attach.json,
-                        attach.contentRaw,
+                        rawBuffer, // Pass Buffer or null
                         attach.contentPlaintext
                     );
                     attachCount++;
                 } catch (attachInsertErr: any) {
-                    console.error(`[SQLITE] Failed to insert attachment for ${attach.resourceType}/${attach.resourceId} at ${attach.path}:`, attachInsertErr);
+                    console.error(`[SQLITE Populate] Failed to insert attachment for ${attach.resourceType}/${attach.resourceId} at ${attach.path}:`, attachInsertErr);
                 }
             }
             attachStmt.finalize();
-            console.log(`[SQLITE] Inserted ${attachCount} attachments.`);
+            console.log(`[SQLITE Populate] Inserted ${attachCount} attachments.`);
         }
 
         db.exec('COMMIT;');
-        console.log("[SQLITE] DB population complete.");
+        console.log("[SQLITE Populate] Database population complete. Changes committed (or persisted if file-backed).");
 
-        // Save to disk if persistence is enabled and patientId provided
-        if (config.persistence.enabled && patientId) {
-            await saveSqliteToDisk(patientId, db);
-        }
+        // REMOVED: No need for explicit saveSqliteToDisk call
+
     } catch (err) {
-        console.error("[SQLITE] Error during DB population transaction:", err);
+        console.error("[SQLITE Populate] Error during DB population transaction:", err);
         try {
             db.exec('ROLLBACK;');
-            console.log("[SQLITE] Transaction rolled back.");
+            console.log("[SQLITE Populate] Transaction rolled back.");
         } catch (rollbackErr) {
-            console.error("[SQLITE] Error during rollback:", rollbackErr);
+            console.error("[SQLITE Populate] Error during rollback:", rollbackErr);
         }
+        // Re-throw the original error after attempting rollback
         throw err;
     }
 }
 
-async function handleResync(session: UserSession) {
-    console.log(`[RESYNC] Starting resync for session: ${session.sessionId}`);
-    if (!session.ehrAccessToken || !config.ehr.fhirBaseUrl || !session.ehrPatientId) {
-        console.error("[RESYNC] Cannot resync: Missing EHR access token, FHIR URL config, or Patient ID in session.");
-        throw new Error("Cannot resync data: Session is missing required EHR context or server configuration.");
-    }
-    const now = Math.floor(Date.now() / 1000);
-    if (session.ehrTokenExpiry && session.ehrTokenExpiry <= now) {
-        console.error(`[RESYNC] EHR token expired. Cannot resync.`);
-        throw new Error("EHR session token has expired. Re-auth required.");
-    }
-    console.log(`[RESYNC] Attempting resync with current EHR token.`);
-    console.log(`[RESYNC] Clearing existing data (in-memory fullEhr).`);
-    session.fullEhr = { fhir: {}, attachments: [] };
-
-    if (session.db) {
-        try {
-            session.db.close();
-            session.db = undefined;
-            console.log("[RESYNC] Closed existing database connection.");
-        } catch (e) {
-            console.warn("[RESYNC] Error closing existing database (may already be closed):", e);
-            session.db = undefined;
-        }
-    }
-
-    // Initialize DB connection based on persistence config
-    let dbForPopulation: Database | null = null;
-    if (config.persistence.enabled && session.ehrPatientId) {
-        dbForPopulation = await loadSqliteFromDisk(session.ehrPatientId);
-        if (dbForPopulation) {
-            console.log("[RESYNC] Loaded existing DB from disk for repopulation.");
-            session.db = dbForPopulation;
-        } else {
-            console.log("[RESYNC] No existing DB found on disk, creating new in-memory DB for population.");
-            dbForPopulation = new Database(':memory:');
-            session.db = dbForPopulation;
-        }
-    } else {
-        console.log("[RESYNC] Persistence disabled or no patient ID. DB will be created in-memory if needed later by query_record.");
-    }
+// NEW function to reconstruct FullEHR from DB
+async function reconstructFullEhrFromDb(db: Database): Promise<FullEHR> {
+    console.log("[SQLITE Reconstruct] Reconstructing FullEHR from database...");
+    const fullEhr: FullEHR = { fhir: {}, attachments: [] };
 
     try {
-        console.log("[RESYNC] Fetching EHR data and processing attachments...");
-        const fetchedFullEhr = await fetchEhrData(session.ehrAccessToken, config.ehr.fhirBaseUrl!, session.ehrPatientId!);
-        session.fullEhr = fetchedFullEhr;
+        // 1. Reconstruct FHIR resources
+        const fhirTables = await db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fhir_%';").all() as { name: string }[];
+        console.log(`[SQLITE Reconstruct] Found ${fhirTables.length} FHIR tables.`);
 
-        // Populate the database IF a connection exists (implies persistence enabled or lazy-load happened)
-        if (session.db) {
-            console.log("[RESYNC] Populating database...");
-            await populateSqlite(session.fullEhr, session.db, session.ehrPatientId);
-        } else {
-            console.log("[RESYNC] Skipping database population (persistence disabled or DB not initialized).");
+        for (const table of fhirTables) {
+            const resourceType = table.name.replace(/^fhir_/, '');
+            const rows = await db.query(`SELECT resource_json FROM "${table.name}";`).all() as { resource_json: string }[];
+            fullEhr.fhir[resourceType] = rows.map(row => {
+                try {
+                    return JSON.parse(row.resource_json);
+        } catch (e) {
+                    console.error(`[SQLITE Reconstruct] Failed to parse JSON for a resource in ${table.name}:`, e);
+                    return null; // Or handle error differently
+                }
+            }).filter(r => r !== null); // Filter out parse failures
+            console.log(`[SQLITE Reconstruct] Reconstructed ${fullEhr.fhir[resourceType].length} resources of type ${resourceType}.`);
         }
 
-        console.log(`[RESYNC] Data re-fetched and processed into memory (fullEhr). DB populated if applicable.`);
-    } catch (fetchOrPopulateErr) {
-        console.error(`[RESYNC] Failed during fetch or population:`, fetchOrPopulateErr);
-        try { session.db?.close(); session.db = undefined; } catch(e) { console.warn("[RESYNC] Error closing DB after failed resync:", e); }
-        throw new Error(`Failed to refresh data from EHR: ${fetchOrPopulateErr instanceof Error ? fetchOrPopulateErr.message : String(fetchOrPopulateErr)}`);
+        // 2. Reconstruct Attachments
+        try {
+            const attachmentRows = await db.query(`
+                SELECT resource_type, resource_id, path, content_type, json, content_raw, content_plaintext
+                FROM attachments;
+            `).all() as {
+                resource_type: string; resource_id: string; path: string; content_type: string;
+                json: string; content_raw: Buffer | null; content_plaintext: string | null; // Bun returns Buffer for BLOB
+            }[];
+
+            fullEhr.attachments = attachmentRows.map(row => {
+                // Basic reconstruction. Assumes `json` field contains the necessary original info if needed.
+                // Bun automatically returns BLOB columns as Buffers.
+                return {
+                    resourceType: row.resource_type,
+                    resourceId: row.resource_id,
+                    path: row.path,
+                    contentType: row.content_type,
+                    json: row.json, // The original JSON node string
+                    contentRaw: row.content_raw, // Should be Buffer or null
+                    contentPlaintext: row.content_plaintext
+                };
+            });
+            console.log(`[SQLITE Reconstruct] Reconstructed ${fullEhr.attachments.length} attachments.`);
+        } catch (e: any) {
+             // Handle case where attachments table might not exist yet
+             if (e.message?.includes('no such table: attachments')) {
+                 console.warn("[SQLITE Reconstruct] Attachments table not found, assuming no attachments.");
+                 fullEhr.attachments = [];
+        } else {
+                 console.error("[SQLITE Reconstruct] Error querying attachments table:", e);
+                 throw e; // Re-throw other errors
+             }
+         }
+
+
+    } catch (error) {
+        console.error("[SQLITE Reconstruct] Error reconstructing FullEHR from database:", error);
+        // Depending on requirements, might return partial data or throw
+        throw new Error(`Failed to reconstruct EHR data from DB: ${error}`);
     }
+
+    console.log("[SQLITE Reconstruct] FullEHR reconstruction complete.");
+    return fullEhr;
 }
 
+
+// --- `getSessionDb` (Revised) ---
+// Ensures DB is initialized for the session, using the appropriate backend
 async function getSessionDb(session: UserSession): Promise<Database> {
+    // Check if DB exists and is open
     if (session.db) {
         try {
-            session.db.query("PRAGMA user_version;").get();
+            session.db.query("PRAGMA user_version;").get(); // Simple query to check if open
+            // console.log(`[DB GET] Using existing open DB connection for session (Patient: ${session.ehrPatientId}).`);
             return session.db;
         } catch (e) {
-            console.warn(`[DB GET] Session DB for patient ${session.ehrPatientId} was closed. Reinitializing.`);
-            session.db = undefined;
+            console.warn(`[DB GET] Session DB for patient ${session.ehrPatientId} was closed or invalid. Reinitializing.`);
+            session.db = undefined; // Clear closed/invalid reference
         }
     }
 
-    console.log(`[DB GET] Initializing DB connection for session (Patient: ${session.ehrPatientId}).`);
-    let newDb: Database | null = null;
-    if (config.persistence.enabled && session.ehrPatientId) {
-        newDb = await loadSqliteFromDisk(session.ehrPatientId);
-        if (newDb) {
-            console.log("[DB GET] Loaded existing DB from disk.");
+    // Initialize new DB connection (file or memory)
+    console.log(`[DB GET] Initializing new DB connection for session (Patient: ${session.ehrPatientId}). Persistence: ${config.persistence.enabled}`);
+    if (!session.ehrPatientId) {
+         // Should generally not happen if called appropriately, but safety check
+         console.error("[DB GET] Cannot initialize DB without patientId in session.");
+         throw new Error("Cannot initialize database without patient context.");
+    }
+    const newDb = await initializeDatabase(session.ehrPatientId);
+    session.db = newDb; // Store the initialized DB in the session
+
+    // If persistence is DISABLED, we need to populate the new in-memory DB from fullEhr
+    // If persistence is ENABLED, the DB file might already contain data (from previous runs)
+    // or it might be empty (first run). We rely on handleResync or the initial background fetch
+    // to populate it correctly later. reconstructFullEhrFromDb could be used here if needed,
+    // but let's keep population tied to data fetching for now.
+    let shouldPopulate = false;
+    if (!config.persistence.enabled) {
+        console.log("[DB GET] Persistence disabled. Will populate in-memory DB if fullEhr data exists.");
+        shouldPopulate = true;
         } else {
-            console.log("[DB GET] No existing DB on disk, creating new in-memory DB and populating.");
-            newDb = new Database(':memory:');
-            if (session.fullEhr && (Object.keys(session.fullEhr.fhir).length > 0 || session.fullEhr.attachments.length > 0)) {
-                await populateSqlite(session.fullEhr, newDb, session.ehrPatientId);
+        // For persistent DBs, check if it's empty (e.g., first time use)
+        try {
+            const tables = await newDb.query("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'fhir_%' OR name = 'attachments');").all();
+            if (tables.length === 0) {
+                 console.log("[DB GET] Persistent DB is empty. Will populate if fullEhr data exists.");
+                 shouldPopulate = true;
             } else {
-                 console.warn("[DB GET] In-memory fullEhr data is empty, cannot populate new DB.");
+                 console.log("[DB GET] Persistent DB exists and has tables. Population will be handled by resync/fetch if necessary.");
              }
-        }
-    } else {
-        console.log("[DB GET] Persistence disabled or no patient ID, creating new in-memory DB and populating.");
-        newDb = new Database(':memory:');
-        if (session.fullEhr && (Object.keys(session.fullEhr.fhir).length > 0 || session.fullEhr.attachments.length > 0)) {
-            await populateSqlite(session.fullEhr, newDb, session.ehrPatientId);
-        } else {
-             console.warn("[DB GET] In-memory fullEhr data is empty, cannot populate new DB.");
+        } catch (dbCheckError) {
+             console.error("[DB GET] Error checking persistent DB tables, attempting population:", dbCheckError);
+             shouldPopulate = true; // Attempt population on error
          }
     }
-    session.db = newDb;
+
+
+    if (shouldPopulate && session.fullEhr && (Object.keys(session.fullEhr.fhir).length > 0 || session.fullEhr.attachments.length > 0)) {
+        console.log("[DB GET] Populating newly initialized DB from existing session fullEhr data.");
+        await populateSqlite(session.fullEhr, newDb); // No patientId needed here as saving is automatic for file DBs
+    } else if (shouldPopulate) {
+         console.warn("[DB GET] DB is new/in-memory but session fullEhr data is empty. Cannot populate.");
+     }
+
     return session.db;
 }
 
@@ -824,10 +814,26 @@ const ResyncRecordOutputSchema = z.object({ message: z.string() }).describe("A c
 const EvalRecordInputSchema = z.object({
     code: z.string().min(1).describe(
         `A string containing the body of an async JavaScript function.
-        This function will receive 'fullEhr' ({ fhir: Record<string, any[]>, attachments: ProcessedAttachment[] }), a limited 'console' object, and the Lodash library as '_' (underscore).
-        Console output (log, warn, error) will be captured.
-        It MUST end with a 'return' statement providing a JSON-serializable value.
-        Example: 'const conditions = fullEhr.fhir["Condition"] || []; return _.filter(conditions, c => c.clinicalStatus?.coding?.[0]?.code === "active");'`
+        This function receives the following arguments:
+        1. 'fullEhr': An object containing the patient's EHR data:
+           - 'fullEhr.fhir': An object where keys are FHIR resource type strings (e.g., "Patient", "Observation", "DocumentReference") and values are arrays of the corresponding FHIR resource JSON objects fetched from the EHR.
+           - 'fullEhr.attachments': An array of processed attachment objects. Each object typically includes:
+             - 'resourceType': The FHIR type of the resource the attachment belongs to (e.g., "DocumentReference").
+             - 'resourceId': The ID of the parent FHIR resource.
+             - 'path': The path within the parent resource where the attachment was found (e.g., "content.attachment").
+             - 'contentType': The MIME type of the attachment (e.g., "text/plain", "application/pdf").
+             - 'contentPlaintext': The extracted plaintext content of the attachment, if available and text-based (string or null).
+             - 'contentRaw': Raw attachment bytes as a Buffer, if available (Buffer or null).
+             - 'json': The original JSON string of the attachment node from the FHIR resource.
+        2. 'console': A limited console object (log, warn, error) for capturing output.
+        3. '_': The Lodash library, accessible via the underscore variable.
+
+        The function MUST conclude with a 'return' statement providing a JSON-serializable value. Console output will be captured separately.
+
+        Example Input JSON:
+        {
+          "code": "const conditions = fullEhr.fhir[\\"Condition\\"] || [];\\nconst activeConditions = _.filter(conditions, c => c.clinicalStatus?.coding?.[0]?.code === 'active');\\nconsole.log(\`Found \${activeConditions.length} active conditions.\`);\\nreturn activeConditions.map(c => ({ id: c.id, code: c.code?.text }));"
+        }`
     )
 });
 
@@ -1118,18 +1124,19 @@ class MyOAuthServerProvider implements OAuthServerProvider {
         const session = activeSessions.get(tokenToRevoke);
 
         if (session) {
-            // Use config for client check bypass
             if (!config.security.disableClientChecks && session.mcpClientInfo.client_id !== mcpClientInfo.client_id) {
                 console.warn(`[AUTH Provider] Revocation attempt failed: Client ${mcpClientInfo.client_id} does not own token ${tokenToRevoke.substring(0, 8)}...`);
-                // Proceed silently for simplicity
             }
 
+            // Close the associated database connection IF IT EXISTS AND IS OPEN
             if (session.db) {
                 try {
+                    console.log(`[AUTH Provider] Closing database connection for revoked session (Token: ${tokenToRevoke.substring(0, 8)}...).`);
                     session.db.close();
-                    console.log(`[AUTH Provider] Closed database connection for revoked session (Token: ${tokenToRevoke.substring(0, 8)}...).`);
+                    session.db = undefined; // Clear reference
                 } catch(e) {
                     console.error(`Error closing DB for session on revoke (Token: ${tokenToRevoke.substring(0, 8)}...):`, e);
+                     session.db = undefined; // Clear reference even on error
                 }
             }
 
@@ -1219,15 +1226,9 @@ mcpServer.tool(
         if (!session) throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
 
         try {
-            if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
-                console.warn(`[TOOL query_record] Session ${session.sessionId} fullEhr missing or empty. Attempting implicit resync.`);
-                await handleResync(session);
-                if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
-                     throw new Error("Data could not be loaded after resync attempt.");
-                 }
-            }
-
+            // Ensure DB is initialized using the helper - this handles population if needed
             const db = await getSessionDb(session);
+
             const resultData = await queryRecordLogic(db, args.sql);
              const MAX_JSON_LENGTH = 500 * 1024; // 500 KB limit
              let resultString = JSON.stringify(resultData, null, 2);
@@ -1238,6 +1239,7 @@ mcpServer.tool(
             return { content: [{ type: "text", text: resultString }] };
         } catch (error: any) {
             console.error(`Error executing tool query_record:`, error);
+             // Check if it's a DB init/population error from getSessionDb or SQL error
             return { content: [{ type: "text", text: `Error executing query_record: ${error.message}` }], isError: true };
         }
     }
@@ -1248,36 +1250,28 @@ mcpServer.tool(
     EvalRecordInputSchema.shape,
     async (args, extra) => {
          const transportSessionId = extra.sessionId;
-         if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
+        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
          const transportEntry = activeSseTransports.get(transportSessionId);
-         if (!transportEntry) throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
+        if (!transportEntry) throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
          const mcpAccessToken = transportEntry.mcpAccessToken;
          const session = activeSessions.get(mcpAccessToken);
-         if (!session) throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
+        if (!session) throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
 
         try {
-             let needsResync = !session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0;
-              if (needsResync) {
-                  console.warn(`[TOOL eval_record] Session ${session.sessionId} fullEhr missing or empty. Attempting implicit resync.`);
-                  await handleResync(session);
-                  if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
-                       throw new Error("Data could not be loaded after resync attempt for eval.");
-                   }
-              }
-
+            // Execute the sandboxed code - passing fullEhr
             const evalOutput = await evalRecordLogic(session.fullEhr, args.code);
              const finalOutput = {
-                 result: evalOutput.result,
+                result: evalOutput.result,
                  logs: evalOutput.logs,
                  errors: evalOutput.errors,
              };
              const MAX_JSON_LENGTH = 1 * 1024 * 1024; // 1 MB limit
              let resultString = JSON.stringify(finalOutput, null, 2);
              if (resultString.length > MAX_JSON_LENGTH) {
-                 console.warn(`[TOOL eval_record] Final output too large (${resultString.length} bytes), returning error message.`);
+                console.warn(`[TOOL eval_record] Final output too large (${resultString.length} bytes), returning error message.`);
                  const truncatedOutput = {
                      result: "[Result omitted due to excessive size]",
-                     logs: evalOutput.logs,
+                    logs: evalOutput.logs,
                      errors: [...evalOutput.errors, `Execution successful, but the JSON result combined with logs/errors is too large (${(resultString.length / 1024 / 1024).toFixed(1)} MB) to return.`],
                  };
                   resultString = JSON.stringify(truncatedOutput, null, 2);
@@ -1290,38 +1284,15 @@ mcpServer.tool(
                   }
              }
               const isError = finalOutput.errors.length > 0 && finalOutput.result === undefined;
-             return { content: [{ type: "text", text: resultString }], isError: isError };
-        } catch (resyncError: any) {
-             console.error(`Error during implicit resync for eval_record:`, resyncError);
+            return { content: [{ type: "text", text: resultString }], isError: isError };
+        } catch (evalOrResyncError: any) { // Catch errors from implicit resync or eval itself
+             console.error(`Error during eval_record (potentially during implicit resync):`, evalOrResyncError);
               const errorOutput = {
                   result: undefined,
-                  logs: [],
-                  errors: [`Failed to prepare data for evaluation: ${resyncError.message}`]
+                  logs: [], // Logs from evalLogic might not be available if resync failed
+                  errors: [`Failed during evaluation or data preparation: ${evalOrResyncError.message}`]
               };
               return { content: [{ type: "text", text: JSON.stringify(errorOutput, null, 2)}], isError: true };
-        }
-    }
-);
-
-mcpServer.tool(
-    "resync_record",
-    ResyncRecordInputSchema.shape,
-    async (args, extra) => {
-        const transportSessionId = extra.sessionId;
-        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
-        const transportEntry = activeSseTransports.get(transportSessionId);
-        if (!transportEntry) throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
-        const mcpAccessToken = transportEntry.mcpAccessToken;
-        const session = activeSessions.get(mcpAccessToken);
-        if (!session) throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
-
-        try {
-            await handleResync(session);
-            const resultData = { message: "Record resynchronization attempt complete." };
-            return { content: [{ type: "text", text: JSON.stringify(resultData) }] };
-        } catch (error: any) {
-            console.error(`Error executing tool resync_record:`, error);
-            return { content: [{ type: "text", text: `Error executing resync_record: ${error.message}` }], isError: true };
         }
     }
 );
@@ -1332,171 +1303,183 @@ const app = express();
 // --- Main Application Startup Function ---
 async function main() {
     try {
-        // Load configuration first
-        const configPath = Bun.env.MCP_CONFIG_PATH || './config.json';
-        config = await loadConfig(configPath); // Assign to global config variable
+        // Set up command-line argument parsing
+        const program = new Command();
+        program
+            .name('smart-mcp')
+            .description('SMART on FHIR MCP Server')
+            .version('0.5.0')
+            .option('-c, --config <path>', 'Path to configuration file', './config.json')
+            .parse(process.argv);
+        
+        const options = program.opts();
+        const configPath = options.config || Bun.env.MCP_CONFIG_PATH || './config.json';
+        
+        console.log(`[CONFIG] Loading configuration from: ${configPath}`);
+        config = await loadConfig(configPath);
 
-        // Middleware
+// Middleware
         app.use(cors());
         app.use(express.urlencoded({ extended: true }));
 
-        // Logging Middleware
-        app.use((req, res, next) => {
-            console.log(`[HTTP] ${req.method} ${req.path}`);
-            next();
-        });
+// Logging Middleware
+app.use((req, res, next) => {
+    console.log(`[HTTP] ${req.method} ${req.path}`);
+    next();
+});
 
-        // --- EHR Callback Handling ---
-        // Use config for paths and URLs
+        // --- EHR Callback Handling (Revised DB Handling) ---
         app.get(config.server.ehrCallbackPath, async (req, res) => {
-            const ehrCode = req.query.code as string | undefined;
-            const ehrState = req.query.state as string | undefined;
+    const ehrCode = req.query.code as string | undefined;
+    const ehrState = req.query.state as string | undefined;
 
-            if (!ehrCode || !ehrState) {
-                res.status(400).send("Missing code or state from EHR.");
-                return;
-            }
+    if (!ehrCode || !ehrState) {
+        res.status(400).send("Missing code or state from EHR.");
+        return;
+    }
 
             const pendingAuth = pendingEhrAuth.get(ehrState);
             pendingEhrAuth.delete(ehrState);
 
-            if (!pendingAuth) {
-                res.status(400).send("Invalid or expired state parameter from EHR.");
-                return;
-            }
+    if (!pendingAuth) {
+        res.status(400).send("Invalid or expired state parameter from EHR.");
+        return;
+    }
             console.log(`[AUTH Callback] Processing EHR callback for state: ${ehrState}, MCP Client: ${pendingAuth.mcpClientId}`);
 
             try {
                 console.log(`[AUTH Callback] Exchanging EHR code at ${config.ehr.tokenUrl}`);
-                const tokenParams = new URLSearchParams({
-                    grant_type: "authorization_code",
-                    code: ehrCode,
+        const tokenParams = new URLSearchParams({
+            grant_type: "authorization_code",
+            code: ehrCode,
                     redirect_uri: `${config.server.baseUrl}${config.server.ehrCallbackPath}`,
                     client_id: config.ehr.clientId!, // Should be validated by loadConfig
-                    code_verifier: pendingAuth.ehrCodeVerifier,
-                });
+            code_verifier: pendingAuth.ehrCodeVerifier,
+        });
                 const tokenResponse = await fetch(config.ehr.tokenUrl!, { // Should be validated by loadConfig
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Accept": "application/json"
-                    },
-                    body: tokenParams,
-                });
+            method: "POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json"
+            },
+            body: tokenParams,
+        });
 
-                if (!tokenResponse.ok) {
-                    const errBody = await tokenResponse.text();
+        if (!tokenResponse.ok) {
+            const errBody = await tokenResponse.text();
                     console.error(`[AUTH Callback] EHR token exchange failed (${tokenResponse.status}): ${errBody}`);
-                    throw new Error(`EHR token exchange failed: ${tokenResponse.statusText}`);
-                }
+            throw new Error(`EHR token exchange failed: ${tokenResponse.statusText}`);
+        }
                 const ehrTokens = await tokenResponse.json() as any;
                 const patientId = ehrTokens.patient;
-                if (!patientId) {
+        if (!patientId) {
                     console.error("[AUTH Callback] Crucial Error: Patient ID not returned.");
-                    throw new Error("Patient context (patient ID) was not provided by the EHR.");
-                }
+            throw new Error("Patient context (patient ID) was not provided by the EHR.");
+        }
                 console.log(`[AUTH Callback] Received EHR tokens (Access Token: ${ehrTokens?.access_token?.substring(0, 8)}..., Patient: ${patientId})`);
 
                 if (!config.ehr.fhirBaseUrl) { // Should not happen due to loadConfig validation
-                    console.error("[AUTH Callback] Configuration Error: EHR_FHIR_URL is not defined.");
-                    throw new Error("Server configuration error: FHIR Base URL is missing.");
-                }
+            console.error("[AUTH Callback] Configuration Error: EHR_FHIR_URL is not defined.");
+            throw new Error("Server configuration error: FHIR Base URL is missing.");
+        }
 
-                let db: Database | undefined = undefined; // Initialize as undefined
-                if (config.persistence.enabled) {
-                    db = await loadSqliteFromDisk(patientId) ?? undefined; // Assign null if load fails, then undefined
-                    if (db) {
-                        console.log(`[AUTH Callback] Loaded existing DB from disk for patient ${patientId}.`);
-                    } else {
-                        // Don't create in-memory here, let getSessionDb handle it if needed
-                        console.log(`[AUTH Callback] No persistent DB found for patient ${patientId}. Will use in-memory if needed.`);
-                    }
-                } else {
-                     console.log(`[AUTH Callback] Persistence disabled. Will use in-memory DB if needed.`);
-                }
+                let db: Database | undefined = undefined; // Start as undefined
+                // DB will be initialized lazily later by getSessionDb when needed
+                console.log("[AUTH Callback] DB will be initialized on first use (via getSessionDb).");
 
-
-                let mcpClientInfo: OAuthClientInformationFull | undefined;
+        let mcpClientInfo: OAuthClientInformationFull | undefined;
                 if (config.security.disableClientChecks) {
-                    console.log(`[AUTH Callback] Client checks disabled. Creating placeholder client info for: ${pendingAuth.mcpClientId}`);
-                    mcpClientInfo = {
-                        client_id: pendingAuth.mcpClientId,
-                        client_name: `Placeholder Client (${pendingAuth.mcpClientId})`,
+            console.log(`[AUTH Callback] Client checks disabled. Creating placeholder client info for: ${pendingAuth.mcpClientId}`);
+            mcpClientInfo = {
+                client_id: pendingAuth.mcpClientId,
+                client_name: `Placeholder Client (${pendingAuth.mcpClientId})`,
                         redirect_uris: [pendingAuth.mcpRedirectUri],
                         token_endpoint_auth_method: 'none',
                         scope: 'offline_access',
                         grant_types: ['authorization_code'],
                         response_types: ['code'],
-                    };
-                } else {
-                    mcpClientInfo = await oauthProvider.clientsStore.getClient(pendingAuth.mcpClientId);
-                    if (!mcpClientInfo) {
-                         console.error(`[AUTH Callback] Failed to retrieve MCP client info for ID: ${pendingAuth.mcpClientId} during callback.`);
-                        throw new Error("MCP Client information not found during callback processing.");
-                    }
-                }
+            };
+        } else {
+            mcpClientInfo = await oauthProvider.clientsStore.getClient(pendingAuth.mcpClientId);
+            if (!mcpClientInfo) {
+                 console.error(`[AUTH Callback] Failed to retrieve MCP client info for ID: ${pendingAuth.mcpClientId} during callback.`);
+                throw new Error("MCP Client information not found during callback processing.");
+            }
+        }
 
-                const session: UserSession = {
+        const session: UserSession = {
                     sessionId: "",
                     mcpAccessToken: "",
-                    ehrAccessToken: ehrTokens.access_token,
-                    ehrTokenExpiry: ehrTokens.expires_in ? Math.floor(Date.now() / 1000) + ehrTokens.expires_in : undefined,
-                    ehrGrantedScopes: ehrTokens.scope,
-                    ehrPatientId: patientId,
+            ehrAccessToken: ehrTokens.access_token,
+            ehrTokenExpiry: ehrTokens.expires_in ? Math.floor(Date.now() / 1000) + ehrTokens.expires_in : undefined,
+            ehrGrantedScopes: ehrTokens.scope,
+            ehrPatientId: patientId,
                     fullEhr: { fhir: {}, attachments: [] }, // Initialize empty
-                    db, // Assign loaded or undefined DB
+                    db, // Assign undefined initially
                     mcpClientInfo,
                     mcpAuthCodeChallenge: pendingAuth.mcpCodeChallenge,
                     mcpAuthCodeRedirectUri: pendingAuth.mcpRedirectUri,
                 };
 
-                const mcpAuthCode = `mcp-code-${uuidv4()}`;
+        const mcpAuthCode = `mcp-code-${uuidv4()}`;
                 session.mcpAuthCode = mcpAuthCode;
                 sessionsByMcpAuthCode.set(mcpAuthCode, session);
 
-                const clientRedirectUrl = new URL(pendingAuth.mcpRedirectUri);
+        const clientRedirectUrl = new URL(pendingAuth.mcpRedirectUri);
                 clientRedirectUrl.searchParams.set("code", mcpAuthCode);
-                if (pendingAuth.mcpOriginalState) clientRedirectUrl.searchParams.set("state", pendingAuth.mcpOriginalState);
-                console.log(`[AUTH Callback] Redirecting back to MCP Client with MCP Auth Code: ${clientRedirectUrl.toString()}`);
-                res.redirect(302, clientRedirectUrl.toString());
+        if (pendingAuth.mcpOriginalState) clientRedirectUrl.searchParams.set("state", pendingAuth.mcpOriginalState);
+        console.log(`[AUTH Callback] Redirecting back to MCP Client with MCP Auth Code: ${clientRedirectUrl.toString()}`);
+        res.redirect(302, clientRedirectUrl.toString());
 
-                // --- Background Data Fetch ---
-                console.log(`[AUTH Callback] Triggering background data fetch/populate for patient ${patientId}...`);
-                (async () => {
+        // --- Trigger Background Data Fetch & Populate --- 
+        console.log(`[AUTH Callback] Triggering background data fetch/populate for patient ${patientId}...`);
+        (async () => {
                     const bgPatientId = session.ehrPatientId!;
-                    console.log(`[AUTH Callback BG ${bgPatientId}] Starting background task.`);
-                    try {
-                        if (!session.ehrAccessToken || !config.ehr.fhirBaseUrl || !session.ehrPatientId) {
-                            throw new Error("Missing necessary session info for background fetch.");
-                        }
+            console.log(`[AUTH Callback BG ${bgPatientId}] Starting background task.`);
+            try {
+                         // Ensure we reference the potentially updated session object
+                         // It might have moved from sessionsByMcpAuthCode to activeSessions
+                         const getUpToDateSession = () => activeSessions.get(session.mcpAccessToken) || sessionsByMcpAuthCode.get(session.mcpAuthCode || '');
 
-                        console.log(`[AUTH Callback BG ${bgPatientId}] Fetching EHR data...`);
-                        const fetchedData = await fetchEhrData(session.ehrAccessToken, config.ehr.fhirBaseUrl!, session.ehrPatientId!);
-                        console.log(`[AUTH Callback BG ${bgPatientId}] Fetched ${Object.keys(fetchedData.fhir).length} resource types and ${fetchedData.attachments.length} attachments.`);
-
-                        // Find the up-to-date session reference (might be in activeSessions now)
-                        const currentSession = activeSessions.get(session.mcpAccessToken) || sessionsByMcpAuthCode.get(session.mcpAuthCode || '');
-                        if (currentSession) {
-                            currentSession.fullEhr = fetchedData;
-                            console.log(`[AUTH Callback BG ${bgPatientId}] Updated session fullEhr in memory.`);
-
-                            // Initialize and Populate DB if needed
-                            const dbToPopulate = await getSessionDb(currentSession); // Ensures DB exists
-                            console.log(`[AUTH Callback BG ${bgPatientId}] Populating database...`);
-                            await populateSqlite(currentSession.fullEhr, dbToPopulate, currentSession.ehrPatientId);
-                            console.log(`[AUTH Callback BG ${bgPatientId}] Database population complete.`);
-
-                        } else {
-                             console.log(`[AUTH Callback BG ${bgPatientId}] Session no longer active. Skipping fullEhr update and DB population.`);
+                         let currentSessionRef = getUpToDateSession();
+                         if (!currentSessionRef?.ehrAccessToken || !config.ehr.fhirBaseUrl || !currentSessionRef?.ehrPatientId) {
+                             console.log(`[AUTH Callback BG ${bgPatientId}] Session seems inactive or missing info. Aborting background task.`);
+                             return; // Exit if session is gone or lacks info
                          }
 
-                    } catch (backgroundError) {
-                        console.error(`[AUTH Callback BG ${bgPatientId}] Error during background data fetch/populate:`, backgroundError);
+                console.log(`[AUTH Callback BG ${bgPatientId}] Fetching EHR data...`);
+                console.log(currentSessionRef);
+                        const fetchedData = await fetchEhrData(currentSessionRef.ehrAccessToken, config.ehr.fhirBaseUrl!, currentSessionRef.ehrPatientId!);
+                console.log(`[AUTH Callback BG ${bgPatientId}] Fetched ${Object.keys(fetchedData.fhir).length} resource types and ${fetchedData.attachments.length} attachments.`);
+
+                        // Re-check session existence before updating/populating
+                        currentSessionRef = getUpToDateSession();
+                        if (currentSessionRef) {
+                            currentSessionRef.fullEhr = fetchedData;
+                    console.log(`[AUTH Callback BG ${bgPatientId}] Updated session fullEhr in memory.`);
+                    
+                            // Ensure DB is initialized and populate it
+                            try {
+                                const dbToPopulate = await getSessionDb(currentSessionRef); // Initializes if needed
+                        console.log(`[AUTH Callback BG ${bgPatientId}] Populating database...`);
+                                await populateSqlite(currentSessionRef.fullEhr, dbToPopulate);
+                        console.log(`[AUTH Callback BG ${bgPatientId}] Database population complete.`);
+                            } catch (dbError) {
+                                 console.error(`[AUTH Callback BG ${bgPatientId}] Error initializing or populating database:`, dbError);
                     }
-                })();
+
+                } else {
+                             console.log(`[AUTH Callback BG ${bgPatientId}] Session became inactive during fetch. Skipping fullEhr update and DB population.`);
+                 }
+
+            } catch (backgroundError) {
+                console.error(`[AUTH Callback BG ${bgPatientId}] Error during background data fetch/populate:`, backgroundError);
+                        // Consider closing DB if opened? getSessionDb might handle this on next call.
+            }
+                })(); // Immediately invoke
 
             } catch (error) { // Outer catch for pre-redirect errors
-                console.error("[AUTH Callback] Error processing EHR callback before redirect:", error);
+        console.error("[AUTH Callback] Error processing EHR callback before redirect:", error);
                 const clientRedirectUri = pendingAuth?.mcpRedirectUri || '/error_fallback';
                 try {
                     const redirectUrl = new URL(clientRedirectUri); // Assume absolute or handle base later
@@ -1511,37 +1494,37 @@ async function main() {
                      if (!res.headersSent) {
                          res.status(500).send("Invalid redirect URI configured for error reporting.");
                      }
-                }
-            }
-        });
+        }
+    }
+});
 
 
-        // --- MCP Auth Endpoints ---
+// --- MCP Auth Endpoints ---
         // Use config for base URLs
         app.options("/.well-known/oauth-authorization-server", cors());
-        app.get("/.well-known/oauth-authorization-server", cors(), (req, res) => {
-            const metadata = {
+app.get("/.well-known/oauth-authorization-server", cors(), (req, res) => {
+    const metadata = {
                 issuer: config.server.baseUrl,
                 authorization_endpoint: `${config.server.baseUrl}/authorize`,
                 token_endpoint: `${config.server.baseUrl}/token`,
                 registration_endpoint: `${config.server.baseUrl}/register`,
                 revocation_endpoint: `${config.server.baseUrl}/revoke`,
-                response_types_supported: ["code"],
-                grant_types_supported: ["authorization_code"],
-                code_challenge_methods_supported: ["S256"],
-                token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
-                revocation_endpoint_auth_methods_supported: ["none", "client_secret_post"],
-            };
-            res.json(metadata);
-        });
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code"],
+        code_challenge_methods_supported: ["S256"],
+        token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+        revocation_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+    };
+    res.json(metadata);
+});
 
-        app.get("/authorize", async (req, res) => {
-            const clientId = req.query.client_id as string | undefined;
-            const redirectUri = req.query.redirect_uri as string | undefined;
-            const responseType = req.query.response_type as string | undefined;
-            const codeChallenge = req.query.code_challenge as string | undefined;
-            const codeChallengeMethod = req.query.code_challenge_method as string | undefined;
-            const state = req.query.state as string | undefined;
+app.get("/authorize", async (req, res) => {
+    const clientId = req.query.client_id as string | undefined;
+    const redirectUri = req.query.redirect_uri as string | undefined;
+    const responseType = req.query.response_type as string | undefined;
+    const codeChallenge = req.query.code_challenge as string | undefined;
+    const codeChallengeMethod = req.query.code_challenge_method as string | undefined;
+    const state = req.query.state as string | undefined;
             console.log(`[AUTHORIZE] Request for client_id: ${clientId}, redirect_uri: ${redirectUri}`);
 
              try {
@@ -1578,49 +1561,49 @@ async function main() {
                 if (codeChallengeMethod !== 'S256') throw new InvalidRequestError("code_challenge_method must be 'S256'");
 
                 // --- Directly generate EHR redirect URL ---
-                const ehrState = uuidv4();
-                const { code_verifier: ehrCodeVerifier, code_challenge: ehrCodeChallenge } = await pkceChallenge();
-                pendingEhrAuth.set(ehrState, {
+                         const ehrState = uuidv4();
+                         const { code_verifier: ehrCodeVerifier, code_challenge: ehrCodeChallenge } = await pkceChallenge();
+        pendingEhrAuth.set(ehrState, {
                     ehrState, ehrCodeVerifier,
-                    mcpClientId: mcpClientInfo.client_id,
+            mcpClientId: mcpClientInfo.client_id,
                     mcpRedirectUri: validatedRedirectUri!, // Validated above
-                    mcpCodeChallenge: codeChallenge,
-                    mcpOriginalState: state,
-                });
+            mcpCodeChallenge: codeChallenge,
+            mcpOriginalState: state,
+        });
                 const ehrAuthUrl = new URL(config.ehr.authUrl!); // Validated by loadConfig
-                ehrAuthUrl.searchParams.set("response_type", "code");
+                         ehrAuthUrl.searchParams.set("response_type", "code");
                 ehrAuthUrl.searchParams.set("client_id", config.ehr.clientId!); // Validated by loadConfig
                 ehrAuthUrl.searchParams.set("scope", config.ehr.requiredScopes.join(" "));
                 ehrAuthUrl.searchParams.set("redirect_uri", `${config.server.baseUrl}${config.server.ehrCallbackPath}`);
-                ehrAuthUrl.searchParams.set("state", ehrState);
+                         ehrAuthUrl.searchParams.set("state", ehrState);
                 ehrAuthUrl.searchParams.set("aud", config.ehr.fhirBaseUrl!); // Validated by loadConfig
-                ehrAuthUrl.searchParams.set("code_challenge", ehrCodeChallenge);
-                ehrAuthUrl.searchParams.set("code_challenge_method", "S256");
+                         ehrAuthUrl.searchParams.set("code_challenge", ehrCodeChallenge);
+                         ehrAuthUrl.searchParams.set("code_challenge_method", "S256");
                 console.log(`[AUTHORIZE] Redirecting user to EHR: ${ehrAuthUrl.toString()}`);
-                res.redirect(302, ehrAuthUrl.toString());
+        res.redirect(302, ehrAuthUrl.toString());
 
             } catch (error: any) {
                 console.error("[AUTHORIZE] /authorize error:", error);
                 let clientRedirectUriOnError = redirectUri || '/error_fallback';
                 if (!config.security.disableClientChecks && clientId && !redirectUri) {
                      try { // Try to get default redirect URI if not provided
-                         const info = await oauthProvider.clientsStore.getClient(clientId);
+            const info = await oauthProvider.clientsStore.getClient(clientId);
                          if (info?.redirect_uris?.[0]) clientRedirectUriOnError = info.redirect_uris[0];
                      } catch {} // Ignore errors fetching client info here
-                 }
+        }
 
                  try {
                     const redirectUrl = new URL(clientRedirectUriOnError, config.server.baseUrl!); // Use base URL context
-                    if (error instanceof OAuthError) {
-                        redirectUrl.searchParams.set("error", error.errorCode);
-                        redirectUrl.searchParams.set("error_description", error.message);
-                    } else {
-                        redirectUrl.searchParams.set("error", "server_error");
-                        redirectUrl.searchParams.set("error_description", "Internal authorization error: " + (error?.message || 'Unknown reason'));
-                    }
-                    if (state) redirectUrl.searchParams.set("state", state);
+        if (error instanceof OAuthError) {
+            redirectUrl.searchParams.set("error", error.errorCode);
+            redirectUrl.searchParams.set("error_description", error.message);
+        } else {
+            redirectUrl.searchParams.set("error", "server_error");
+            redirectUrl.searchParams.set("error_description", "Internal authorization error: " + (error?.message || 'Unknown reason'));
+        }
+        if (state) redirectUrl.searchParams.set("state", state);
                      if (!res.headersSent) {
-                         res.redirect(302, redirectUrl.toString());
+        res.redirect(302, redirectUrl.toString());
                      }
                  } catch (urlError) {
                       console.error(`[AUTHORIZE] Invalid redirect URI for error reporting: ${clientRedirectUriOnError}`);
@@ -1632,15 +1615,15 @@ async function main() {
         });
 
         app.options("/token", cors());
-        app.post("/token", cors(), async (req, res) => {
-            try {
-                const {
-                    client_id: clientId,
-                    client_secret: clientSecret,
-                    grant_type: grantType,
-                    code: mcpCode,
-                    code_verifier: mcpCodeVerifier
-                } = req.body;
+app.post("/token", cors(), async (req, res) => {
+    try {
+        const {
+            client_id: clientId,
+            client_secret: clientSecret,
+            grant_type: grantType,
+            code: mcpCode,
+            code_verifier: mcpCodeVerifier
+        } = req.body;
 
                 console.log(`[TOKEN] Request grant_type: ${grantType}`);
                  if (!grantType) throw new InvalidRequestError("grant_type required");
@@ -1669,43 +1652,43 @@ async function main() {
                     if (!mcpCode) throw new InvalidRequestError("code required");
                     if (!mcpCodeVerifier) throw new InvalidRequestError("code_verifier required");
                     const expectedChallenge = await oauthProvider.challengeForAuthorizationCode(mcpClientInfo!, mcpCode);
-                    if (!await verifyChallenge(mcpCodeVerifier, expectedChallenge)) {
-                        throw new InvalidGrantError("code_verifier does not match challenge");
-                    }
+            if (!await verifyChallenge(mcpCodeVerifier, expectedChallenge)) {
+                throw new InvalidGrantError("code_verifier does not match challenge");
+            }
                     const tokens = await oauthProvider.exchangeAuthorizationCode(mcpClientInfo!, mcpCode);
-                    res.setHeader('Cache-Control', 'no-store');
-                    res.setHeader('Pragma', 'no-cache');
-                    res.json(tokens);
-                } else {
-                    throw new UnsupportedGrantTypeError("Unsupported grant_type");
-                }
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('Pragma', 'no-cache');
+            res.json(tokens);
+        } else {
+            throw new UnsupportedGrantTypeError("Unsupported grant_type");
+        }
 
             } catch (error: any) {
                  console.error("[AUTH] /token error:", error);
                  const status = (error instanceof OAuthError && !(error instanceof ServerError)) ? 400 : 500;
                  const errorResp = (error instanceof OAuthError) ? error.toResponseObject() : new ServerError("Token exchange failed").toResponseObject();
-                res.setHeader('Cache-Control', 'no-store');
-                res.setHeader('Pragma', 'no-cache');
-                res.status(status).json(errorResp);
-            }
-        });
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Pragma', 'no-cache');
+        res.status(status).json(errorResp);
+    }
+});
 
         app.options("/register", cors());
-        app.post("/register", cors(), express.json(), async (req, res) => {
-            console.log(`[REGISTER] Received register request`);
-            try {
-                if (!oauthProvider.clientsStore.registerClient) {
-                    throw new ServerError("Dynamic client registration not supported");
-                }
-                const clientMetadata = req.body as Partial<OAuthClientMetadata>;
-                if (!clientMetadata || !Array.isArray(clientMetadata.redirect_uris) || clientMetadata.redirect_uris.length === 0) {
-                    throw new InvalidClientError("redirect_uris required");
-                }
-                const buf = new Uint8Array(32);
-                crypto.getRandomValues(buf);
-                const secretHex = Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
-                const isPublic = clientMetadata.token_endpoint_auth_method === 'none';
-                const generatedInfo: OAuthClientInformationFull = {
+app.post("/register", cors(), express.json(), async (req, res) => {
+    console.log(`[REGISTER] Received register request`);
+    try {
+        if (!oauthProvider.clientsStore.registerClient) {
+            throw new ServerError("Dynamic client registration not supported");
+        }
+        const clientMetadata = req.body as Partial<OAuthClientMetadata>;
+        if (!clientMetadata || !Array.isArray(clientMetadata.redirect_uris) || clientMetadata.redirect_uris.length === 0) {
+            throw new InvalidClientError("redirect_uris required");
+        }
+                 const buf = new Uint8Array(32);
+                 crypto.getRandomValues(buf);
+                 const secretHex = Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
+                 const isPublic = clientMetadata.token_endpoint_auth_method === 'none';
+                 const generatedInfo: OAuthClientInformationFull = {
                     ...(clientMetadata as OAuthClientMetadata),
                      client_id: crypto.randomUUID(),
                      client_secret: isPublic ? undefined : secretHex,
@@ -1713,29 +1696,29 @@ async function main() {
                      client_secret_expires_at: isPublic ? undefined : (Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60)), // 30 days
                  };
                  const registeredInfo = await oauthProvider.clientsStore.registerClient(generatedInfo);
-                res.setHeader('Cache-Control', 'no-store');
-                res.setHeader('Pragma', 'no-cache');
-                res.status(201).json(registeredInfo);
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Pragma', 'no-cache');
+        res.status(201).json(registeredInfo);
             } catch (error: any) {
                 console.error("[AUTH] /register error:", error);
                  const status = (error instanceof OAuthError && !(error instanceof ServerError)) ? 400 : 500;
                  const errorResp = (error instanceof OAuthError) ? error.toResponseObject() : new ServerError("Client registration failed").toResponseObject();
-                res.status(status).json(errorResp);
-            }
-        });
+        res.status(status).json(errorResp);
+    }
+});
 
         app.options("/revoke", cors());
-        app.post("/revoke", cors(), async (req, res) => {
-            try {
-                if (!oauthProvider.revokeToken) {
-                    throw new ServerError("Token revocation not supported");
-                }
-                const {
-                    client_id: clientId,
-                    client_secret: clientSecret,
-                    token: tokenToRevoke,
-                    token_type_hint: tokenTypeHint
-                } = req.body;
+app.post("/revoke", cors(), async (req, res) => {
+    try {
+        if (!oauthProvider.revokeToken) {
+            throw new ServerError("Token revocation not supported");
+        }
+        const {
+            client_id: clientId,
+            client_secret: clientSecret,
+            token: tokenToRevoke,
+            token_type_hint: tokenTypeHint
+        } = req.body;
 
                  if (!tokenToRevoke) throw new InvalidRequestError("token required");
                  if (!clientId) throw new InvalidRequestError("client_id required");
@@ -1760,148 +1743,149 @@ async function main() {
                  }
 
                  await oauthProvider.revokeToken(mcpClientInfo!, { token: tokenToRevoke, token_type_hint: tokenTypeHint });
-                res.sendStatus(200);
+        res.sendStatus(200);
             } catch (error: any) {
                  console.error("[AUTH] /revoke error:", error);
                  const status = (error instanceof OAuthError && !(error instanceof ServerError)) ? 400 : 500;
                  const errorResp = (error instanceof OAuthError) ? error.toResponseObject() : new ServerError("Token revocation failed").toResponseObject();
-                res.status(status).json(errorResp);
-            }
-        });
+        res.status(status).json(errorResp);
+    }
+});
 
         // --- MCP SSE Endpoint ---
-        app.get("/mcp-sse", bearerAuthMiddleware, async (req: Request, res: Response) => {
-            const authInfo = req.auth;
-            if (!authInfo) {
-                console.error("[SSE GET] Middleware succeeded but req.auth is missing!");
-                if (!res.headersSent) res.status(500).send("Authentication failed unexpectedly.");
-                return;
-            }
+app.get("/mcp-sse", bearerAuthMiddleware, async (req: Request, res: Response) => {
+    const authInfo = req.auth;
+    if (!authInfo) {
+        console.error("[SSE GET] Middleware succeeded but req.auth is missing!");
+        if (!res.headersSent) res.status(500).send("Authentication failed unexpectedly.");
+        return;
+    }
 
-            const mcpAccessToken = authInfo.token;
-            console.log(`[SSE GET] Auth successful for token ${mcpAccessToken.substring(0, 8)}..., client: ${authInfo.clientId}`);
+    const mcpAccessToken = authInfo.token;
+    console.log(`[SSE GET] Auth successful for token ${mcpAccessToken.substring(0, 8)}..., client: ${authInfo.clientId}`);
 
-            const session = activeSessions.get(mcpAccessToken);
-            if (!session) {
-                console.error(`[SSE GET] Internal Error: Session data not found for valid token ${mcpAccessToken.substring(0, 8)}...`);
-                res.set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Session associated with token not found or expired."`)
-                res.status(401).json({ error: "invalid_token", error_description: "Session associated with token not found or expired." });
-                return;
-            }
+    const session = activeSessions.get(mcpAccessToken);
+    if (!session) {
+        console.error(`[SSE GET] Internal Error: Session data not found for valid token ${mcpAccessToken.substring(0, 8)}...`);
+        res.set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Session associated with token not found or expired."`)
+        res.status(401).json({ error: "invalid_token", error_description: "Session associated with token not found or expired." });
+        return;
+    }
 
             // Use config for client check bypass? Generally SSE connection implies ownership.
             // Let's keep the check unless explicitly disabled.
             if (!config.security.disableClientChecks && session.mcpClientInfo.client_id !== authInfo.clientId) {
-                console.error(`[SSE GET] Forbidden: Client ID mismatch for token ${mcpAccessToken.substring(0, 8)}... Token Client: ${authInfo.clientId}, Session Client: ${session.mcpClientInfo.client_id}`);
-                res.set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Token client ID does not match session client ID."`);
-                res.status(401).json({ error: "invalid_token", error_description: "Token client ID does not match session client ID." });
-                return;
-            }
+        console.error(`[SSE GET] Forbidden: Client ID mismatch for token ${mcpAccessToken.substring(0, 8)}... Token Client: ${authInfo.clientId}, Session Client: ${session.mcpClientInfo.client_id}`);
+        res.set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Token client ID does not match session client ID."`);
+        res.status(401).json({ error: "invalid_token", error_description: "Token client ID does not match session client ID." });
+        return;
+    }
 
-            let transport: SSEServerTransport | null = null;
-            try {
+    let transport: SSEServerTransport | null = null;
+    try {
                 transport = new SSEServerTransport(`/mcp-messages`, res);
                 const transportSessionId = transport.sessionId;
                 session.sessionId = transportSessionId;
 
-                activeSseTransports.set(transportSessionId, {
-                    transport: transport,
-                    mcpAccessToken: mcpAccessToken,
-                    authInfo: authInfo
-                });
-                console.log(`[SSE GET] Client connected & authenticated. Transport Session ID: ${transportSessionId}, linked to MCP Token: ${mcpAccessToken.substring(0, 8)}...`);
+        activeSseTransports.set(transportSessionId, {
+            transport: transport,
+            mcpAccessToken: mcpAccessToken,
+            authInfo: authInfo
+        });
+        console.log(`[SSE GET] Client connected & authenticated. Transport Session ID: ${transportSessionId}, linked to MCP Token: ${mcpAccessToken.substring(0, 8)}...`);
 
-                res.on('close', () => {
-                    activeSseTransports.delete(transportSessionId);
-                    if (session && session.sessionId === transportSessionId) {
+        res.on('close', () => {
+            activeSseTransports.delete(transportSessionId);
+            if (session && session.sessionId === transportSessionId) {
                         session.sessionId = "";
-                    }
-                    console.log(`[SSE GET] Client disconnected. Cleaned up transport session: ${transportSessionId}`);
-                });
-
-                await mcpServer.connect(transport);
-
-            } catch (error) {
-                console.error("[SSE GET] Error setting up authenticated SSE connection:", error);
-                if (transport && activeSseTransports.has(transport.sessionId)) {
-                    activeSseTransports.delete(transport.sessionId);
-                    if (session && session.sessionId === transport.sessionId) {
-                         session.sessionId = "";
-                     }
-                }
-                if (!res.headersSent) {
-                     const message = (error instanceof OAuthError) ? "SSE connection setup failed due to authorization issue." : "Failed to establish SSE connection";
-                     const statusCode = (error instanceof InvalidTokenError) ? 401 : (error instanceof InsufficientScopeError ? 403 : 500);
-                     if (statusCode === 401 || statusCode === 403) {
-                         res.set("WWW-Authenticate", `Bearer error="server_error", error_description="${message}"`);
-                     }
-                     res.status(statusCode).send(message);
-                } else if (!res.writableEnded) {
-                    res.end();
-                }
             }
+            console.log(`[SSE GET] Client disconnected. Cleaned up transport session: ${transportSessionId}`);
         });
 
-        // --- MCP Message POST Endpoint ---
+        await mcpServer.connect(transport);
+
+    } catch (error) {
+        console.error("[SSE GET] Error setting up authenticated SSE connection:", error);
+        if (transport && activeSseTransports.has(transport.sessionId)) {
+            activeSseTransports.delete(transport.sessionId);
+            if (session && session.sessionId === transport.sessionId) {
+                 session.sessionId = "";
+             }
+        }
+        if (!res.headersSent) {
+             const message = (error instanceof OAuthError) ? "SSE connection setup failed due to authorization issue." : "Failed to establish SSE connection";
+             const statusCode = (error instanceof InvalidTokenError) ? 401 : (error instanceof InsufficientScopeError ? 403 : 500);
+             if (statusCode === 401 || statusCode === 403) {
+                         res.set("WWW-Authenticate", `Bearer error="server_error", error_description="${message}"`);
+             }
+             res.status(statusCode).send(message);
+        } else if (!res.writableEnded) {
+                    res.end();
+        }
+    }
+});
+
+// --- MCP Message POST Endpoint ---
         app.post("/mcp-messages", (req: Request, res: Response) => {
             const transportSessionId = req.query.sessionId as string | undefined;
-            if (!transportSessionId) {
-                console.warn("[MCP POST] Received POST without transport sessionId query param.");
-                res.status(400).send("Missing sessionId query parameter");
-                return;
-            }
+    if (!transportSessionId) {
+        console.warn("[MCP POST] Received POST without transport sessionId query param.");
+        res.status(400).send("Missing sessionId query parameter");
+        return;
+    }
 
-            const transportEntry = activeSseTransports.get(transportSessionId);
-            if (!transportEntry) {
-                console.warn(`[MCP POST] Received POST for unknown/expired transport sessionId: ${transportSessionId}`);
+    const transportEntry = activeSseTransports.get(transportSessionId);
+    if (!transportEntry) {
+        console.warn(`[MCP POST] Received POST for unknown/expired transport sessionId: ${transportSessionId}`);
                 res.status(404).send("Invalid or expired sessionId");
-                return;
-            }
+        return;
+    }
 
-            const transport = transportEntry.transport;
-            try {
-                console.log(`[MCP POST] Received POST for transport session ${transportSessionId}, linked to MCP Token: ${transportEntry.mcpAccessToken.substring(0,8)}...`);
-                transport.handlePostMessage(req, res);
-            } catch (error) {
-                console.error(`[MCP POST] Error in handlePostMessage for session ${transportSessionId}:`, error);
-                if (!res.headersSent) {
-                    res.status(500).send("Error processing message");
-                } else if (!res.writableEnded) {
-                    res.end();
-                }
-            }
-        });
+    const transport = transportEntry.transport;
+    try {
+        console.log(`[MCP POST] Received POST for transport session ${transportSessionId}, linked to MCP Token: ${transportEntry.mcpAccessToken.substring(0,8)}...`);
+        console.log(req.headers);
+        transport.handlePostMessage(req, res);
+    } catch (error) {
+        console.error(`[MCP POST] Error in handlePostMessage for session ${transportSessionId}:`, error);
+        if (!res.headersSent) {
+            res.status(500).send("Error processing message");
+        } else if (!res.writableEnded) {
+            res.end();
+        }
+    }
+});
 
-        // --- Error Handling Middleware ---
-        app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
-            console.error("[HTTP] Unhandled Route Error:", err);
-            if (res.headersSent) {
-                return next(err);
-            }
-            res.status(500).json({ error: "Internal Server Error", message: err.message });
-        });
+// --- Error Handling Middleware ---
+app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("[HTTP] Unhandled Route Error:", err);
+    if (res.headersSent) {
+        return next(err);
+    }
+    res.status(500).json({ error: "Internal Server Error", message: err.message });
+});
 
 
-        // --- Start Server ---
-        let server;
+// --- Start Server ---
+    let server;
         let serverOptions: https.ServerOptions = {}; // Use https.ServerOptions type
 
         // Use config for HTTPS settings
         if (config.server.https.enabled) {
-            console.log("[HTTP] HTTPS is enabled. Loading certificates...");
+        console.log("[HTTP] HTTPS is enabled. Loading certificates...");
             // Paths validated by loadConfig
-            try {
+        try {
                 const cert = await fs.readFile(config.server.https.certPath!);
                 const key = await fs.readFile(config.server.https.keyPath!);
                 serverOptions = { key: key, cert: cert };
                 console.log(`[HTTP] Certificates loaded from ${config.server.https.certPath} and ${config.server.https.keyPath}`);
                 server = https.createServer(serverOptions, app);
-            } catch (error) {
-                console.error(`[HTTP] FATAL ERROR: Failed to read certificate files: ${error}`);
-                process.exit(1);
-            }
-        } else {
-            console.log("[HTTP] HTTPS is disabled. Creating HTTP server.");
+        } catch (error) {
+            console.error(`[HTTP] FATAL ERROR: Failed to read certificate files: ${error}`);
+            process.exit(1);
+        }
+    } else {
+        console.log("[HTTP] HTTPS is disabled. Creating HTTP server.");
             server = http.createServer(app);
         }
 
@@ -1911,38 +1895,48 @@ async function main() {
         });
 
         // --- Graceful Shutdown ---
-        const shutdown = async () => {
-            console.log("\nShutting down...");
+    const shutdown = async () => {
+        console.log("\nShutting down...");
             server.close(async (err) => {
-                if (err) {
+            if (err) {
                     console.error(`Error closing ${config.server.https.enabled ? 'HTTPS' : 'HTTP'} server:`, err);
-                } else {
+            } else {
                     console.log(`${config.server.https.enabled ? 'HTTPS' : 'HTTP'} server closed.`);
-                }
-            });
-
-            await mcpServer.close().catch(e => console.error("Error closing MCP server:", e));
-
-            for (const [id, session] of activeSessions.entries()) {
-                if (session.db) {
-                    try { session.db.close(); } catch (e) { console.error(`Error closing DB for session ${id}:`, e); }
-                }
             }
-            activeSessions.clear();
-            console.log("Closed active sessions and DBs (if existed).");
-            process.exit(0);
-        };
+        });
 
-        process.removeListener('SIGINT', shutdown);
-        process.removeListener('SIGTERM', shutdown);
-        process.on('SIGINT', shutdown);
-        process.on('SIGTERM', shutdown);
+        await mcpServer.close().catch(e => console.error("Error closing MCP server:", e));
+
+        // Close any open database connections in active sessions
+        for (const [id, session] of activeSessions.entries()) {
+            if (session.db) {
+                try {
+                         console.log(`[Shutdown] Closing DB for session ${id} (Patient: ${session.ehrPatientId})`);
+                    session.db.close();
+                     } catch (e) { console.error(`[Shutdown] Error closing DB for session ${id}:`, e); }
+            }
+        }
+        activeSessions.clear();
+         // Also clear pending auth map? Probably good practice.
+         pendingEhrAuth.clear();
+         sessionsByMcpAuthCode.clear(); // Clear temporary auth codes
+         activeSseTransports.clear(); // Clear active transports
+
+        console.log("Closed active sessions, cleared caches, and closed DBs (if existed).");
+        process.exit(0);
+    };
+
+    process.removeListener('SIGINT', shutdown);
+    process.removeListener('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
 
     } catch (error) {
         console.error("FATAL ERROR during startup:", error);
-        process.exit(1);
+    process.exit(1);
     }
 }
 
 // Start the application
 main();
+

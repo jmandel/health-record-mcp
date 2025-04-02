@@ -1,0 +1,26 @@
+{
+  "ehr": {
+    "fhirBaseUrl": "https://launch.smarthealthit.org/v/r4/sim/WzMsIjE0ODY3ZGJhLWZiMTEtNGRmMy05ODI5LThlOGUwODFiMzllNiIsIiIsIkFVVE8iLDAsMSwwLCIiLCIiLCIiLCIiLCIiLCIiLCIiLDAsMSwiIl0/fhir",
+    "clientId": "mcp-client",
+    "requiredScopes": [
+      "openid", "fhirUser", "launch/patient",
+      "patient/Patient.read", "patient/Observation.read", "patient/Condition.read",
+      "patient/DocumentReference.read", "patient/MedicationRequest.read",
+      "patient/MedicationStatement.read", "patient/AllergyIntolerance.read",
+      "patient/Procedure.read", "patient/Immunization.read",
+      "patient/CommunicationRequest", "patient/Contract"
+    ]
+  },
+  "server": {
+    "host": "localhost",
+    "baseUrl": null,
+    "port": 3001
+  },
+  "persistence": {
+    "enabled": true,
+    "directory": "./data"
+  },
+  "security": {
+    "disableClientChecks": true
+  }
+} 

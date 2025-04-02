@@ -22,36 +22,109 @@ The goal of this project is to demonstrate how EHR workflows can seamlessly conn
     *   `resync_record`: Manually trigger a re-fetch of data from the EHR.
 *   **OAuth 2.0 Provider:** Implements necessary OAuth endpoints (`/authorize`, `/token`, `/revoke`, `/register`, `/.well-known/oauth-authorization-server`) for MCP client authorization.
 *   **SQLite Persistence (Optional):** Can persist the SQLite database for a patient session to disk to speed up subsequent connections for the same patient on the same FHIR server.
-*   **Configuration via Environment Variables:** Server behavior (EHR endpoints, client IDs, persistence) is controlled through environment variables.
+*   **Configuration via JSON:** Server behavior is controlled through a simple JSON configuration file.
 *   **Built with Bun:** Leverages the Bun runtime for execution.
 
 ## Configuration
 
-The server is configured using environment variables. You can set these directly in your shell or create a `.env` file in the project root.
+The server can be configured using a JSON configuration file. You can specify the path to the configuration file using the `--config` command-line option:
 
-**Required:**
+```bash
+bun run index.ts --config my-config.json
+```
 
-*   `EHR_FHIR_URL`: The base URL of the target FHIR server (e.g., `https://fhir.ehr.system/R4`).
-*   `MCP_SERVER_EHR_CLIENT_ID`: The client ID registered with the EHR for this MCP server application.
+If no configuration file is specified, the server will look for a file named `config.json` in the current directory. If the file doesn't exist, the server will throw an error.
 
-**Optional (often discovered via SMART configuration):**
+### Sample Configuration
 
-*   `EHR_AUTH_URL`: The EHR's OAuth 2.0 authorization endpoint URL. If not provided, the server attempts discovery using `/.well-known/smart-configuration` on the `EHR_FHIR_URL`.
-*   `EHR_TOKEN_URL`: The EHR's OAuth 2.0 token endpoint URL. If not provided, the server attempts discovery.
+A sample configuration file (`config.json.example`) is provided. You can copy this file to `config.json` and modify it according to your needs:
 
-**Optional (Server Behavior):**
+```bash
+cp config.json.example config.json
+```
 
-*   `MCP_SERVER_BASE_URL`: The base URL where this MCP server is publicly accessible (defaults to `http://localhost:3001`). **Crucial for OAuth redirects.**
-*   `MCP_SERVER_PORT`: The port the server listens on (defaults to `3001`).
-*   `EHR_SCOPES`: Space-separated string of SMART scopes required from the EHR (defaults to a common set including `openid`, `fhirUser`, `launch/patient`, and read scopes for various resources).
-*   `SQLITE_PERSISTENCE_ENABLED`: Set to `true` to enable saving/loading the SQLite database to disk (defaults to `false`).
-*   `SQLITE_PERSISTENCE_DIR`: Directory to store SQLite database files if persistence is enabled (defaults to `./data`).
-*   `DISABLE_CLIENT_CHECKS`: Set to `true` to disable MCP client ID lookup and redirect URI validation during OAuth flows. **Use with caution, intended for specific development/testing scenarios.** (Defaults to `false`).
+### Configuration Options
 
-**Defaults for SMART Health IT Sandbox:**
+The configuration file has the following structure:
 
-If `EHR_FHIR_URL` is not set, it defaults to the public SMART Health IT sandbox (`https://launch.smarthealthit.org/v/r4/sim/...`).
-If `MCP_SERVER_EHR_CLIENT_ID` is not set *and* the default SMART sandbox URL is used, it defaults to `mcp_app`.
+```json
+{
+  "ehr": {
+    "clientId": "your-client-id",
+    "fhirBaseUrl": "https://ehr.example.com/fhir",
+    "authUrl": "https://ehr.example.com/oauth/authorize",
+    "tokenUrl": "https://ehr.example.com/oauth/token",
+    "requiredScopes": [
+      "openid",
+      "fhirUser",
+      "launch/patient",
+      "patient/*.read"
+    ]
+  },
+  "server": {
+    "port": 3000,
+    "baseUrl": "http://localhost:3000",
+    "ehrCallbackPath": "/ehr-callback",
+    "https": {
+      "enabled": false,
+      "certPath": "./certs/server.crt",
+      "keyPath": "./certs/server.key"
+    }
+  },
+  "persistence": {
+    "enabled": false,
+    "directory": "./data"
+  },
+  "security": {
+    "disableClientChecks": false
+  }
+}
+```
+
+#### Required Configuration
+
+Only the following fields are required:
+
+```json
+{
+  "ehr": {
+    "clientId": "your-client-id",
+    "fhirBaseUrl": "https://ehr.example.com/fhir"
+  },
+  "server": {
+    "port": 3000
+  }
+}
+```
+
+All other fields will be derived or set to sensible defaults.
+
+#### EHR Configuration
+
+- `clientId`: The client ID for your application in the EHR system (required)
+- `fhirBaseUrl`: The base URL for the EHR's FHIR API (required)
+- `authUrl`: The URL for the EHR's OAuth authorization endpoint (optional, will be discovered if not provided)
+- `tokenUrl`: The URL for the EHR's OAuth token endpoint (optional, will be discovered if not provided)
+- `requiredScopes`: The OAuth scopes required for your application (optional, defaults to common SMART scopes)
+
+#### Server Configuration
+
+- `port`: The port on which the server will listen (required)
+- `baseUrl`: The base URL of your server (optional, derived from port and HTTPS settings)
+- `ehrCallbackPath`: The path on your server that will handle EHR OAuth callbacks (optional, defaults to "/ehr-callback")
+- `https`: HTTPS configuration (optional)
+  - `enabled`: Whether to enable HTTPS (optional, defaults to false)
+  - `certPath`: Path to the SSL certificate file (required if HTTPS is enabled)
+  - `keyPath`: Path to the SSL private key file (required if HTTPS is enabled)
+
+#### Persistence Configuration
+
+- `enabled`: Whether to enable SQLite persistence (optional, defaults to false)
+- `directory`: The directory where SQLite database files will be stored (optional, defaults to "./data")
+
+#### Security Configuration
+
+- `disableClientChecks`: Whether to disable client authentication checks (optional, defaults to false, not recommended for production)
 
 ## Setup and Running
 
@@ -70,9 +143,9 @@ If `MCP_SERVER_EHR_CLIENT_ID` is not set *and* the default SMART sandbox URL is 
     bun install
     ```
 
-4.  **Configure Environment:**
-    *   Create a `.env` file in the project root.
-    *   Add the necessary environment variables (see Configuration section). Minimally, you'll likely need `EHR_FHIR_URL` and `MCP_SERVER_EHR_CLIENT_ID`. If your EHR doesn't support SMART configuration discovery, you'll also need `EHR_AUTH_URL` and `EHR_TOKEN_URL`. Ensure `MCP_SERVER_BASE_URL` is correct for your deployment.
+4.  **Configure:**
+    *   Create a `config.json` file in the project root.
+    *   Add the necessary configuration options (see Configuration section). Minimally, you'll need to specify `ehr.clientId`, `ehr.fhirBaseUrl`, and `server.port`.
 
 5.  **Run the Server:**
     ```bash
@@ -129,4 +202,4 @@ This server acts as an OAuth 2.0 Authorization Server for MCP clients wishing to
 *   **SSE Endpoint:** `GET /mcp-sse`
     *   Authenticated MCP clients establish a Server-Sent Events connection here after obtaining an access token. MCP messages (requests and responses) are exchanged over this connection. Requires a `Bearer` token.
 *   **Message Endpoint:** `POST /mcp-messages`
-    *   The MCP client sends request messages (like `callTool`) to this endpoint, associated with the established SSE session via a `sessionId` query parameter. Authentication is implicitly handled by the valid `sessionId`. 
+    *   The MCP client sends request messages (like `callTool`) to this endpoint, associated with the established SSE session via a `sessionId` query parameter. Authentication is implicitly handled by the valid `sessionId`.
