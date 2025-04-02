@@ -19,8 +19,6 @@ import {
 import { Database } from 'bun:sqlite';
 import cors from 'cors';
 import express, { Request, Response } from 'express';
-import { XMLParser } from 'fast-xml-parser';
-import { convert as htmlToText } from 'html-to-text';
 import http from 'http';
 import https from 'https';
 import fs from 'fs/promises';
@@ -30,10 +28,6 @@ import { v4 as uuidv4 } from 'uuid';
 import vm from 'vm';
 import { z } from 'zod';
 import { Command } from 'commander';
-
-// --- RTF Parser Imports ---
-import { deEncapsulateSync } from 'rtf-stream-parser';
-import * as iconvLite from 'iconv-lite';
 
 // --- Configuration Loading ---
 import { loadConfig, AppConfig } from './src/config.js'; // Import config loader
@@ -64,23 +58,6 @@ interface AuthPendingState {
     mcpRedirectUri: string; mcpCodeChallenge: string; mcpOriginalState?: string;
 }
 
-// Structure for processed attachments
-interface ProcessedAttachment {
-    resourceType: string;
-    resourceId: string;
-    path: string;
-    contentType: string;
-    json: string; // JSON string of the original attachment node
-    contentRaw: Buffer | null;
-    contentPlaintext: string | null;
-}
-
-// New structure to hold all processed EHR data
-interface FullEHR {
-    fhir: Record<string, any[]>; // Renamed from 'record'
-    attachments: ProcessedAttachment[];
-}
-
 const pendingEhrAuth = new Map<string, AuthPendingState>();
 
 interface UserSession {
@@ -104,383 +81,72 @@ const activeSseTransports = new Map<string, { transport: SSEServerTransport; mcp
 
 // --- FHIR Data Fetching ---
 
-interface AttachmentLike {
-    contentType?: string;
-    data?: string;
-    url?: string;
-}
 
-const KNOWN_ATTACHMENT_PATHS = new Map<string, string[]>([
-    ['DocumentReference', ['content.attachment']],
-    ['Binary', ['']],
-    ['Media', ['content']],
-    ['DiagnosticReport', ['presentedForm']],
-    ['Observation', ['valueAttachment']],
-    ['Patient', ['photo']],
-    ['Practitioner', ['photo']],
-    ['Organization', ['photo']],
-    ['Communication', ['payload.content.attachment']],
-    ['CommunicationRequest', ['payload.content.attachment']],
-    ['Contract', ['legal.contentAttachment', 'rule.contentAttachment']]
-]);
+
+// Import types and utility functions
+import { FullEHR } from './src/types';
+import {
+    fetchInitialFhirResources,
+    resolveFhirReferences,
+    processFhirAttachments,
+    fetchAllEhrData
+} from './src/fhirUtils';
+
+// Import new utilities
+import { ehrToSqlite, sqliteToEhr } from './src/dbUtils';
+
+// ==========================================================================
+// Core Data Fetching Orchestration
+// ==========================================================================
 
 /**
- * Resolves a relative or absolute path against the FHIR base URL.
- * Ensures correct joining regardless of trailing slash on the base URL.
- * Handles both relative paths (e.g., "Patient/123", "Observation?category=...") and absolute URLs.
- * @param relativeOrAbsolutePath - The relative path (e.g., "Patient/123", "Observation?category=...") or an absolute URL.
- * @param fhirBaseUrl - The base URL of the FHIR server.
- * @returns The fully resolved URL object.
+ * Fetches, resolves references, and processes attachments for a given patient's EHR data.
+ * Orchestrates the calls to the specialized fetching and processing functions.
+ * @param ehrAccessToken - The access token for the EHR FHIR server.
+ * @param fhirBaseUrl - The base URL of the EHR FHIR server.
+ * @param patientId - The ID of the patient whose data is being fetched.
+ * @returns A Promise resolving to the FullEHR object containing structured FHIR data and processed attachments.
+ * @throws If the core Patient resource cannot be fetched or other critical errors occur.
  */
-function resolveFhirUrl(relativeOrAbsolutePath: string, fhirBaseUrl: string): URL {
-    try {
-        // Ensure the base URL itself is valid before using it
-        const baseWithSlash = fhirBaseUrl.endsWith("/") ? fhirBaseUrl : fhirBaseUrl + "/";
-        const base = new URL(baseWithSlash);
-        // Now resolve the relative/absolute path against the valid base
-        return new URL(relativeOrAbsolutePath, base);
-    } catch (error) {
-        console.error(`[URL RESOLVE] Error creating URL: relativeOrAbsolute='${relativeOrAbsolutePath}', base='${fhirBaseUrl}'`, error);
-        throw new Error(`Failed to resolve URL: ${error instanceof Error ? error.message : String(error)}`);
-    }
-}
-
-async function fetchAttachmentContent(attachmentUrl: string, fhirBaseUrl: string, accessToken: string): Promise<{ contentRaw: Buffer, contentType: string | null }> {
-    const resolvedUrl = resolveFhirUrl(attachmentUrl, fhirBaseUrl); // Use helper
-    console.log(`[ATTACHMENT Fetch] GET ${resolvedUrl.toString()}`); // Use toString()
-    const headers = new Headers({ "Authorization": `Bearer ${accessToken}`, "Accept": "*/*" });
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
-
-    try {
-        const response = await fetch(resolvedUrl.toString(), { headers: headers, signal: controller.signal }); // Use toString()
-        clearTimeout(timeoutId);
-        if (!response.ok) {
-            const errorBody = await response.text();
-            console.error(`[ATTACHMENT Fetch] Error ${response.status} from ${resolvedUrl.toString()}: ${errorBody}`); // Use toString()
-            throw new Error(`Attachment fetch failed with status ${response.status} for ${resolvedUrl.toString()}`); // Use toString()
-        }
-        const contentRaw = Buffer.from(await response.arrayBuffer());
-        const contentType = response.headers.get("Content-Type");
-        console.log(`[ATTACHMENT Fetch] Success (${contentRaw.length} bytes, Type: ${contentType || 'N/A'}) for ${resolvedUrl.toString()}`); // Use toString()
-        return { contentRaw, contentType };
-    } catch (error) {
-        clearTimeout(timeoutId);
-        if ((error as any).name === 'AbortError') {
-            console.error(`[ATTACHMENT Fetch] Timeout fetching ${resolvedUrl.toString()}`); // Use toString()
-            throw new Error(`Timeout fetching attachment: ${resolvedUrl.toString()}`); // Use toString()
-        }
-        console.error(`[ATTACHMENT Fetch] Network/Fetch error for ${resolvedUrl.toString()}:`, error); // Use toString()
-        throw error;
-    }
-}
-
-function getValueAtPath(obj: any, path: string): any | any[] | undefined {
-    if (!obj || !path) return undefined;
-    if (path === '') return obj;
-
-    const parts = path.split('.');
-    let current: any = obj;
-
-    for (let i = 0; i < parts.length; i++) {
-        const part = parts[i];
-        if (current === null || current === undefined) return undefined;
-
-        const arrayMatch = part.match(/^(.+)\[(\d+)\]$/);
-        if (arrayMatch) {
-            const arrayKey = arrayMatch[1];
-            const index = parseInt(arrayMatch[2], 10);
-            if (!current[arrayKey] || !Array.isArray(current[arrayKey]) || index >= current[arrayKey].length) {
-                return undefined;
-            }
-            current = current[arrayKey][index];
-        } else {
-            current = current[part];
-        }
-
-        if (Array.isArray(current) && i === parts.length - 1) {
-            return current.filter(item => item !== null && item !== undefined);
-        }
-    }
-    return current ? [current] : [];
-}
-
-async function fetchFhirResource(url: string, accessToken: string): Promise<any> {
-    console.log(`[FHIR Fetch] GET ${url}`);
-    const headers = new Headers({ "Authorization": `Bearer ${accessToken}`, "Accept": "application/fhir+json" });
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
-
-    try {
-        const response = await fetch(url, { headers: headers, signal: controller.signal });
-        clearTimeout(timeoutId);
-        if (!response.ok) {
-            const errorBody = await response.text();
-            console.error(`[FHIR Fetch] Error ${response.status} from ${url}: ${errorBody}`);
-            throw new Error(`FHIR request failed with status ${response.status} for ${url}`);
-        }
-        return await response.json();
-    } catch (error) {
-        clearTimeout(timeoutId);
-        if ((error as any).name === 'AbortError') {
-            console.error(`[FHIR Fetch] Timeout fetching ${url}`);
-            throw new Error(`Timeout fetching FHIR resource: ${url}`);
-        }
-        throw error;
-    }
-}
-
-async function fetchAllPages(initialUrl: string, accessToken: string): Promise<any[]> {
-    let resources: any[] = [];
-    let nextUrl: string | undefined = initialUrl;
-    let pageCount = 0;
-    const maxPages = 200;
-
-    console.log(`[FHIR Fetch] Starting pagination for ${initialUrl}`);
-    while (nextUrl && pageCount < maxPages) {
-        pageCount++;
-        console.log(`[FHIR Fetch] Fetching page ${pageCount}: ${nextUrl}`);
-        const bundle = await fetchFhirResource(nextUrl, accessToken);
-        if (bundle.entry) {
-            const pageResources = bundle.entry.map((e: any) => e.resource).filter((r: any) => r);
-            resources = resources.concat(pageResources);
-            console.log(`[FHIR Fetch] Added ${pageResources.length} resources from page ${pageCount}. Total: ${resources.length}`);
-        }
-        const nextLink = bundle.link?.find((link: any) => link.relation === 'next');
-        nextUrl = nextLink?.url;
-    }
-    if (pageCount >= maxPages && nextUrl) {
-        console.warn(`[FHIR Fetch] Reached maximum pagination limit (${maxPages}) for ${initialUrl}. Data may be incomplete.`);
-    }
-    console.log(`[FHIR Fetch] Pagination complete for ${initialUrl}. Total resources fetched: ${resources.length}`);
-    return resources;
-}
-
 async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patientId: string): Promise<FullEHR> {
-    console.log(`[DATA] Fetching specific FHIR resources from ${fhirBaseUrl} for Patient: ${patientId}`);
+    console.log(`[DATA] Orchestrating EHR data fetch for Patient: ${patientId} from ${fhirBaseUrl}`);
     if (!patientId) throw new Error("Patient ID is required to fetch data.");
-
-    const fhirRecord: Record<string, any[]> = {};
-    const processedAttachments: ProcessedAttachment[] = [];
-    let totalFetched = 0;
-    const patientReadUrl = resolveFhirUrl(`Patient/${patientId}`, fhirBaseUrl).toString(); // Use helper
-    const searchQueries: { resourceType: string; params?: Record<string, string> }[] = [
-        { resourceType: 'Observation', params: { 'category': 'laboratory', patient: patientId, '_count': '1000' } },
-        { resourceType: 'Observation', params: { 'category': 'vital-signs', patient: patientId, '_count': '1000' } },
-        { resourceType: 'Observation', params: { 'category': 'social-history', patient: patientId, '_count': '1000' } },
-        { resourceType: 'Condition', params: { patient: patientId, '_count': '1000' } },
-        { resourceType: 'MedicationRequest', params: { patient: patientId, '_count': '1000' } },
-        { resourceType: 'MedicationStatement', params: { patient: patientId, '_count': '1000' } },
-        { resourceType: 'AllergyIntolerance', params: { patient: patientId, '_count': '1000' } },
-        { resourceType: 'Procedure', params: { patient: patientId, '_count': '1000' } },
-        { resourceType: 'Immunization', params: { patient: patientId, '_count': '1000' } },
-        { resourceType: 'DocumentReference', params: { patient: patientId, '_count': '1000' } },
-    ];
+    if (!fhirBaseUrl) throw new Error("FHIR Base URL is required.");
 
     try {
-        const patientResource = await fetchFhirResource(patientReadUrl, ehrAccessToken);
-        fhirRecord['Patient'] = [patientResource];
-        totalFetched++;
+        // Step 1: Fetch initial set of resources (Patient + bulk searches)
+        const { initialFhirRecord, initialTotalFetched } = await fetchInitialFhirResources(ehrAccessToken, fhirBaseUrl, patientId);
+        let currentFhirRecord = initialFhirRecord;
+        let totalFetched = initialTotalFetched;
+
+        // Step 2: Resolve references within the fetched resources
+        const maxResolveIterations = 3; // Moved constant here or pass as arg
+        const { resolvedFhirRecord, referencesAddedCount } = await resolveFhirReferences(
+            currentFhirRecord,
+            ehrAccessToken,
+            fhirBaseUrl,
+            maxResolveIterations
+        );
+        currentFhirRecord = resolvedFhirRecord;
+        totalFetched += referencesAddedCount;
+        console.log(`[DATA] Total resources after reference resolution: ${totalFetched}`);
+
+
+        // Step 3: Process attachments found in the final set of resources
+        const processedAttachments = await processFhirAttachments(
+            currentFhirRecord,
+            ehrAccessToken,
+            fhirBaseUrl
+        );
+
+        console.log(`[DATA] EHR data fetching and processing complete for Patient: ${patientId}.`);
+        return { fhir: currentFhirRecord, attachments: processedAttachments };
+
     } catch (error) {
-        console.error(`[DATA] Failed to fetch Patient resource: ${error}`);
-        throw new Error(`Could not fetch core Patient resource: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`[DATA] Critical error during EHR data fetch orchestration for Patient ${patientId}:`, error);
+        // Re-throw the error to be handled by the caller (e.g., the background task)
+        throw new Error(`Failed to fetch or process EHR data: ${error instanceof Error ? error.message : String(error)}`);
     }
-
-    await Promise.allSettled(searchQueries.map(async (query) => {
-        try {
-            const url = resolveFhirUrl(query.resourceType, fhirBaseUrl); // Use helper
-            if (query.params) {
-                Object.entries(query.params).forEach(([key, value]) => url.searchParams.set(key, value));
-            }
-            const resources = await fetchAllPages(url.toString(), ehrAccessToken); // Use toString()
-            fhirRecord[query.resourceType] = resources;
-            totalFetched += resources.length;
-        } catch (error) {
-            console.warn(`[DATA] Failed to fetch ${query.resourceType} resources (continuing): ${error}`);
-            fhirRecord[query.resourceType] = [];
-        }
-    }));
-
-    console.log(`[DATA] Completed fetching. Total resources retrieved: ${totalFetched} across ${Object.keys(fhirRecord).length} types.`);
-
-    // --- Internal Attachment Processing Logic ---
-    console.log("[DATA:ATTACHMENT] Starting attachment processing within fetchEhrData...");
-    const xmlParser = new XMLParser({ ignoreAttributes: true, textNodeName: "_text", parseTagValue: false, trimValues: true, stopNodes: ["*.html"] });
-    let processedCount = 0;
-    let processingErrorCount = 0;
-    let fetchErrorCount = 0;
-
-    async function processSingleAttachmentNode(node: AttachmentLike, resourceType: string, resourceId: string, path: string): Promise<void> {
-         let contentRaw: Buffer | null = null;
-         let contentPlaintext: string | null = null;
-         let finalContentType = (node.contentType || 'application/octet-stream').toLowerCase();
-
-         try {
-             if (node.url) {
-                 console.log(`[DATA:ATTACHMENT Process] Found URL: ${node.url} in ${resourceType}/${resourceId} at ${path}`);
-                 try {
-                     const fetched = await fetchAttachmentContent(node.url, fhirBaseUrl, ehrAccessToken); // Pass base URL directly
-                     contentRaw = fetched.contentRaw;
-                     if (fetched.contentType) {
-                         finalContentType = fetched.contentType.split(';')[0].trim().toLowerCase();
-                         console.log(`[DATA:ATTACHMENT Process] Using fetched content type: ${finalContentType}`);
-                     } else {
-                         console.log(`[DATA:ATTACHMENT Process] Fetched content type missing, using type from resource: ${finalContentType}`);
-                     }
-                 } catch (fetchErr) {
-                     console.error(`[DATA:ATTACHMENT Process] Failed to fetch content from ${node.url}:`, fetchErr);
-                     contentPlaintext = `[Error fetching external content at ${node.url}: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}]`;
-                     fetchErrorCount++;
-                 }
-             } else if (node.data) {
-                 console.log(`[DATA:ATTACHMENT Process] Found inline data in ${resourceType}/${resourceId} at ${path}`);
-                 contentRaw = Buffer.from(node.data, 'base64');
-                 finalContentType = (node.contentType || 'application/octet-stream').toLowerCase();
-             } else {
-                 console.warn(`[DATA:ATTACHMENT Process] Attachment node in ${resourceType}/${resourceId} at ${path} has neither URL nor data.`);
-                 contentPlaintext = '[Attachment has no data or URL]';
-             }
-
-             if (contentRaw !== null && contentPlaintext === null) {
-                 if (finalContentType.startsWith('text/plain')) {
-                     contentPlaintext = contentRaw.toString('utf8');
-                 } else if (finalContentType === 'application/rtf') {
-                     try {
-                         console.log(`[DATA:ATTACHMENT Process] Attempting RTF de-encapsulation for ${resourceType}/${resourceId} at ${path}`);
-                         const result = deEncapsulateSync(contentRaw, { decode: iconvLite.decode });
-                         if (result.mode === 'html') {
-                             console.log(`[DATA:ATTACHMENT Process] RTF contained HTML, converting to text.`);
-                             try {
-                                 contentPlaintext = htmlToText(result.text.toString(), { wordwrap: false });
-                             } catch (htmlErr) {
-                                 console.error(`[DATA:ATTACHMENT Process] HTML parsing error after RTF extraction in ${resourceType}/${resourceId} at ${path}:`, htmlErr);
-                                 contentPlaintext = '[Error parsing HTML from RTF]';
-                                 processingErrorCount++;
-                             }
-                         } else {
-                              console.log(`[DATA:ATTACHMENT Process] RTF contained text.`);
-                              contentPlaintext = result.text.toString();
-                         }
-                          if (!contentPlaintext) contentPlaintext = '[Empty RTF content after processing]';
-                     } catch (rtfErr) {
-                         console.error(`[DATA:ATTACHMENT Process] RTF de-encapsulation error in ${resourceType}/${resourceId} at ${path}:`, rtfErr);
-                         contentPlaintext = '[Error processing RTF]';
-                         processingErrorCount++;
-                     }
-                 } else if (finalContentType.startsWith('text/html')) {
-                     try {
-                         contentPlaintext = htmlToText(contentRaw.toString('utf8'), { wordwrap: false });
-                     } catch (htmlErr) {
-                         console.error(`[DATA:ATTACHMENT Process] HTML parsing error in ${resourceType}/${resourceId} at ${path}:`, htmlErr);
-                         contentPlaintext = '[Error parsing HTML]';
-                         processingErrorCount++;
-                     }
-                 } else if (finalContentType.includes('xml')) {
-                     try {
-                         const parsed = xmlParser.parse(contentRaw.toString('utf8'));
-                         const extractText = (n: any): string => {
-                             if (typeof n === 'string') return n + "\n";
-                             if (typeof n !== 'object' || n === null) return "";
-                             return Object.values(n).map(extractText).join("");
-                         };
-                         contentPlaintext = extractText(parsed).replace(/ +/g, ' ').replace(/\n+/g, '\n').trim();
-                         if (!contentPlaintext) contentPlaintext = '[Empty XML content]';
-                     } catch (xmlErr) {
-                         console.error(`[DATA:ATTACHMENT Process] XML parsing error in ${resourceType}/${resourceId} at ${path}:`, xmlErr);
-                         contentPlaintext = '[Error parsing XML]';
-                         processingErrorCount++;
-                     }
-                 } else {
-                     contentPlaintext = `[Binary content type: ${finalContentType}]`;
-                 }
-             }
-
-             processedAttachments.push({
-                 resourceType,
-                 resourceId,
-                 path,
-                 contentType: finalContentType,
-                 json: JSON.stringify(node),
-                 contentRaw,
-                 contentPlaintext
-             });
-             processedCount++;
-
-         } catch (processError) {
-             console.error(`[DATA:ATTACHMENT Process] Error processing node in ${resourceType}/${resourceId} at ${path}:`, processError);
-             processingErrorCount++;
-             processedAttachments.push({
-                 resourceType, resourceId, path,
-                 contentType: finalContentType,
-                 json: JSON.stringify({ error: `Processing failed: ${processError}` }),
-                 contentRaw: null,
-                 contentPlaintext: `[Error during attachment processing: ${processError}]`
-             });
-         }
-    }
-
-    async function findAndProcessAttachments(obj: any, resourceType: string, resourceId: string, currentPath: string = '', processedPaths: Set<string>): Promise<void> {
-         if (!obj || typeof obj !== 'object') return;
-
-         const knownPathsForType = KNOWN_ATTACHMENT_PATHS.get(resourceType);
-         if (knownPathsForType) {
-             for (const knownPath of knownPathsForType) {
-                 if (processedPaths.has(knownPath)) continue;
-                 const attachments = getValueAtPath(obj, knownPath);
-                 if (Array.isArray(attachments)) {
-                     for (const attachment of attachments) {
-                         if (attachment && typeof attachment === 'object') {
-                             await processSingleAttachmentNode(attachment, resourceType, resourceId, knownPath);
-                             processedPaths.add(knownPath);
-                         }
-                     }
-                 }
-             }
-         }
-
-         const isAttachmentLike = (node: any): node is AttachmentLike =>
-             node && typeof node === 'object' && node.contentType && (node.data || node.url);
-
-         if (isAttachmentLike(obj) && !processedPaths.has(currentPath)) {
-             console.log(`[DATA:ATTACHMENT Heuristic] Found potential attachment at path: ${currentPath || '<root>'}`);
-             await processSingleAttachmentNode(obj, resourceType, resourceId, currentPath || 'content');
-             processedPaths.add(currentPath);
-             return;
-         }
-
-         if (Array.isArray(obj)) {
-             await Promise.all(obj.map((item, index) =>
-                 findAndProcessAttachments(item, resourceType, resourceId, `${currentPath}[${index}]`, processedPaths)
-             ));
-         } else if (!isAttachmentLike(obj)) {
-             await Promise.all(Object.entries(obj).map(([key, value]) => {
-                 const newPath = currentPath ? `${currentPath}.${key}` : key;
-                 if (processedPaths.has(newPath)) return Promise.resolve();
-                 return findAndProcessAttachments(value, resourceType, resourceId, newPath, processedPaths);
-             }));
-         }
-    }
-
-    try {
-        await Promise.allSettled(Object.entries(fhirRecord).map(async ([resourceType, resources]) => {
-            for (const resource of resources) {
-                if (resource && resource.id) {
-                    const processedPaths = new Set<string>();
-                    try {
-                        await findAndProcessAttachments(resource, resourceType, resource.id, '', processedPaths);
-                    } catch (resourceErr) {
-                        console.error(`[DATA:ATTACHMENT] Error processing attachments for ${resourceType}/${resource.id}:`, resourceErr);
-                        processingErrorCount++;
-                    }
-                }
-            }
-        }));
-        console.log(`[DATA:ATTACHMENT] Processing complete. Found: ${processedCount}, URL Fetch Errors: ${fetchErrorCount}, Other Processing Errors: ${processingErrorCount}`);
-    } catch (err) {
-        console.error("[DATA:ATTACHMENT] Fatal error during attachment processing loop:", err);
-    }
-
-    return { fhir: fhirRecord, attachments: processedAttachments };
 }
 
 
@@ -521,183 +187,6 @@ async function initializeDatabase(patientId: string): Promise<Database> {
         return new Database(':memory:');
     }
 }
-
-// Populates the given DB instance (memory or file) - NO SAVE NEEDED
-async function populateSqlite(fullEhr: FullEHR, db: Database): Promise<void> {
-    console.log("[SQLITE Populate] Populating database from FullEHR data...");
-    const { fhir: record, attachments } = fullEhr;
-    const resourceTypes = Object.keys(record);
-
-    db.exec('BEGIN TRANSACTION;');
-    try {
-        // Drop existing tables first to ensure clean slate
-        const tables = await db.query("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'fhir_%' OR name = 'attachments');").all() as { name: string }[];
-        for (const table of tables) {
-            db.exec(`DROP TABLE IF EXISTS "${table.name}";`);
-        }
-        console.log("[SQLITE Populate] Dropped existing FHIR/attachment tables.");
-
-        // 1. Create/Populate FHIR resource tables
-        for (const resourceType of resourceTypes) {
-            const safeTableName = `fhir_${resourceType.replace(/[^a-zA-Z0-9_]/g, '_')}`;
-            db.exec(`CREATE TABLE "${safeTableName}" (id TEXT PRIMARY KEY, resource_json TEXT NOT NULL);`);
-            const stmt = db.prepare(`INSERT INTO "${safeTableName}" (id, resource_json) VALUES (?, ?)`);
-            let count = 0;
-            for (const resource of record[resourceType]) {
-                if (resource && resource.id) {
-                    try {
-                        stmt.run(resource.id, JSON.stringify(resource));
-                        count++;
-                    } catch (insertErr: any) {
-                        if (insertErr?.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
-                            console.warn(`[SQLITE Populate] Duplicate ID '${resource.id}' for ${resourceType}. Skipping.`);
-                        } else {
-                            console.error(`[SQLITE Populate] Error inserting ${resourceType}/${resource.id}:`, insertErr);
-                            // Decide whether to throw or continue
-                        }
-                    }
-                } else {
-                    console.warn(`[SQLITE Populate] Resource ${resourceType} missing ID or invalid, skipping.`);
-                }
-            }
-            stmt.finalize();
-            console.log(`[SQLITE Populate] Inserted ${count} resources into ${safeTableName}.`);
-        }
-
-        // 2. Create/Populate attachments table
-        console.log(`[SQLITE Populate] Populating attachments table with ${attachments.length} entries...`);
-        db.exec(`
-            CREATE TABLE attachments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                resource_type TEXT NOT NULL,
-                resource_id TEXT NOT NULL,
-                path TEXT NOT NULL,
-                content_type TEXT,
-                json TEXT NOT NULL, -- Store the original JSON node
-                content_raw BLOB,    -- Store raw bytes if available
-                content_plaintext TEXT, -- Store extracted text if available
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(resource_type, resource_id, path, json) -- Use json in uniqueness constraint
-            )
-        `);
-
-        if (attachments.length > 0) {
-            const attachStmt = db.prepare(`
-                INSERT OR REPLACE INTO attachments (
-                    resource_type, resource_id, path, content_type, json, content_raw, content_plaintext
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            `);
-            let attachCount = 0;
-            for (const attach of attachments) {
-                try {
-                    // Ensure contentRaw is passed correctly (Buffer or null)
-                    const rawBuffer = attach.contentRaw instanceof Buffer ? attach.contentRaw : null;
-                    attachStmt.run(
-                        attach.resourceType,
-                        attach.resourceId,
-                        attach.path,
-                        attach.contentType,
-                        attach.json,
-                        rawBuffer, // Pass Buffer or null
-                        attach.contentPlaintext
-                    );
-                    attachCount++;
-                } catch (attachInsertErr: any) {
-                    console.error(`[SQLITE Populate] Failed to insert attachment for ${attach.resourceType}/${attach.resourceId} at ${attach.path}:`, attachInsertErr);
-                }
-            }
-            attachStmt.finalize();
-            console.log(`[SQLITE Populate] Inserted ${attachCount} attachments.`);
-        }
-
-        db.exec('COMMIT;');
-        console.log("[SQLITE Populate] Database population complete. Changes committed (or persisted if file-backed).");
-
-        // REMOVED: No need for explicit saveSqliteToDisk call
-
-    } catch (err) {
-        console.error("[SQLITE Populate] Error during DB population transaction:", err);
-        try {
-            db.exec('ROLLBACK;');
-            console.log("[SQLITE Populate] Transaction rolled back.");
-        } catch (rollbackErr) {
-            console.error("[SQLITE Populate] Error during rollback:", rollbackErr);
-        }
-        // Re-throw the original error after attempting rollback
-        throw err;
-    }
-}
-
-// NEW function to reconstruct FullEHR from DB
-async function reconstructFullEhrFromDb(db: Database): Promise<FullEHR> {
-    console.log("[SQLITE Reconstruct] Reconstructing FullEHR from database...");
-    const fullEhr: FullEHR = { fhir: {}, attachments: [] };
-
-    try {
-        // 1. Reconstruct FHIR resources
-        const fhirTables = await db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fhir_%';").all() as { name: string }[];
-        console.log(`[SQLITE Reconstruct] Found ${fhirTables.length} FHIR tables.`);
-
-        for (const table of fhirTables) {
-            const resourceType = table.name.replace(/^fhir_/, '');
-            const rows = await db.query(`SELECT resource_json FROM "${table.name}";`).all() as { resource_json: string }[];
-            fullEhr.fhir[resourceType] = rows.map(row => {
-                try {
-                    return JSON.parse(row.resource_json);
-        } catch (e) {
-                    console.error(`[SQLITE Reconstruct] Failed to parse JSON for a resource in ${table.name}:`, e);
-                    return null; // Or handle error differently
-                }
-            }).filter(r => r !== null); // Filter out parse failures
-            console.log(`[SQLITE Reconstruct] Reconstructed ${fullEhr.fhir[resourceType].length} resources of type ${resourceType}.`);
-        }
-
-        // 2. Reconstruct Attachments
-        try {
-            const attachmentRows = await db.query(`
-                SELECT resource_type, resource_id, path, content_type, json, content_raw, content_plaintext
-                FROM attachments;
-            `).all() as {
-                resource_type: string; resource_id: string; path: string; content_type: string;
-                json: string; content_raw: Buffer | null; content_plaintext: string | null; // Bun returns Buffer for BLOB
-            }[];
-
-            fullEhr.attachments = attachmentRows.map(row => {
-                // Basic reconstruction. Assumes `json` field contains the necessary original info if needed.
-                // Bun automatically returns BLOB columns as Buffers.
-                return {
-                    resourceType: row.resource_type,
-                    resourceId: row.resource_id,
-                    path: row.path,
-                    contentType: row.content_type,
-                    json: row.json, // The original JSON node string
-                    contentRaw: row.content_raw, // Should be Buffer or null
-                    contentPlaintext: row.content_plaintext
-                };
-            });
-            console.log(`[SQLITE Reconstruct] Reconstructed ${fullEhr.attachments.length} attachments.`);
-        } catch (e: any) {
-             // Handle case where attachments table might not exist yet
-             if (e.message?.includes('no such table: attachments')) {
-                 console.warn("[SQLITE Reconstruct] Attachments table not found, assuming no attachments.");
-                 fullEhr.attachments = [];
-        } else {
-                 console.error("[SQLITE Reconstruct] Error querying attachments table:", e);
-                 throw e; // Re-throw other errors
-             }
-         }
-
-
-    } catch (error) {
-        console.error("[SQLITE Reconstruct] Error reconstructing FullEHR from database:", error);
-        // Depending on requirements, might return partial data or throw
-        throw new Error(`Failed to reconstruct EHR data from DB: ${error}`);
-    }
-
-    console.log("[SQLITE Reconstruct] FullEHR reconstruction complete.");
-    return fullEhr;
-}
-
 
 // --- `getSessionDb` (Revised) ---
 // Ensures DB is initialized for the session, using the appropriate backend
@@ -752,7 +241,7 @@ async function getSessionDb(session: UserSession): Promise<Database> {
 
     if (shouldPopulate && session.fullEhr && (Object.keys(session.fullEhr.fhir).length > 0 || session.fullEhr.attachments.length > 0)) {
         console.log("[DB GET] Populating newly initialized DB from existing session fullEhr data.");
-        await populateSqlite(session.fullEhr, newDb); // No patientId needed here as saving is automatic for file DBs
+        await ehrToSqlite(session.fullEhr, newDb); // Use the improved ehrToSqlite function instead of populateSqlite
     } else if (shouldPopulate) {
          console.warn("[DB GET] DB is new/in-memory but session fullEhr data is empty. Cannot populate.");
      }
@@ -798,7 +287,7 @@ const GrepRecordOutputSchema = z.object({
 
 
 const QueryRecordInputSchema = z.object({
-    sql: z.string().min(1).describe("The read-only SQL SELECT statement to execute against the in-memory FHIR data.")
+    sql: z.string().min(1).describe("The read-only SQL SELECT statement to execute against the in-memory FHIR data. FHIR resources are stored in the 'fhir_resources' table with columns 'resource_type', 'resource_id', and 'json'. For example, 'SELECT json FROM fhir_resources WHERE resource_type = \"Patient\"' or 'SELECT json FROM fhir_resources WHERE resource_type = \"Observation\" AND json LIKE \"%diabetes%\"'.")
 });
 const QueryRecordOutputSchema = z.array(z.record(z.unknown())).describe("An array of rows returned by the SQL query. Each row is an object where keys are column names.");
 
@@ -1462,7 +951,7 @@ app.use((req, res, next) => {
                             try {
                                 const dbToPopulate = await getSessionDb(currentSessionRef); // Initializes if needed
                         console.log(`[AUTH Callback BG ${bgPatientId}] Populating database...`);
-                                await populateSqlite(currentSessionRef.fullEhr, dbToPopulate);
+                                await ehrToSqlite(currentSessionRef.fullEhr, dbToPopulate); // Use the improved ehrToSqlite function
                         console.log(`[AUTH Callback BG ${bgPatientId}] Database population complete.`);
                             } catch (dbError) {
                                  console.error(`[AUTH Callback BG ${bgPatientId}] Error initializing or populating database:`, dbError);
