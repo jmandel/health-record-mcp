@@ -18,11 +18,12 @@ import {
 
 import { Database } from 'bun:sqlite';
 import cors from 'cors'; // Import cors
-import dotenv from 'dotenv'; // Import dotenv
 import express, { Request, Response } from 'express'; // Import express types
 import { XMLParser } from 'fast-xml-parser';
 import { convert as htmlToText } from 'html-to-text';
 import http from 'http'; // Import http for server creation
+import https from 'https'; // Import https module
+import fs from 'fs/promises'; // Import fs promises for reading certs
 import _ from 'lodash'; // Import lodash
 import pkceChallenge, { verifyChallenge } from 'pkce-challenge';
 import { v4 as uuidv4 } from 'uuid';
@@ -43,8 +44,6 @@ declare module "express-serve-static-core" {
   }
 }
 
-// --- Load Environment Variables ---
-dotenv.config(); // Load .env file
 
 // --- Default Configuration ---
 const DEFAULT_SMART_LAUNCHER_FHIR_BASE = "https://launch.smarthealthit.org/v/r4/sim/WzMsIjgzNjRmZjc0LWQ5MDQtNDQyYi1iOTg0LWY5ZDY0MDUzMTYzOSIsIiIsIkFVVE8iLDEsMSwwLCIiLCIiLCIiLCIiLCIiLDAsMSwiIl0/fhir";
@@ -72,8 +71,46 @@ if (SQLITE_PERSISTENCE_ENABLED) {
     }
 }
 
-const MCP_SERVER_BASE_URL = Bun.env.MCP_SERVER_BASE_URL || "http://localhost:3001";
-const MCP_SERVER_PORT = parseInt(Bun.env.MCP_SERVER_PORT || "3001");
+
+// --- HTTPS Configuration ---
+const MCP_SERVER_HTTPS_ENABLED = Bun.env.MCP_SERVER_HTTPS_ENABLED?.toLowerCase() === 'true';
+const MCP_SERVER_CERT_PATH = Bun.env.MCP_SERVER_CERT_PATH; // e.g., './healthsearch.snarked.com+3.pem'
+const MCP_SERVER_KEY_PATH = Bun.env.MCP_SERVER_KEY_PATH; // e.g., './healthsearch.snarked.com+3-key.pem'
+
+// --- Determine Base URL based on HTTPS ---
+const MCP_SERVER_PROTOCOL = MCP_SERVER_HTTPS_ENABLED ? 'https' : 'http';
+// Default host to localhost if not specified, but allow override
+const MCP_SERVER_HOST = Bun.env.MCP_SERVER_HOST || 'localhost';
+const MCP_SERVER_PORT = MCP_SERVER_HTTPS_ENABLED
+    ? parseInt(Bun.env.MCP_SERVER_PORT || "443")
+    : parseInt(Bun.env.MCP_SERVER_PORT || "3001");
+
+
+console.log(`[CONFIG] MCP_SERVER_PROTOCOL: ${MCP_SERVER_PROTOCOL}`);
+console.log(`[CONFIG] MCP_SERVER_HOST: ${MCP_SERVER_HOST}`);
+console.log(`[CONFIG] MCP_SERVER_PORT: ${MCP_SERVER_PORT}`);
+
+// Construct default base URLs with and without port
+const defaultBaseUrlWithoutPort = `${MCP_SERVER_PROTOCOL}://${MCP_SERVER_HOST}`;
+const defaultBaseUrlWithPort = `${defaultBaseUrlWithoutPort}:${MCP_SERVER_PORT}`;
+
+// Set MCP_SERVER_BASE_URL: Use env var if provided, otherwise construct based on HTTPS
+let MCP_SERVER_BASE_URL = Bun.env.MCP_SERVER_BASE_URL;
+if (!MCP_SERVER_BASE_URL) {
+    // If env var is NOT set, determine default based on HTTPS
+    MCP_SERVER_BASE_URL = MCP_SERVER_HTTPS_ENABLED && MCP_SERVER_PORT === 443 ? defaultBaseUrlWithoutPort : defaultBaseUrlWithPort;
+     console.log(`[CONFIG] MCP_SERVER_BASE_URL not set in environment. Defaulting to: ${MCP_SERVER_BASE_URL}`);
+} else {
+    // If env var IS set, validate its protocol
+    console.log(`[CONFIG] Using MCP_SERVER_BASE_URL from environment: ${MCP_SERVER_BASE_URL}`);
+    if (!MCP_SERVER_BASE_URL.startsWith(`${MCP_SERVER_PROTOCOL}://`)) {
+        console.warn(`[CONFIG] WARNING: MCP_SERVER_BASE_URL (${MCP_SERVER_BASE_URL}) protocol does not match MCP_SERVER_HTTPS_ENABLED setting (${MCP_SERVER_PROTOCOL}). Using environment variable value anyway.`);
+    }
+}
+
+console.log(`[CONFIG] MCP Server Port set to: ${MCP_SERVER_PORT}`);
+console.log(`[CONFIG] MCP Server Base URL set to: ${MCP_SERVER_BASE_URL}`);
+
 const MCP_SERVER_EHR_CALLBACK_PATH = "/ehr-callback";
 const REQUIRED_EHR_SCOPES = Bun.env.EHR_SCOPES || [
     "openid", "fhirUser", "launch/patient",
@@ -1450,21 +1487,10 @@ mcpServer.tool(
         }
 
         try {
-            // Ensure fullEhr is loaded (implicit resync) - DB check removed for grep
-            if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
-                console.warn(`[TOOL grep_record] Session ${session.sessionId} fullEhr missing or empty. Attempting implicit resync.`);
-                await handleResync(session);
-                // After resync, check again if data is present
-                if (!session.fullEhr || Object.keys(session.fullEhr.fhir).length === 0 && session.fullEhr.attachments.length === 0 ) {
-                     throw new Error("Data could not be loaded after resync attempt.");
-                 }
-            }
-            // Call the updated logic function, passing fullEhr
-            const resultData = await grepRecordLogic(session.fullEhr, args.query, args.resource_types); // Pass fullEhr, no db
+            const resultData = await grepRecordLogic(session.fullEhr, args.query, args.resource_types);
 
             // Limit result size before stringifying (important now we return full resources)
-             // ... (Size limiting logic remains the same) ...
-             const MAX_JSON_LENGTH = 1 * 1024 * 1024; // 1 MB limit (adjust as needed)
+             const MAX_JSON_LENGTH = 2 * 1024 * 1024; // 2 MB limit (adjust as needed)
              let resultString = JSON.stringify(resultData, null, 2);
              if (resultString.length > MAX_JSON_LENGTH) {
                  console.warn(`[TOOL grep_record] Result too large (${resultString.length} bytes), truncating heavily.`);
@@ -1747,28 +1773,26 @@ app.get(MCP_SERVER_EHR_CALLBACK_PATH, async (req, res) => {
             throw new Error("Server configuration error: FHIR Base URL is missing.");
         }
 
-        // Try to load existing database from disk first
+        // Try to load existing database from disk first (but don't populate yet)
         let db: Database | null = null;
         if (SQLITE_PERSISTENCE_ENABLED) {
+            // Okay to await this brief check/load
             db = await loadSqliteFromDisk(patientId);
+            if (db) {
+                console.log(`[AUTH Callback] Loaded existing DB from disk for patient ${patientId}.`);
+            }
         }
-        
-        // If no database loaded from disk, create new in-memory database
+
+        // If no database loaded from disk, create new in-memory database (still don't populate)
         if (!db) {
             db = new Database(':memory:');
+            console.log(`[AUTH Callback] Created new in-memory DB for patient ${patientId}.`);
         }
 
-                const fetchedData = await fetchEhrData(ehrTokens.access_token, EHR_FHIR_URL!, patientId);
-        // Populate the database
-        console.log("[AUTH Callback] Populating database...");
-        // Corrected: Pass the fetched data object, db, and patientId
-        await populateSqlite(fetchedData, db, patientId);
-
-        console.log("[DATA] Initial data fetched, processed, and loaded into SQLite.");
-
-        // --- Create UserSession (without mcpAccessToken or transport sessionId yet) ---
+        // --- Get MCP Client Info (logic remains the same) ---
         let mcpClientInfo: OAuthClientInformationFull | undefined;
         if (DISABLE_CLIENT_CHECKS) {
+            // ... (placeholder logic) ...
             console.log(`[AUTH Callback] Client checks disabled. Creating placeholder client info for: ${pendingAuth.mcpClientId}`);
             mcpClientInfo = {
                 client_id: pendingAuth.mcpClientId,
@@ -1788,6 +1812,8 @@ app.get(MCP_SERVER_EHR_CALLBACK_PATH, async (req, res) => {
             }
         }
 
+
+        // --- Create UserSession (INITIAL state - empty fullEhr) ---
         const session: UserSession = {
             sessionId: "", // Will be set by transport later
             mcpAccessToken: "", // Will be set during token exchange
@@ -1795,30 +1821,80 @@ app.get(MCP_SERVER_EHR_CALLBACK_PATH, async (req, res) => {
             ehrTokenExpiry: ehrTokens.expires_in ? Math.floor(Date.now() / 1000) + ehrTokens.expires_in : undefined,
             ehrGrantedScopes: ehrTokens.scope,
             ehrPatientId: patientId,
-            fullEhr: fetchedData, // Assign the fetched FullEHR data
+            fullEhr: { fhir: {}, attachments: [] }, // Initialize as empty! Data fetched in background.
             db, // Assign the potentially initialized DB connection
-            mcpClientInfo, // Now guaranteed to be defined
+            mcpClientInfo, // Assign the MCP client info
             mcpAuthCodeChallenge: pendingAuth.mcpCodeChallenge, // Store challenge for token exchange
             mcpAuthCodeRedirectUri: pendingAuth.mcpRedirectUri, // Store redirect URI for token exchange
         };
 
+        // Generate MCP Auth Code and map it
         const mcpAuthCode = `mcp-code-${uuidv4()}`;
         session.mcpAuthCode = mcpAuthCode; // Add temporary code to session object
         sessionsByMcpAuthCode.set(mcpAuthCode, session); // Map the temporary code to the session object
 
+        // --- Redirect User Immediately ---
         const clientRedirectUrl = new URL(pendingAuth.mcpRedirectUri);
         clientRedirectUrl.searchParams.set("code", mcpAuthCode); // Use the MCP code
         if (pendingAuth.mcpOriginalState) clientRedirectUrl.searchParams.set("state", pendingAuth.mcpOriginalState);
-        console.log(`[AUTH] Redirecting back to MCP Client with MCP Auth Code: ${clientRedirectUrl.toString()}`);
+        console.log(`[AUTH Callback] Redirecting back to MCP Client with MCP Auth Code: ${clientRedirectUrl.toString()}`);
         res.redirect(302, clientRedirectUrl.toString());
 
-    } catch (error) {
-        console.error("[AUTH] Error in /ehr-callback:", error);
+        // --- Trigger Background Data Fetch & Populate --- 
+        // Use an IIAFE (Immediately Invoked Async Function Expression) - DO NOT await this
+        console.log(`[AUTH Callback] Triggering background data fetch/populate for patient ${patientId}...`);
+        (async () => {
+            const bgPatientId = session.ehrPatientId!; // Capture for logging
+            console.log(`[AUTH Callback BG ${bgPatientId}] Starting background task.`);
+            try {
+                // Ensure we have necessary info (redundant check, but safe)
+                if (!session.ehrAccessToken || !EHR_FHIR_URL || !session.ehrPatientId) {
+                    throw new Error("Missing necessary session info for background fetch.");
+                }
+                
+                // 1. Fetch data (includes attachment processing, returns FullEHR)
+                console.log(`[AUTH Callback BG ${bgPatientId}] Fetching EHR data...`);
+                const fetchedData = await fetchEhrData(session.ehrAccessToken, EHR_FHIR_URL!, session.ehrPatientId!);
+                console.log(`[AUTH Callback BG ${bgPatientId}] Fetched ${Object.keys(fetchedData.fhir).length} resource types and ${fetchedData.attachments.length} attachments.`);
+
+                // 2. Update the session's fullEhr in place
+                // Check if session still exists (might have been revoked quickly)
+                const currentSession = activeSessions.get(session.mcpAccessToken) || sessionsByMcpAuthCode.get(session.mcpAuthCode || '');
+                if (currentSession) {
+                    currentSession.fullEhr = fetchedData;
+                    console.log(`[AUTH Callback BG ${bgPatientId}] Updated session fullEhr in memory.`);
+                    
+                     // 3. Populate the database if it exists in the session
+                    if (currentSession.db) {
+                        console.log(`[AUTH Callback BG ${bgPatientId}] Populating database...`);
+                        // Pass the updated currentSession.fullEhr, the existing db, and patientId
+                        await populateSqlite(currentSession.fullEhr, currentSession.db, currentSession.ehrPatientId);
+                        console.log(`[AUTH Callback BG ${bgPatientId}] Database population complete.`);
+                    } else {
+                         console.log(`[AUTH Callback BG ${bgPatientId}] Skipping database population (DB not initialized/enabled in session).`);
+                    }
+                } else {
+                     console.log(`[AUTH Callback BG ${bgPatientId}] Session no longer active. Skipping fullEhr update and DB population.`);
+                 }
+
+            } catch (backgroundError) {
+                console.error(`[AUTH Callback BG ${bgPatientId}] Error during background data fetch/populate:`, backgroundError);
+                // Optional: Update session state to indicate error?
+                // if (session) { session.syncStatus = 'error'; }
+            }
+        })(); // Immediately invoke the async function
+
+
+    } catch (error) { // This outer catch handles errors *before* the redirect
+        console.error("[AUTH Callback] Error processing EHR callback before redirect:", error);
+        // --- Error redirection logic (remains the same) ---
         const clientRedirectUrl = new URL(pendingAuth?.mcpRedirectUri || '/error_fallback');
         clientRedirectUrl.searchParams.set("error", "ehr_callback_failed");
         clientRedirectUrl.searchParams.set("error_description", error instanceof Error ? error.message : "Processing failed after EHR callback");
         if (pendingAuth?.mcpOriginalState) clientRedirectUrl.searchParams.set("state", pendingAuth.mcpOriginalState);
-        res.redirect(302, clientRedirectUrl.toString());
+        if (!res.headersSent) { // Ensure we don't try to redirect twice
+            res.redirect(302, clientRedirectUrl.toString());
+        }
     }
 });
 
@@ -2235,42 +2311,74 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 
 
 // --- Start Server ---
-const expressServer = http.createServer(app); // Create HTTP server instance
 
-expressServer.listen(MCP_SERVER_PORT, () => {
-    console.log(`[HTTP] Server listening on http://localhost:${MCP_SERVER_PORT}`);
-});
+async function startServer() {
+    let server;
+    let serverOptions = {}; // Options for https server
 
-// Graceful shutdown
-const shutdown = async () => {
-    console.log("\nShutting down...");
-    expressServer.close(async (err) => { // Use the HTTP server instance
-        if (err) {
-            console.error("Error closing Express server:", err);
-        } else {
-            console.log("Express server closed.");
+    if (MCP_SERVER_HTTPS_ENABLED) {
+        console.log("[HTTP] HTTPS is enabled. Loading certificates...");
+        if (!MCP_SERVER_CERT_PATH || !MCP_SERVER_KEY_PATH) {
+            console.error("[HTTP] FATAL ERROR: HTTPS is enabled, but MCP_SERVER_CERT_PATH or MCP_SERVER_KEY_PATH is not set in environment variables.");
+            process.exit(1);
         }
-    }); // Make server close async if needed, but often it's sync
+        try {
+            const cert = await fs.readFile(MCP_SERVER_CERT_PATH);
+            const key = await fs.readFile(MCP_SERVER_KEY_PATH);
+            serverOptions = { key: key, cert: cert };
+            console.log(`[HTTP] Certificates loaded from ${MCP_SERVER_CERT_PATH} and ${MCP_SERVER_KEY_PATH}`);
+            server = https.createServer(serverOptions, app); // Create HTTPS server
+        } catch (error) {
+            console.error(`[HTTP] FATAL ERROR: Failed to read certificate files: ${error}`);
+            process.exit(1);
+        }
+    } else {
+        console.log("[HTTP] HTTPS is disabled. Creating HTTP server.");
+        server = http.createServer(app); // Create HTTP server
+    }
 
-    await mcpServer.close().catch(e => console.error("Error closing MCP server:", e));
+    server.listen(MCP_SERVER_PORT, () => {
+        // Use the determined base URL for the log message
+        console.log(`[HTTP] Server listening on ${MCP_SERVER_BASE_URL}`);
+    });
 
-    for (const [id, session] of activeSessions.entries()) {
-        // Close DB if it exists for the session
-        if (session.db) { // Check if db exists before closing
-            try {
-                session.db.close();
-            } catch (e) {
-                console.error(`Error closing DB for session ${id}:`, e);
+    // Graceful shutdown setup (ensure it references the correct server instance)
+    const shutdown = async () => {
+        console.log("\nShutting down...");
+        server.close(async (err) => { // Use the created server instance
+            if (err) {
+                console.error(`Error closing ${MCP_SERVER_PROTOCOL} server:`, err);
+            } else {
+                console.log(`${MCP_SERVER_PROTOCOL} server closed.`);
+            }
+        });
+
+        await mcpServer.close().catch(e => console.error("Error closing MCP server:", e));
+
+        for (const [id, session] of activeSessions.entries()) {
+            // Close DB if it exists for the session
+            if (session.db) {
+                try {
+                    session.db.close();
+                } catch (e) {
+                    console.error(`Error closing DB for session ${id}:`, e);
+                }
             }
         }
-    }
-    activeSessions.clear();
-    console.log("Closed active sessions and DBs (if existed).");
-    process.exit(0); // Assume success unless Express closing failed earlier (handle that if needed)
-};
+        activeSessions.clear();
+        console.log("Closed active sessions and DBs (if existed).");
+        process.exit(0);
+    };
 
-// Replace process listeners to use new shutdown
-process.removeListener('SIGINT', shutdown); // Remove old listener if it existed with same name
-process.removeListener('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+    // Remove potential old listeners before adding new ones
+    process.removeListener('SIGINT', shutdown);
+    process.removeListener('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+}
+
+// Initialize configuration and then start the server
+initializeConfiguration().then(startServer).catch(err => {
+    console.error("FATAL ERROR during initialization or server start:", err);
+    process.exit(1);
+});
