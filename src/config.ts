@@ -35,10 +35,14 @@ const SecurityConfigSchema = z.object({
 });
 
 const ConfigSchema = z.object({
-    ehr: EhrConfigSchema,
+    ehr: EhrConfigSchema.optional(),
     server: ServerConfigSchema,
     persistence: PersistenceConfigSchema,
-    security: SecurityConfigSchema
+    security: SecurityConfigSchema,
+    staticSession: z.object({
+        enabled: z.boolean(),
+        dbPath: z.string().optional()
+    }).optional()
 });
 
 // --- Configuration Type ---
@@ -82,6 +86,7 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
             }
         }
 
+        console.log(validatedConfig);
         return validatedConfig;
     } catch (error) {
         console.error(`[CONFIG] Error loading configuration: ${error}`);
@@ -101,7 +106,7 @@ async function applyDerivedValues(config: any): Promise<AppConfig> {
 
     // Set default port if not provided
     if (!result.server.port) {
-        result.server.port = 3000;
+        result.server.port = 3001;
     }
 
     // Set default callback path if not provided
@@ -139,37 +144,39 @@ async function applyDerivedValues(config: any): Promise<AppConfig> {
     }
 
     // Ensure required scopes exist
-    if (!result.ehr.requiredScopes || result.ehr.requiredScopes.length === 0) {
-        result.ehr.requiredScopes = [
-            "openid",
-            "fhirUser",
-            "launch/patient",
-            "patient/*.read",
-            "launch",
-            "offline_access"
-        ];
-    }
+    if (result.ehr) {
+        if ( !result?.ehr?.requiredScopes || result?.ehr?.requiredScopes.length === 0) {
+            result.ehr.requiredScopes = [
+                "openid",
+                "fhirUser",
+                "launch/patient",
+                "patient/*.read",
+                "launch",
+                "offline_access"
+            ];
+        }
 
-    // Try to discover auth and token URLs if not provided
-    if (!result.ehr.authUrl || !result.ehr.tokenUrl) {
-        console.log(`[CONFIG] Auth or token URL not provided, attempting SMART discovery`);
-        if (result.ehr.fhirBaseUrl) {
-            try {
-                const smartConfig = await fetchSmartConfiguration(result.ehr.fhirBaseUrl);
-                if (smartConfig.authorization_endpoint && !result.ehr.authUrl) {
-                    result.ehr.authUrl = smartConfig.authorization_endpoint;
-                    console.log(`[CONFIG] Discovered auth URL: ${result.ehr.authUrl}`);
+        // Try to discover auth and token URLs if not provided
+        if (!result.ehr.authUrl || !result.ehr.tokenUrl) {
+            console.log(`[CONFIG] Auth or token URL not provided, attempting SMART discovery`);
+            if (result.ehr.fhirBaseUrl) {
+                try {
+                    const smartConfig = await fetchSmartConfiguration(result.ehr.fhirBaseUrl);
+                    if (smartConfig.authorization_endpoint && !result.ehr.authUrl) {
+                        result.ehr.authUrl = smartConfig.authorization_endpoint;
+                        console.log(`[CONFIG] Discovered auth URL: ${result.ehr.authUrl}`);
+                    }
+                    if (smartConfig.token_endpoint && !result.ehr.tokenUrl) {
+                        result.ehr.tokenUrl = smartConfig.token_endpoint;
+                        console.log(`[CONFIG] Discovered token URL: ${result.ehr.tokenUrl}`);
+                    }
+                } catch (error) {
+                    console.error(`[CONFIG] Error during SMART discovery: ${error}`);
+                    // Continue without the discovered URLs
                 }
-                if (smartConfig.token_endpoint && !result.ehr.tokenUrl) {
-                    result.ehr.tokenUrl = smartConfig.token_endpoint;
-                    console.log(`[CONFIG] Discovered token URL: ${result.ehr.tokenUrl}`);
-                }
-            } catch (error) {
-                console.error(`[CONFIG] Error during SMART discovery: ${error}`);
-                // Continue without the discovered URLs
+            } else {
+                console.warn(`[CONFIG] Cannot perform SMART discovery: fhirBaseUrl is missing`);
             }
-        } else {
-            console.warn(`[CONFIG] Cannot perform SMART discovery: fhirBaseUrl is missing`);
         }
     }
 

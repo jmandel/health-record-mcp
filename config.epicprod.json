@@ -1,4 +1,3 @@
-
 {
   "ehr": {
     "fhirBaseUrl": "https://epicfhir.unitypoint.org/ProdFHIR/api/FHIR/R4",
@@ -24,5 +23,9 @@
   },
   "security": {
     "disableClientChecks": true
+  },
+  "staticSession": {
+    "enabled": false,
+    "dbPath": ""
   }
 } 
