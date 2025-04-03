@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EHR Retriever Opener</title>
+    <style>
+        body { font-family: sans-serif; padding: 1em; }
+        button { padding: 0.8em 1.5em; cursor: pointer; margin-bottom: 1em; }
+        #opener-status { margin-top: 1em; font-style: italic; color: #555; }
+    </style>
+</head>
+<body>
+    <h1>EHR Retriever Opener</h1>
+    <p>This page will open the EHR Retriever app and listen for the results via BroadcastChannel.</p>
+
+    <button id="open-retriever">Open EHR Retriever</button>
+
+    <div id="opener-status">Status: Ready</div>
+
+    <script>
+        const openButton = document.getElementById('open-retriever');
+        const statusElement = document.getElementById('opener-status');
+        let retrieverWindow = null; // To potentially reference the window later
+        let broadcastChannel = null; // Hold the channel reference
+        const CHANNEL_NAME = 'ehr-retriever-results'; // Define consistent channel name
+
+        function updateOpenerStatus(message) {
+            console.log(`[Opener Status] ${message}`);
+            if (statusElement) {
+                statusElement.textContent = `Status: ${message}`;
+            }
+        }
+
+        openButton.addEventListener('click', () => {
+            updateOpenerStatus('Opening EHR Retriever window...');
+            const retrieverUrl = './ehretriever.html#deliver-to-opener'; // Signal intent via hash
+
+            // --- Setup BroadcastChannel Listener FIRST ---
+            if (broadcastChannel) {
+                // Close previous channel if button is clicked again
+                broadcastChannel.close();
+            }
+            broadcastChannel = new BroadcastChannel(CHANNEL_NAME);
+            updateOpenerStatus('Listening on BroadcastChannel...');
+            broadcastChannel.onmessage = (event) => {
+                console.log('Opener received broadcast message event:', event);
+                updateOpenerStatus('Broadcast message received. Processing...');
+
+                try {
+                    // BroadcastChannel sends structured data directly, no need to parse JSON
+                    const receivedData = event.data;
+                    
+                    console.log("--- Received ClientFullEHR Object (from BroadcastChannel) ---");
+                    console.log(receivedData);
+                    console.log("-----------------------------------------------------------");
+
+                    updateOpenerStatus('Data successfully received via BroadcastChannel and logged to console!');
+
+                } catch (e) {
+                    console.error('Error processing received broadcast data:', e);
+                    updateOpenerStatus('Error processing received data. Check console.');
+                } finally {
+                    // Close the channel once message is received
+                    if (broadcastChannel) {
+                        broadcastChannel.close();
+                        broadcastChannel = null;
+                        console.log('Opener closed BroadcastChannel.');
+                    }
+                }
+            };
+            broadcastChannel.onmessageerror = (event) => {
+                console.error("BroadcastChannel message error:", event);
+                updateOpenerStatus('Error receiving broadcast message.');
+                 if (broadcastChannel) {
+                     broadcastChannel.close();
+                     broadcastChannel = null;
+                 }
+            };
+            // --- End BroadcastChannel Setup ---
+
+            // Open the window
+            retrieverWindow = window.open(retrieverUrl, 'ehrRetrieverWindow');
+
+            if (retrieverWindow) {
+                updateOpenerStatus('Retriever window opened. Waiting for data via BroadcastChannel...');
+            } else {
+                updateOpenerStatus('Failed to open retriever window. Check popup blockers.');
+                // Close channel if window failed to open
+                 if (broadcastChannel) {
+                     broadcastChannel.close();
+                     broadcastChannel = null;
+                 }
+            }
+        });
+
+        // --- Remove the old postMessage listener ---
+        /*
+        window.addEventListener('message', (event) => {
+           ...
+        }, false); 
+        */
+
+    </script>
+</body>
+</html>

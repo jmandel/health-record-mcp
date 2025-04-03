@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EHR Data Retriever</title>
+    <style>
+        body { font-family: sans-serif; padding: 1em; }
+        label { display: block; margin-bottom: 0.5em; }
+        input[type="text"], input[type="url"] { width: 90%; max-width: 400px; padding: 0.5em; margin-bottom: 1em; box-sizing: border-box; }
+        button { padding: 0.8em 1.5em; cursor: pointer; }
+        #form-container, #status-container { margin-top: 1em; }
+        #status-container { border: 1px solid #ccc; padding: 1em; background-color: #f9f9f9; }
+    </style>
+</head>
+<body>
+    <h1>EHR Data Retriever (Client-Side)</h1>
+
+    <div id="form-container">
+        <p>Enter EHR details to initiate SMART authorization:</p>
+        <form id="ehr-form">
+            <div>
+                <label for="ehr_base_url">EHR FHIR Base URL:</label>
+                <input type="url" id="ehr_base_url" name="ehr_base_url" required>
+            </div>
+            <div>
+                <label for="ehr_client_id">EHR Application Client ID:</label>
+                <input type="text" id="ehr_client_id" name="ehr_client_id" required>
+            </div>
+            <div>
+                <label for="ehr_scopes">Requested Scopes (space-separated):</label>
+                <input type="text" id="ehr_scopes" name="ehr_scopes" value="patient/*.read launch/patient offline_access" required>
+            </div>
+            <div>
+                <label for="redirect_uri">Redirect URI (optional, defaults to this page):</label>
+                <input type="url" id="redirect_uri" name="redirect_uri">
+            </div>
+            <button type="submit">Connect & Fetch Data</button>
+        </form>
+    </div>
+
+    <div id="status-container" style="display: none;">
+        <h2>Status</h2>
+        <p id="status-message">Loading...</p>
+    </div>
+
+    <!-- Bundled script will be included here -->
+    <script src="./dist/ehretriever.bundle.js"></script>
+</body>
+</html> 

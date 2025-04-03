@@ -1,0 +1,25 @@
+{
+  "ehr": {
+    "fhirBaseUrl": "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4",
+    "clientId": "4b080c5a-bc22-409f-9078-2f4828905562",
+    "requiredScopes": [
+      "patient/*.read",
+      "launch/patient",
+      "offline_access"
+    ]
+  },
+  "deliveryEndpoints": {
+    "mcp-callback": {
+      "postUrl": "http://localhost:3000/ehr-retriever-callback",
+      "redirectUrl": "http://localhost:3000/callback-placeholder"
+    },
+    "local-server": {
+      "postUrl": "http://localhost:8080/data-sink", 
+      "redirectUrl": "http://localhost:8080/retrieval-complete?status=done"
+    },
+    "prod-server": {
+      "postUrl": "https://example.com/api/receive-ehr",
+      "redirectUrl": "https://example.com/thank-you"
+    }
+  }
+} 
