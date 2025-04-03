@@ -13,6 +13,7 @@
     "@types/express": "^5.0.1",
     "@types/lodash": "^4.17.16",
     "commander": "^13.1.0",
+    "cookie": "^1.0.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",

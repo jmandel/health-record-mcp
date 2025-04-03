@@ -1,0 +1,13 @@
+{
+  "persistence": {
+    "enabled": true,
+    "directory": "./data"
+  },
+  "staticSession": {
+    "enabled": true,
+    "dbPath": "data/epicfhir_unitypoint_org__euBTtyZGh3f_JTiA7uZ5FgZJna7wj9UegXGnkSaLxxLk3.sqlite"
+  },
+  "security": {
+    "disableClientChecks": true
+  }
+} 

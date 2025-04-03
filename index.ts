@@ -28,6 +28,7 @@ import { v4 as uuidv4 } from 'uuid';
 import vm from 'vm';
 import { z } from 'zod';
 import { Command } from 'commander';
+import cookie from 'cookie'; // Need to parse cookies
 
 // --- Configuration Loading ---
 import { loadConfig, AppConfig } from './src/config.js'; // Import config loader
@@ -67,11 +68,25 @@ interface AuthPendingState {
     mcpCodeChallenge: string;
     mcpOriginalState?: string; // MCP original state
 }
-
 const pendingEhrAuth = new Map<string, AuthPendingState>();
 
+// State store for the temporary /authorize -> /initiate-ehr-auth flow
+interface AuthFlowState {
+    mcpClientId: string;
+    mcpRedirectUri: string;
+    mcpCodeChallenge: string;
+    mcpOriginalState?: string;
+    nonce: string;
+    expiresAt: number; // Timestamp for expiration
+}
+const authFlowStates = new Map<string, AuthFlowState>(); // Renamed map
+const AUTH_FLOW_COOKIE_NAME = 'mcpAuthFlow'; // Renamed cookie name
+const AUTH_FLOW_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes validity
+
+
+// Represents the active, authenticated session after MCP token exchange
 interface UserSession {
-    sessionId: string;
+    transportSessionId: string; // Renamed from sessionId, represents the SSE transport ID
     mcpAccessToken: string;
 
     // EHR Details used for this session
@@ -95,11 +110,12 @@ interface UserSession {
     // Transient MCP Auth Code details (used between callback and token exchange)
     mcpAuthCode?: string;
     mcpAuthCodeChallenge?: string;
-    mcpAuthCodeRedirectUri?: string;
+    // Removed mcpAuthCodeRedirectUri as it wasn't used here
 }
-const activeSessions = new Map<string, UserSession>();
-const sessionsByMcpAuthCode = new Map<string, UserSession>();
+const activeSessions = new Map<string, UserSession>(); // Keyed by mcpAccessToken
+const sessionsByMcpAuthCode = new Map<string, UserSession>(); // Keyed by temporary mcpAuthCode
 const registeredMcpClients = new Map<string, OAuthClientInformationFull>();
+// Keyed by transportSessionId, holds SSE transport and associated token/auth info
 const activeSseTransports = new Map<string, { transport: SSEServerTransport; mcpAccessToken: string; authInfo: AuthInfo }>();
 
 // --- FHIR Data Fetching ---
@@ -606,12 +622,11 @@ class MyOAuthServerProvider implements OAuthServerProvider {
 
         const mcpAccessToken = uuidv4();
         session.mcpAccessToken = mcpAccessToken;
-        session.sessionId = ""; // Transport will set this later
+        session.transportSessionId = ""; // Transport will set this later
         activeSessions.set(mcpAccessToken, session);
 
         delete session.mcpAuthCode;
         delete session.mcpAuthCodeChallenge;
-        delete session.mcpAuthCodeRedirectUri;
 
         console.log(`[AUTH Provider] Issuing MCP token: ${mcpAccessToken.substring(0, 8)}... for client ${mcpClientInfo.client_id}`);
         return { access_token: mcpAccessToken, token_type: "Bearer", expires_in: 3600 };
@@ -699,9 +714,9 @@ mcpServer.tool(
     "grep_record",
     GrepRecordInputSchema.shape,
     async (args, extra) => {
-        const transportSessionId = extra.sessionId;
-        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
-        const transportEntry = activeSseTransports.get(transportSessionId);
+        const transportSessionId = extra.sessionId; // Rename variable
+        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier."); // Use renamed variable
+        const transportEntry = activeSseTransports.get(transportSessionId); // Use renamed variable
         if (!transportEntry) throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
         const mcpAccessToken = transportEntry.mcpAccessToken;
         const session = activeSessions.get(mcpAccessToken);
@@ -736,9 +751,9 @@ mcpServer.tool(
     "query_record",
     QueryRecordInputSchema.shape,
     async (args, extra) => {
-        const transportSessionId = extra.sessionId;
-        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
-        const transportEntry = activeSseTransports.get(transportSessionId);
+        const transportSessionId = extra.sessionId; // Rename variable
+        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier."); // Use renamed variable
+        const transportEntry = activeSseTransports.get(transportSessionId); // Use renamed variable
         if (!transportEntry) throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
         const mcpAccessToken = transportEntry.mcpAccessToken;
         const session = activeSessions.get(mcpAccessToken);
@@ -768,9 +783,9 @@ mcpServer.tool(
     "eval_record",
     EvalRecordInputSchema.shape,
     async (args, extra) => {
-         const transportSessionId = extra.sessionId;
-        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
-         const transportEntry = activeSseTransports.get(transportSessionId);
+         const transportSessionId = extra.sessionId; // Rename variable
+        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier."); // Use renamed variable
+         const transportEntry = activeSseTransports.get(transportSessionId); // Use renamed variable
         if (!transportEntry) throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
          const mcpAccessToken = transportEntry.mcpAccessToken;
          const session = activeSessions.get(mcpAccessToken);
@@ -975,7 +990,7 @@ app.use((req, res, next) => {
 
         // --- Create User Session with all required fields ---
         const session: UserSession = {
-                    sessionId: "", // Will be set by transport
+                    transportSessionId: "", // Initialize correctly - will be set by transport later
                     mcpAccessToken: "", // Will be set upon token exchange
                     // EHR Connection Details (from pendingAuth)
                     ehrBaseUrl: ehrBaseUrl,
@@ -991,7 +1006,6 @@ app.use((req, res, next) => {
                     mcpClientInfo: mcpClientInfo,
                     // MCP Auth Code Details (to be used in /token)
                     mcpAuthCodeChallenge: mcpCodeChallenge,
-                    mcpAuthCodeRedirectUri: mcpRedirectUri, // Not needed here, but was in previous version? Let's remove.
                 };
 
         const mcpAuthCode = `mcp-code-${uuidv4()}`;
@@ -1170,28 +1184,10 @@ app.get("/authorize", async (req, res) => {
             }
 
             // Determine patientId: Use config first, then try to extract from DB, fallback to placeholder
-            let patientId = config.staticSession.patientId;
-            if (!patientId) {
-                 try {
-                     const patientResource = staticDb.query("SELECT json FROM fhir_resources WHERE resource_type = 'Patient' LIMIT 1").get() as { json: string } | null;
-                     if (patientResource && patientResource.json) {
-                         const patient = JSON.parse(patientResource.json);
-                         if (patient.id) {
-                             patientId = patient.id;
-                             console.log(`[STATIC MODE] Inferred patient ID from DB: ${patientId}`);
-                         }
-                     }
-                 } catch (e) {
-                     console.warn("[STATIC MODE] Could not query/parse patient ID from DB:", e);
-                 }
-            }
-            if (!patientId) {
-                 patientId = 'static_patient_id'; // Fallback placeholder
-                 console.warn(`[STATIC MODE] Using placeholder patient ID: ${patientId}`);
-            }
+            let patientId = 'static_patient_id'; // Fallback placeholder
 
             const session: UserSession = {
-                sessionId: "", // Will be set by transport
+                transportSessionId: "", // Will be set by transport
                 mcpAccessToken: "", // Will be set upon token exchange
                 // EHR Connection Details (Placeholders)
                 ehrBaseUrl: `static:///${config.staticSession.dbPath}`, // Use path as identifier
@@ -1207,7 +1203,6 @@ app.get("/authorize", async (req, res) => {
                 mcpClientInfo: mcpClientInfo, // Use the validated/placeholder MCP client info
                 // MCP Auth Code Details
                 mcpAuthCodeChallenge: codeChallenge,
-                mcpAuthCodeRedirectUri: validatedRedirectUri, // Needed for comparison? Let's keep it for now
             };
 
             const mcpAuthCode = `mcp-static-code-${uuidv4()}`;
@@ -1225,6 +1220,44 @@ app.get("/authorize", async (req, res) => {
 
 
         // --- Generate HTML Form (Only if NOT in static mode) ---
+        // <<<--- START SESSION STATE EDIT ---
+        const authFlowId = `mcp-auth-${uuidv4()}`; // Renamed variable
+        const nonce = uuidv4(); // Unique nonce for this form instance
+
+        authFlowStates.set(authFlowId, { // Use renamed map and ID
+            mcpClientId: clientId,
+            mcpRedirectUri: validatedRedirectUri!,
+            mcpCodeChallenge: codeChallenge,
+            mcpOriginalState: state,
+            nonce: nonce,
+            expiresAt: Date.now() + AUTH_FLOW_EXPIRY_MS // Use renamed expiry
+        });
+         console.log(`[AUTHORIZE] Stored auth flow state ${authFlowId} with nonce ${nonce}. Expires at ${new Date(Date.now() + AUTH_FLOW_EXPIRY_MS).toISOString()}`);
+
+         // Clean up expired sessions periodically (simple approach)
+         if (Math.random() < 0.1) { // ~10% chance on each request
+             const now = Date.now();
+             let removedCount = 0;
+             authFlowStates.forEach((data, id) => { // Iterate renamed map
+                 if (data.expiresAt < now) {
+                     authFlowStates.delete(id); // Delete from renamed map
+                     removedCount++;
+                 }
+             });
+             if (removedCount > 0) console.log(`[AUTHORIZE Flow State Cleanup] Removed ${removedCount} expired states.`);
+         }
+
+        // Set the session cookie
+        const cookieOptions: cookie.SerializeOptions = {
+            httpOnly: true,
+            path: '/',
+            maxAge: AUTH_FLOW_EXPIRY_MS / 1000, // maxAge is in seconds
+            secure: config.server.https.enabled, // Use Secure flag only if HTTPS is enabled
+            sameSite: 'lax' // Recommended for security
+        };
+        res.setHeader('Set-Cookie', cookie.serialize(AUTH_FLOW_COOKIE_NAME, authFlowId, cookieOptions)); // Use renamed cookie name and ID
+        // --->>> END SESSION STATE EDIT ---
+
         const defaultEhrBaseUrl = config.ehr?.fhirBaseUrl || ''; // Use optional chaining
         const defaultEhrClientId = config.ehr?.clientId || ''; // Use optional chaining
         const defaultEhrScopes = config.ehr?.requiredScopes.join(' ') || 'patient/*.read launch/patient offline_access'; // Default if EHR config missing
@@ -1248,11 +1281,8 @@ app.get("/authorize", async (req, res) => {
     <h1>Connect to Your Electronic Health Record (EHR)</h1>
     <p>Please provide the connection details for the FHIR server you wish to use.</p>
     <form action="/initiate-ehr-auth" method="POST">
-        <!-- Hidden fields to pass MCP parameters -->
-        <input type="hidden" name="mcp_client_id" value="${_.escape(clientId)}">
-        <input type="hidden" name="mcp_redirect_uri" value="${_.escape(validatedRedirectUri!)}">
-        <input type="hidden" name="mcp_code_challenge" value="${_.escape(codeChallenge)}">
-        ${state ? `<input type="hidden" name="mcp_state" value="${_.escape(state)}">` : ''}
+        <!-- Hidden field for CSRF/session linking -->
+        <input type="hidden" name="nonce" value="${_.escape(nonce)}">
 
         <div>
             <label for="ehr_base_url">EHR FHIR Base URL:</label>
@@ -1477,10 +1507,10 @@ app.get("/mcp-sse", bearerAuthMiddleware, async (req: Request, res: Response) =>
     let transport: SSEServerTransport | null = null;
     try {
                 transport = new SSEServerTransport(`/mcp-messages`, res);
-                const transportSessionId = transport.sessionId;
-                session.sessionId = transportSessionId;
+                const transportSessionId = transport.sessionId; // Assign to renamed local variable
+                session.transportSessionId = transportSessionId; // Set the renamed field in UserSession
 
-        activeSseTransports.set(transportSessionId, {
+        activeSseTransports.set(transportSessionId, { // Use renamed variable
             transport: transport,
             mcpAccessToken: mcpAccessToken,
             authInfo: authInfo
@@ -1488,21 +1518,22 @@ app.get("/mcp-sse", bearerAuthMiddleware, async (req: Request, res: Response) =>
         console.log(`[SSE GET] Client connected & authenticated. Transport Session ID: ${transportSessionId}, linked to MCP Token: ${mcpAccessToken.substring(0, 8)}...`);
 
         res.on('close', () => {
-            activeSseTransports.delete(transportSessionId);
-            if (session && session.sessionId === transportSessionId) {
-                        session.sessionId = "";
+            activeSseTransports.delete(transportSessionId); // Use renamed variable
+            if (session && session.transportSessionId === transportSessionId) { // Check renamed field
+                        session.transportSessionId = ""; // Reset renamed field
             }
-            console.log(`[SSE GET] Client disconnected. Cleaned up transport session: ${transportSessionId}`);
+            console.log(`[SSE GET] Client disconnected. Cleaned up transport session: ${transportSessionId}`); // Use renamed variable
         });
 
         await mcpServer.connect(transport);
 
     } catch (error) {
         console.error("[SSE GET] Error setting up authenticated SSE connection:", error);
-        if (transport && activeSseTransports.has(transport.sessionId)) {
-            activeSseTransports.delete(transport.sessionId);
-            if (session && session.sessionId === transport.sessionId) {
-                 session.sessionId = "";
+        if (transport && activeSseTransports.has(transport.sessionId)) { // transport.sessionId is correct here (from SDK)
+            const transportSessionId = transport.sessionId; // Assign for clarity
+            activeSseTransports.delete(transportSessionId);
+            if (session && session.transportSessionId === transportSessionId) { // Check renamed field
+                 session.transportSessionId = ""; // Reset renamed field
              }
         }
         if (!res.headersSent) {
@@ -1520,27 +1551,27 @@ app.get("/mcp-sse", bearerAuthMiddleware, async (req: Request, res: Response) =>
 
 // --- MCP Message POST Endpoint ---
         app.post("/mcp-messages", (req: Request, res: Response) => {
-            const transportSessionId = req.query.sessionId as string | undefined;
-    if (!transportSessionId) {
+            const transportSessionId = req.query.sessionId as string | undefined; // Rename variable
+    if (!transportSessionId) { // Check renamed variable
         console.warn("[MCP POST] Received POST without transport sessionId query param.");
         res.status(400).send("Missing sessionId query parameter");
         return;
     }
 
-    const transportEntry = activeSseTransports.get(transportSessionId);
+    const transportEntry = activeSseTransports.get(transportSessionId); // Use renamed variable
     if (!transportEntry) {
-        console.warn(`[MCP POST] Received POST for unknown/expired transport sessionId: ${transportSessionId}`);
+        console.warn(`[MCP POST] Received POST for unknown/expired transport sessionId: ${transportSessionId}`); // Use renamed variable
                 res.status(404).send("Invalid or expired sessionId");
         return;
     }
 
     const transport = transportEntry.transport;
     try {
-        console.log(`[MCP POST] Received POST for transport session ${transportSessionId}, linked to MCP Token: ${transportEntry.mcpAccessToken.substring(0,8)}...`);
+        console.log(`[MCP POST] Received POST for transport session ${transportSessionId}, linked to MCP Token: ${transportEntry.mcpAccessToken.substring(0,8)}...`); // Use renamed variable
         console.log(req.headers);
         transport.handlePostMessage(req, res);
     } catch (error) {
-        console.error(`[MCP POST] Error in handlePostMessage for session ${transportSessionId}:`, error);
+        console.error(`[MCP POST] Error in handlePostMessage for session ${transportSessionId}:`, error); // Use renamed variable
         if (!res.headersSent) {
             res.status(500).send("Error processing message");
         } else if (!res.writableEnded) {
@@ -1559,21 +1590,65 @@ app.post("/initiate-ehr-auth", express.urlencoded({ extended: true }), async (re
     }
     // --->>> END EDIT
 
-    // Extract MCP parameters passed via hidden fields
-    const mcpClientId = req.body.mcp_client_id as string | undefined;
-    const mcpRedirectUri = req.body.mcp_redirect_uri as string | undefined;
-    const mcpCodeChallenge = req.body.mcp_code_challenge as string | undefined;
-    const mcpOriginalState = req.body.mcp_state as string | undefined; // MCP State
+    // <<<--- START SESSION STATE EDIT ---
+    // Parse cookies
+    const cookies = cookie.parse(req.headers.cookie || '');
+    const authFlowId = cookies[AUTH_FLOW_COOKIE_NAME]; // Use renamed cookie name
 
-    // Extract user-provided EHR details
+    // Cookie options needed for clearing
+    const cookieOptions: cookie.SerializeOptions = {
+        httpOnly: true,
+        path: '/',
+        maxAge: -1, // Expire immediately
+        secure: config.server.https.enabled,
+        sameSite: 'lax'
+    };
+    // Clear the auth flow cookie immediately after reading it
+    res.setHeader('Set-Cookie', cookie.serialize(AUTH_FLOW_COOKIE_NAME, '', cookieOptions));
+
+    if (!authFlowId) { // Use renamed variable
+        console.error("[INITIATE EHR] Error: Missing auth flow cookie.");
+        res.status(400).send("Missing session information. Please start the authorization flow again.");
+        return;
+    }
+
+    // Retrieve and immediately delete session data
+    const authFlowData = authFlowStates.get(authFlowId); // Use renamed map and ID
+    authFlowStates.delete(authFlowId); // Remove state regardless of validity for security
+
+    if (!authFlowData) { // Check retrieved data
+        console.error(`[INITIATE EHR] Error: Invalid or expired auth flow ID: ${authFlowId}`);
+        res.status(400).send("Invalid or expired session. Please start the authorization flow again.");
+        return;
+    }
+
+    // Check expiration just in case cleanup didn't run
+    if (authFlowData.expiresAt < Date.now()) {
+        console.error(`[INITIATE EHR] Error: Expired auth flow ID: ${authFlowId}`);
+        res.status(400).send("Session expired. Please start the authorization flow again.");
+        return;
+    }
+
+    // Extract form data
+    const submittedNonce = req.body.nonce as string | undefined;
     const ehrBaseUrlInput = req.body.ehr_base_url as string | undefined;
     const ehrClientIdInput = req.body.ehr_client_id as string | undefined;
     const ehrScopesInput = req.body.ehr_scopes as string | undefined; // Space-separated string
 
-    console.log(`[INITIATE EHR] Received request. MCP Client: ${mcpClientId}, EHR URL: ${ehrBaseUrlInput}`);
+    // Validate nonce
+    if (!submittedNonce || submittedNonce !== authFlowData.nonce) {
+        console.error(`[INITIATE EHR] Error: Nonce mismatch for auth flow ${authFlowId}. Expected: ${authFlowData.nonce}, Received: ${submittedNonce}`);
+        res.status(400).send("Invalid form submission. Please try again.");
+        return;
+    }
+
+    // Retrieve MCP parameters from session data
+    const { mcpClientId, mcpRedirectUri, mcpCodeChallenge, mcpOriginalState } = authFlowData; // Use retrieved data
+    console.log(`[INITIATE EHR] Valid auth flow state ${authFlowId} processed. MCP Client: ${mcpClientId}, EHR URL: ${ehrBaseUrlInput}`);
+    // --->>> END SESSION STATE EDIT ---
 
     try {
-        // --- Basic Validation ---
+        // --- Basic Validation (already have MCP params from session) ---
         if (!mcpClientId || !mcpRedirectUri || !mcpCodeChallenge) {
             throw new InvalidRequestError("Missing required MCP authorization parameters.");
         }
@@ -1640,7 +1715,7 @@ app.post("/initiate-ehr-auth", express.urlencoded({ extended: true }), async (re
         // Fallback or default if discovery fails - ASSUMPTION: might need adjustment based on common EHRs
         if (!ehrAuthorizationEndpoint) {
             // Look for a config override first
-            if (config.ehr.authUrl) {
+            if (config.ehr?.authUrl) {
                  console.warn(`[INITIATE EHR] Using configured EHR Auth URL: ${config.ehr.authUrl}`);
                 ehrAuthorizationEndpoint = config.ehr.authUrl;
              } else {
