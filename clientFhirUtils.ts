@@ -2,6 +2,8 @@ import { ClientFullEHR, ClientProcessedAttachment } from './clientTypes';
 import { KNOWN_ATTACHMENT_PATHS, AttachmentLike } from './src/types'; // Reuse server types where applicable
 import { getInitialFhirSearchQueries } from './src/fhirSearchQueries'; // Import shared query function
 import _ from 'lodash'; // Make sure lodash is installed (bun add lodash @types/lodash)
+import { htmlToText } from 'html-to-text';
+import { XMLParser } from 'fast-xml-parser';
 
 // --- Configuration --- 
 const MAX_CONCURRENCY = 5;
@@ -96,19 +98,6 @@ async function fetchResource(url: string, accessToken: string): Promise<any | nu
     }
 }
 
-// --- Helper: Convert Blob to Base64 String ---
-function blobToBase64(blob: Blob): Promise<string> {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => {
-            // Result includes the data URL prefix (e.g., "data:contentType;base64,"), remove it.
-            const base64String = reader.result as string;
-            resolve(base64String.split(',', 2)[1]);
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-    });
-}
 
 // --- Core Fetching Function with Timeout --- 
 async function fetchWithTimeout(url: string, options: RequestInit, timeout = REQUEST_TIMEOUT_MS): Promise<Response> {
@@ -242,8 +231,141 @@ function extractTasksFromResource(resource: any, fhirBaseUrl: string, currentDep
     return newTasks;
 }
 
+/**
+ * Best-effort RTF to Plain Text conversion using Regex.
+ * WARNING: This is simplistic and will fail on complex RTF.
+ * Based on user-provided example.
+ * @param {string} rtf - The RTF content as a string.
+ * @returns {string} - Extracted plain text (best effort).
+ */
+export function rtfToTextBestEffort(rtf: string): string {
+    if (!rtf) {
+        return "";
+    }
+
+    try {
+        // 1. Remove RTF header, font table, color table, stylesheet, info blocks etc.
+        let text = rtf.replace(/\{\\fonttbl.*?\}|\{\\colortbl.*?\}|\{\\stylesheet.*?\}|\{\\info.*?\}|\{\\operator.*?\}|\{\\pict.*?\}|\{\\object.*?\}|\{\\comment.*?\}|\{\\\*.*?\}|\pard\plain/gs, '');
+        // Removed more specific \* block replaces as the one above should catch them
+        // text = text.replace(/\{\\\*\\generator.*?;\}|.../gs, ''); 
+
+        // 2. Handle Unicode characters \\uN?
+         text = text.replace(/\\u(\d+)\s*\\\?\s?/g, (match, dec) => {
+            try {
+                return String.fromCharCode(parseInt(dec, 10));
+            } catch (e) {
+                console.warn(`[RTF] Invalid Unicode code point: ${dec}`);
+                return ''; // Skip invalid code points
+            }
+        });
+
+        // 3. Handle Hexadecimal characters \\'xx
+        text = text.replace(/\\'([0-9a-fA-F]{2})/g, (match, hex) => {
+             try {
+                // Assume Windows-1252 / Latin-1 as a common default fallback
+                return String.fromCharCode(parseInt(hex, 16));
+            } catch (e) {
+                console.warn(`[RTF] Invalid hex escape: ${hex}`);
+                return ''; // Skip invalid hex escapes
+            }
+        });
+
+         // 4. Convert specific RTF control words to text equivalents
+         text = text.replace(/\\(par|pard|sect|page|line|ul)\b\s*/g, '\n'); 
+         text = text.replace(/\\tab\b\s*/g, '\t'); 
+         text = text.replace(/\\(bullet|emdash|endash|enspace|emspace)\b/g, (match, code) => {
+             switch (code) {
+                 case 'bullet': return '•';
+                 case 'emdash': return '—';
+                 case 'endash': return '–';
+                 case 'enspace': return '\u2002'; 
+                 case 'emspace': return '\u2003'; 
+                 default: return '';
+             }
+         });
+        text = text.replace(/\\~ /g, '\u00A0'); // Non-breaking space
+        text = text.replace(/\\_/g, ''); // Optional hyphen - remove
+        text = text.replace(/\\-/g, '-'); // Non-breaking hyphen
+
+        // 5. Handle escaped characters \\{, \\}, \\\\
+        text = text.replace(/\\\\\{/g, '{').replace(/\\\\\}/g, '}').replace(/\\\\\\\\/g, '\\');
+
+        // 6. Remove remaining RTF control words (like \\b, \\i, \\fs24, etc.)
+        text = text.replace(/\\(\*?)[:\\w\-]+\d*\s?/g, '');
+        // --- Add a more aggressive control word stripper --- 
+        // This targets \ followed by letters, optionally followed by a number (parameter), then optional space.
+        // It might be too aggressive and remove intended backslashes followed by words, but let's try.
+        text = text.replace(/\\[a-zA-Z]+(-?\d+)?\s?/g, ''); 
+
+        // 7. Remove braces 
+        text = text.replace(/[{}]/g, '');
+
+        // 8. Clean up: Multiple spaces/newlines, trim whitespace
+        text = text.replace(/(\n\s*){2,}/g, '\n\n'); 
+        text = text.replace(/[ \t]{2,}/g, ' ');    
+        text = text.replace(/^\s+|\s+$/g, '');      
+
+        return text || '[Empty RTF content after processing]';
+    } catch (error) {
+        console.error('[RTF] Error during regex processing:', error);
+        return '[Error processing RTF content]';
+    }
+}
+
+/**
+ * Extracts plain text from XML content using fast-xml-parser.
+ * Attempts to preserve newlines between elements.
+ * @param xmlContent The XML content as a string.
+ * @returns Extracted plain text or an error marker string.
+ */
+export function xmlToTextBestEffort(xmlContent: string): string {
+    try {
+        // Ignore attributes, focus on text content, preserve whitespace
+        const parser = new XMLParser({ 
+            ignoreAttributes: true, 
+            textNodeName: "#text",
+            trimValues: false, 
+            isArray: (name, jpath, isLeafNode, isAttribute) => { 
+                return !isAttribute; 
+            }
+        });
+        const parsed = parser.parse(xmlContent);
+        
+        const extractText = (node: any): string => {
+            let text = "";
+            if (typeof node === 'string') {
+                text += node;
+            } else if (Array.isArray(node)) {
+                text += node.map(extractText).join("\n"); 
+            } else if (typeof node === 'object' && node !== null) {
+                if (node["#text"]) {
+                    text += node["#text"];
+                }
+                text += Object.keys(node)
+                    .filter(key => key !== "#text")
+                    .map(key => extractText(node[key]))
+                    .join("\n"); 
+            }
+            return text;
+        };
+
+        let rawText = extractText(parsed);
+        
+        // Cleanup whitespace
+        let cleanedText = rawText.replace(/[ \t]+/g, ' ');
+        cleanedText = cleanedText.replace(/\n+/g, '\n');
+        const finalText = cleanedText.trim();
+
+        return finalText || '[Empty XML content after processing]'; // Return marker if empty
+
+    } catch (xmlErr) {
+        console.error(`[XML Parse] Error parsing XML content:`, xmlErr);
+        return '[Error parsing XML]';
+    }
+}
+
 // Processes the Blob data from a fetched attachment
-async function processAttachmentData(fetchResultData: Blob, task: FetchTask, clientAttachments: ClientProcessedAttachment[]): Promise<void> {
+export async function processAttachmentData(fetchResultData: Blob, task: FetchTask, clientAttachments: ClientProcessedAttachment[]): Promise<void> {
      if (!task.isAttachment || !task.resourceType || !task.resourceId || !task.attachmentPath || !task.originalResourceJson) {
          console.warn('Skipping attachment processing due to missing task context', { task });
          return;
@@ -270,8 +392,36 @@ async function processAttachmentData(fetchResultData: Blob, task: FetchTask, cli
          });
 
          // Attempt plaintext extraction for common types
-         if (contentType.startsWith('text/') || contentType === 'application/json' || contentType === 'application/fhir+json') {
+        if (contentType.startsWith('text/html')) {
+             try {
+                 const htmlContent = await blob.text();
+                 contentPlaintext = htmlToText(htmlContent, { wordwrap: false });
+             } catch (htmlErr) {
+                 console.error(`[ATTACHMENT:HTML] HTML parsing error in ${task.resourceType}/${task.resourceId} at ${task.attachmentPath}:`, htmlErr);
+                 contentPlaintext = '[Error parsing HTML]';
+             }
+        } else if (contentType.includes('xml')) { // Broader check for XML types
+              try {
+                 const xmlContent = await blob.text();
+                 contentPlaintext = xmlToTextBestEffort(xmlContent);
+              } catch (err) { // Catch errors from blob.text() or xmlToTextBestEffort
+                 console.error(`[ATTACHMENT:XML] Error reading or processing XML blob in ${task.resourceType}/${task.resourceId} at ${task.attachmentPath}:`, err);
+                 contentPlaintext = '[Error processing XML]';
+             }
+         } else if (contentType.startsWith('application/rtf') || contentType.startsWith('text/rtf')) {
+             try {
+                console.log(`[ATTACHMENT:RTF] Attempting best-effort RTF parsing for ${task.resourceType}/${task.resourceId} at ${task.attachmentPath}`);
+                const rtfContent = await blob.text(); // Read blob as text (potential encoding issues)
+                contentPlaintext = rtfToTextBestEffort(rtfContent);
+                 if (!contentPlaintext) contentPlaintext = '[Empty RTF content after processing]';
+             } catch (rtfErr) {
+                 console.error(`[ATTACHMENT:RTF] Error reading or processing RTF blob in ${task.resourceType}/${task.resourceId} at ${task.attachmentPath}:`, rtfErr);
+                 contentPlaintext = '[Error processing RTF]';
+             }
+         } else {
                              contentPlaintext = await blob.text();
+             // Fallback for other binary types or unhandled text types
+             console.log(`[ATTACHMENT:OTHER] Attachment ${task.resourceType}/${task.resourceId} at ${task.attachmentPath} has non-extractable type ${contentType}. default .text() plaintext generated.`);
          } 
 
          const newAttachment: ClientProcessedAttachment = {
@@ -314,11 +464,52 @@ function processInlineAttachments(clientFullEhr: ClientFullEHR): void {
                          let contentPlaintext: string | null = null;
                          const contentType = attachment.contentType || 'application/octet-stream';
                          try {
-                             if (contentBase64 && (contentType.startsWith('text/') || contentType === 'application/json' || contentType === 'application/fhir+json')) {
-                                try { contentPlaintext = atob(contentBase64); } catch (decodeError) {
-                                     console.warn(`Failed to decode base64 for inline text attachment ${resource.resourceType}/${resource.id} at ${path}:`, decodeError);
-                                }
+                             if (contentBase64) {
+                                 let decodedText: string | null = null;
+                                 try { 
+                                     // Use Buffer for robust decoding (handles UTF-8 etc.)
+                                     decodedText = Buffer.from(contentBase64, 'base64').toString('utf8'); 
+                                 } catch (decodeError) {
+                                     console.warn(`[INLINE:DECODE] Failed to decode base64 for inline attachment ${resource.resourceType}/${resource.id} at ${path}:`, decodeError);
+                                     contentPlaintext = '[Error decoding base64 data]';
+                                 }
+
+                                 if (decodedText !== null) {
+                                     if (contentType.startsWith('text/html')) {
+                                        try {
+                                            contentPlaintext = htmlToText(decodedText, { wordwrap: false });
+                                        } catch (htmlErr) {
+                                            console.error(`[INLINE:HTML] HTML parsing error for inline ${resource.resourceType}/${resource.id} at ${path}:`, htmlErr);
+                                            contentPlaintext = '[Error parsing inline HTML]';
+                                        }
+                                    } else if (contentType.includes('xml')) {
+                                        try {
+                                            // decodedText already contains the XML string here
+                                            contentPlaintext = xmlToTextBestEffort(decodedText);
+                                        } catch (xmlErr) {
+                                            // Catch errors specifically from the XML processing function for inline
+                                            console.error(`[INLINE:XML] XML parsing error for inline ${resource.resourceType}/${resource.id} at ${path}:`, xmlErr);
+                                            contentPlaintext = '[Error parsing inline XML]';
+                                        }
+                                    } else if (contentType.startsWith('text/') || contentType === 'application/json' || contentType === 'application/fhir+json') {
+                                         contentPlaintext = decodedText; // Already decoded text
+                                    } else if (contentType.startsWith('application/rtf') || contentType.startsWith('text/rtf')) {
+                                        try {
+                                            console.log(`[INLINE:RTF] Attempting best-effort RTF parsing for inline ${resource.resourceType}/${resource.id} at ${path}`);
+                                            contentPlaintext = rtfToTextBestEffort(decodedText);
+                                            if (!contentPlaintext) contentPlaintext = '[Empty inline RTF content after processing]';
+                                        } catch (rtfErr) {
+                                            console.error(`[INLINE:RTF] Error processing inline RTF in ${resource.resourceType}/${resource.id} at ${path}:`, rtfErr);
+                                            contentPlaintext = '[Error processing inline RTF]';
+                                        }
+                                    } else {
+                                        // Other non-text inline types - no plaintext
+                                        contentPlaintext = null; 
+                                    }
+                                 }
                              }
+                             // If contentBase64 was null or decoding failed and set plaintext to error, keep that value.
+
                               clientFullEhr.attachments.push({
                                  resourceType: resource.resourceType,
                                  resourceId: resource.id,
@@ -361,15 +552,30 @@ export async function fetchAllEhrDataClientSideParallel(
     };
 
     // --- Fetch and Process Single Task Function (Uses pool, updates clientFullEhr directly) ---
-    async function fetchAndProcessTask(task: FetchTask): Promise<FetchTask[]> { 
+    async function fetchAndProcessTask(task: FetchTask): Promise<FetchTask[]> {
         await pool.acquire(); // Wait for a slot
-        
+
         let discoveredTasks: FetchTask[] = [];
         let taskCompletedSuccessfully = false;
 
+        // --- Determine Accept Header ---
+        let acceptHeader = 'application/fhir+json, application/json, */*'; // Default
+        if (task.isAttachment && task.originalResourceJson && task.attachmentPath) {
+            const originalAttachmentNode = _.get(task.originalResourceJson, task.attachmentPath);
+            if (originalAttachmentNode?.contentType) {
+                acceptHeader = originalAttachmentNode.contentType; // Use specific content type
+                 console.log(`Setting Accept header to "${acceptHeader}" for attachment: ${task.description}`);
+            }
+        }
+        const currentHeaders = new Headers(headers); // Clone base headers
+        currentHeaders.set('Accept', acceptHeader); // Set dynamic Accept header
+        // --- End Determine Accept Header ---
+
+
         try {
             progressCallback(completedFetches, totalTasks, `Fetching: ${task.description}...`);
-            const response = await fetchWithTimeout(task.url, { headers }, REQUEST_TIMEOUT_MS);
+            // Use the dynamically set headers
+            const response = await fetchWithTimeout(task.url, { headers: currentHeaders }, REQUEST_TIMEOUT_MS);
             
             let resultData: any = null;
             let isJson = false;

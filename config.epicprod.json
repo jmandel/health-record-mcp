@@ -1,4 +1,9 @@
 {
+  "deliveryEndpoints": {
+    "mcp-callback": {
+      "postUrl": "/ehr-retriever-callback"
+    }
+  },
   "ehr": {
     "fhirBaseUrl": "https://epicfhir.unitypoint.org/ProdFHIR/api/FHIR/R4",
     "clientId": "4b080c5a-bc22-409f-9078-2f4828905562",

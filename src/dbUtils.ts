@@ -123,7 +123,7 @@ interface AttachmentRow {
  * @returns A Promise resolving to a FullEHR object
  */
 export async function sqliteToEhr(db: Database): Promise<ClientFullEHR> {
-    console.log("[DB:RECONSTRUCT] Reconstructing FullEHR from database");
+    // console.log("[DB:RECONSTRUCT] Reconstructing FullEHR from database");
     
     try {
         // Initialize the FullEHR structure
@@ -164,7 +164,7 @@ export async function sqliteToEhr(db: Database): Promise<ClientFullEHR> {
         }));
         
         const resourceCount = Object.values(fhir).reduce((sum, arr) => sum + arr.length, 0);
-        console.log(`[DB:RECONSTRUCT] Reconstructed ${resourceCount} resources and ${attachments.length} attachments`);
+        // console.log(`[DB:RECONSTRUCT] Reconstructed ${resourceCount} resources and ${attachments.length} attachments`);
         
         return { fhir, attachments };
     } catch (error) {
