@@ -1,13 +1,13 @@
 import { FullEHR } from './src/types';
 import pkceChallenge from 'pkce-challenge'; // Import the library
 import { ClientFullEHR } from './clientTypes'; // Import client-specific type
-import { fetchAllEhrDataClientSide } from './clientFhirUtils'; // Import the data fetching function
+import { fetchAllEhrDataClientSideParallel } from './clientFhirUtils'; // UPDATED: Import the parallel data fetching function
 
 // --- Declare potential global constants injected by build ---
 declare const __CONFIG_FHIR_BASE_URL__: string | undefined;
 declare const __CONFIG_CLIENT_ID__: string | undefined;
 declare const __CONFIG_SCOPES__: string | undefined;
-declare const __DELIVERY_ENDPOINTS__: Record<string, { postUrl: string, redirectUrl: string }> | undefined;
+declare const __DELIVERY_ENDPOINTS__: Record<string, { postUrl: string}> | undefined;
 // ----------------------------------------------------------
 
 // Keys for sessionStorage
@@ -43,6 +43,33 @@ function showStatusContainer(show: boolean) {
     const statusContainer = document.getElementById('status-container');
     if (formContainer) formContainer.style.display = show ? 'none' : 'block';
     if (statusContainer) statusContainer.style.display = show ? 'block' : 'none';
+}
+
+// Helper function to show/hide progress UI
+function showProgressContainer(show: boolean) {
+    const progressContainer = document.getElementById('progress-container');
+    if (progressContainer) progressContainer.style.display = show ? 'block' : 'none';
+}
+
+// Helper function to update progress UI
+function updateProgress(completed: number, total: number, message?: string) {
+    const progressBar = document.getElementById('fetch-progress') as HTMLProgressElement;
+    const progressText = document.getElementById('progress-text');
+
+    if (progressBar && progressText) {
+        const percentage = total > 0 ? (completed / total) * 100 : 0;
+        progressBar.value = percentage;
+        progressText.textContent = `(${completed}/${total}) ${message || ''}`.trim();
+        console.log(`Progress: ${completed}/${total} (${percentage.toFixed(1)}%) ${message || ''}`);
+    }
+
+    // Show the container if it's not already visible and we have progress
+    if (total > 0) {
+        const progressContainer = document.getElementById('progress-container');
+        if (progressContainer && progressContainer.style.display === 'none') {
+            showProgressContainer(true);
+        }
+    }
 }
 
 // Helper function to resolve potentially relative URLs to absolute ones
@@ -168,7 +195,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 // 2. Fetch FHIR data
                 updateStatus('Fetching EHR data (this may take a while)...');
-                const clientFullEhrObject = await fetchAllEhrDataClientSide(accessToken, fhirBaseUrl, patientId);
+                showProgressContainer(true); // Show progress bar early
+                updateProgress(0, 0, 'Initiating fetch...'); // Initial progress message
+
+                const clientFullEhrObject = await fetchAllEhrDataClientSideParallel(
+                    accessToken,
+                    fhirBaseUrl,
+                    patientId,
+                    updateProgress // Pass the progress update function
+                );
+
+                console.log("Returned from fetchAllEhrDataClientSideParallel. EHR data:", clientFullEhrObject);
+
+                // Hide progress bar on completion or error
+                showProgressContainer(false);
 
                 // 3. Log the result
                 console.log("--- ClientFullEHR Object ---");
@@ -180,6 +220,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 updateStatus(finalStatus);
 
                 // --- 5. Check for and perform delivery --- 
+                console.log("Proceeding to delivery check...");
                 console.log('[Delivery Check] Checking sessionStorage for key:', DELIVERY_TARGET_KEY);
                 const deliveryTargetName = sessionStorage.getItem(DELIVERY_TARGET_KEY);
                 console.log('[Delivery Check] Value found in sessionStorage:', deliveryTargetName);
@@ -223,12 +264,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         const deliveryEndpoints = typeof __DELIVERY_ENDPOINTS__ !== 'undefined' ? __DELIVERY_ENDPOINTS__ : {};
                         const endpointConfig = deliveryEndpoints[deliveryTargetName]; // Get the config object
 
-                        if (endpointConfig && endpointConfig.postUrl && endpointConfig.redirectUrl) {
+                        if (endpointConfig && endpointConfig.postUrl) {
                             // Resolve URLs to absolute using the helper
                             const postUrl = makeAbsoluteUrl(endpointConfig.postUrl);
-                            const redirectUrl = makeAbsoluteUrl(endpointConfig.redirectUrl);
-                            let deliveryStatus: 'success' | 'error' = 'success';
-                            let deliveryErrorMsg: string | null = null;
 
                             updateStatus(`${finalStatus} Delivering data to ${deliveryTargetName} at ${postUrl}...`);
                             try {
@@ -246,38 +284,38 @@ document.addEventListener('DOMContentLoaded', () => {
                                 }
                                 console.log(`Successfully POSTed data to ${deliveryTargetName} (${postUrl})`);
                                 sessionStorage.removeItem(DELIVERY_TARGET_KEY);
-                            } catch (deliveryError: any) {
-                                deliveryStatus = 'error';
-                                deliveryErrorMsg = deliveryError.message || 'Unknown delivery error';
-                                console.error(`Failed to POST data to ${deliveryTargetName}:`, deliveryError);
-                            }
 
-                            // --- Redirect after POST attempt --- PREVENTED for mcp-callback
-                            if (deliveryTargetName !== 'mcp-callback') { // Only redirect if not the special backend target
-                                const finalRedirectUrl = new URL(redirectUrl); // Use the resolved absolute URL
-                                if (deliveryStatus === 'error') {
-                                    updateStatus(`${finalStatus} Delivery POST to ${deliveryTargetName} FAILED: ${deliveryErrorMsg}. Redirecting...`);
-                                    finalRedirectUrl.searchParams.set('deliveryError', deliveryErrorMsg || 'Unknown error');
-                                    finalRedirectUrl.searchParams.set('deliveryTarget', deliveryTargetName);
-                                } else {
-                                    updateStatus(`${finalStatus} Data successfully POSTed to ${deliveryTargetName}. Redirecting...`);
-                                    finalRedirectUrl.searchParams.set('deliverySuccess', 'true');
-                                    finalRedirectUrl.searchParams.set('deliveryTarget', deliveryTargetName);
+                                // --- Process JSON response and redirect --- 
+                                try {
+                                    const jsonData = await deliveryResponse.json();
+                                    if (jsonData.success === true && typeof jsonData.redirectTo === 'string' && jsonData.redirectTo) {
+                                        updateStatus(`${finalStatus} Data POST successful. Redirecting to complete flow...`);
+                                        console.log(`Redirecting to: ${jsonData.redirectTo}`);
+                                        window.location.href = jsonData.redirectTo; // Perform client-side redirect
+                                        return; // Stop further execution after redirect
+                                    } else {
+                                        // Server indicated failure or response missing redirectTo
+                                        const serverError = jsonData.error || 'unknown_server_error';
+                                        const serverErrorDesc = jsonData.error_description || 'Server did not provide redirect URL or indicated failure.';
+                                        throw new Error(`Server Error (${serverError}): ${serverErrorDesc}`);
+                                    }
+                                } catch (parseError) {
+                                    // Handle cases where response wasn't valid JSON
+                                    console.error("Failed to parse JSON response from delivery endpoint:", parseError);
+                                    throw new Error("Received malformed response from the delivery server.");
                                 }
-                                console.log(`Redirecting to: ${finalRedirectUrl.toString()}`);
-                                window.location.href = finalRedirectUrl.toString();
-                            } else {
-                                // For mcp-callback, just update status and wait for server redirect
-                                if (deliveryStatus === 'error') {
-                                     updateStatus(`${finalStatus} Delivery POST to backend FAILED: ${deliveryErrorMsg}. Server should handle redirect or error.`, true);
-                                } else {
-                                     updateStatus(`${finalStatus} Data successfully POSTed to backend. Waiting for server redirect...`);
-                                }
+                                // --- End JSON response processing ---
+
+                            } catch (deliveryError: any) {
+                                // Catch errors from fetch, non-ok status, JSON parsing, or server-indicated failure
+                                console.error(`Failed to POST or process response for ${deliveryTargetName}:`, deliveryError);
+                                finalStatus += ` Delivery to ${deliveryTargetName} FAILED: ${deliveryError.message || 'Unknown delivery error'}`;
+                                updateStatus(finalStatus, true);
+                                // No automatic redirect on error anymore, user sees the error message.
                             }
-                            // --- End Redirect Logic ---
 
                         } else {
-                            finalStatus += ` Delivery target '${deliveryTargetName}' configuration invalid or incomplete (missing postUrl/redirectUrl).`;
+                            finalStatus += ` Delivery target '${deliveryTargetName}' configuration invalid or incomplete (missing postUrl).`;
                             updateStatus(finalStatus, true);
                             console.error(`Delivery target '${deliveryTargetName}' requested but configuration is invalid in __DELIVERY_ENDPOINTS__.`);
                             sessionStorage.removeItem(DELIVERY_TARGET_KEY); // Remove invalid target
@@ -299,6 +337,7 @@ document.addEventListener('DOMContentLoaded', () => {
     } else {
         // --- Phase 1: Initial Load - Setup Form ---
         showStatusContainer(false);
+        showProgressContainer(false); // Ensure progress is hidden on initial load
         console.log('Initial page load. Setting up form.');
 
         // Check for delivery target in hash

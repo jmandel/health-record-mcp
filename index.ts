@@ -18,20 +18,24 @@ import {
 
 import { Database } from 'bun:sqlite';
 import cors from 'cors';
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
 import https from 'https';
 import fs from 'fs/promises';
 import _ from 'lodash';
-import pkceChallenge, { verifyChallenge } from 'pkce-challenge';
+import { verifyChallenge } from 'pkce-challenge';
 import { v4 as uuidv4 } from 'uuid';
 import vm from 'vm';
 import { z } from 'zod';
 import { Command } from 'commander';
 import cookie from 'cookie'; // Need to parse cookies
+import path from 'path'; // Import path module
+import { execSync } from 'child_process'; // Import for running build command
 
 // --- Configuration Loading ---
 import { loadConfig, AppConfig } from './src/config.js'; // Import config loader
+import { ClientFullEHR } from './clientTypes.js'; // Import client types
+import { ehrToSqlite, sqliteToEhr } from './src/dbUtils.js'; // Import the functions
 
 // --- Add Type Declaration for req.auth ---
 declare module "express-serve-static-core" {
@@ -54,24 +58,9 @@ const SERVER_OPTIONS = {
 
 
 // --- In-Memory Stores (Demo purposes only!) ---
-interface AuthPendingState {
-    // EHR Auth Details
-    ehrState: string;
-    ehrCodeVerifier: string;
-    ehrBaseUrl: string; // User provided
-    ehrClientId: string; // User provided
-    ehrScopes: string[]; // User provided (as array)
 
-    // MCP Client details
-    mcpClientId: string;
-    mcpRedirectUri: string;
-    mcpCodeChallenge: string;
-    mcpOriginalState?: string; // MCP original state
-}
-const pendingEhrAuth = new Map<string, AuthPendingState>();
-
-// State store for the temporary /authorize -> /initiate-ehr-auth flow
-interface AuthFlowState {
+// State store for the temporary /authorize -> /ehr-retriever-callback flow
+interface AuthFlowState { // RENAMED: Was AuthorizeSessionData
     mcpClientId: string;
     mcpRedirectUri: string;
     mcpCodeChallenge: string;
@@ -88,20 +77,10 @@ const AUTH_FLOW_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes validity
 interface UserSession {
     transportSessionId: string; // Renamed from sessionId, represents the SSE transport ID
     mcpAccessToken: string;
+    // databaseId: string; // REMOVED: Unique ID for this session's data/DB - managed internally now
 
-    // EHR Details used for this session
-    ehrBaseUrl: string;
-    ehrClientId: string;
-    ehrScopes: string[]; // Store as array
-
-    // EHR Auth details
-    ehrAccessToken: string;
-    ehrTokenExpiry?: number;
-    ehrGrantedScopes?: string; // Raw string from token response
-    ehrPatientId?: string;
-
-    // Data
-    fullEhr: FullEHR;
+    // Data (Received from client or loaded from DB)
+    fullEhr: ClientFullEHR; // UPDATED: Use client-side type
     db?: Database;
 
     // MCP Client Info
@@ -110,7 +89,6 @@ interface UserSession {
     // Transient MCP Auth Code details (used between callback and token exchange)
     mcpAuthCode?: string;
     mcpAuthCodeChallenge?: string;
-    // Removed mcpAuthCodeRedirectUri as it wasn't used here
 }
 const activeSessions = new Map<string, UserSession>(); // Keyed by mcpAccessToken
 const sessionsByMcpAuthCode = new Map<string, UserSession>(); // Keyed by temporary mcpAuthCode
@@ -118,98 +96,84 @@ const registeredMcpClients = new Map<string, OAuthClientInformationFull>();
 // Keyed by transportSessionId, holds SSE transport and associated token/auth info
 const activeSseTransports = new Map<string, { transport: SSEServerTransport; mcpAccessToken: string; authInfo: AuthInfo }>();
 
-// --- FHIR Data Fetching ---
 
-
-
-// Import types and utility functions
-import { FullEHR } from './src/types';
-import {
-    fetchInitialFhirResources,
-    resolveFhirReferences,
-    processFhirAttachments,
-    fetchAllEhrData
-} from './src/fhirUtils';
-
-// Import new utilities
-import { ehrToSqlite, sqliteToEhr } from './src/dbUtils';
-
-// ==========================================================================
-// Core Data Fetching Orchestration
-// ==========================================================================
+// --- Session Creation & DB Management --- 
 
 /**
- * Fetches, resolves references, and processes attachments for a given patient's EHR data.
- * Orchestrates the calls to the specialized fetching and processing functions.
- * @param ehrAccessToken - The access token for the EHR FHIR server.
- * @param fhirBaseUrl - The base URL of the EHR FHIR server.
- * @param patientId - The ID of the patient whose data is being fetched.
- * @returns A Promise resolving to the FullEHR object containing structured FHIR data and processed attachments.
- * @throws If the core Patient resource cannot be fetched or other critical errors occur.
+ * Creates a new UserSession, initializes its database (in-memory or file-based based on config),
+ * populates it with the provided EHR data, and returns the complete session object.
+ * 
+ * @param mcpClientInfo - Information about the MCP client initiating the session.
+ * @param mcpCodeChallenge - The PKCE code challenge provided by the MCP client.
+ * @param ehrData - The full EHR data received from the client-side retriever.
+ * @returns A Promise resolving to the initialized UserSession.
  */
-async function fetchEhrData(ehrAccessToken: string, fhirBaseUrl: string, patientId: string): Promise<FullEHR> {
-    console.log(`[DATA] Orchestrating EHR data fetch for Patient: ${patientId} from ${fhirBaseUrl}`);
-    if (!patientId) throw new Error("Patient ID is required to fetch data.");
-    if (!fhirBaseUrl) throw new Error("FHIR Base URL is required.");
+async function createSessionFromEhrData(
+    mcpClientInfo: OAuthClientInformationFull,
+    mcpCodeChallenge: string,
+    ehrData: ClientFullEHR
+): Promise<UserSession> {
+    const newDatabaseId = uuidv4(); // Generate a unique ID for this session's DB context
+    console.log(`[SESSION CREATE] Creating new session with DB ID: ${newDatabaseId}`);
+
+    let db: Database;
+    try {
+        // Initialize the database (creates file if persistent, or uses :memory:)
+        db = await initializeDatabase(newDatabaseId);
+        console.log(`[SESSION CREATE] Database initialized for ${newDatabaseId}. File: ${db.filename || ':memory:'}`);
+    } catch (initError) {
+        console.error(`[SESSION CREATE] Failed to initialize database for ${newDatabaseId}:`, initError);
+        throw new Error(`Database initialization failed: ${initError}`);
+    }
 
     try {
-        // Step 1: Fetch initial set of resources (Patient + bulk searches)
-        const { initialFhirRecord, initialTotalFetched } = await fetchInitialFhirResources(ehrAccessToken, fhirBaseUrl, patientId);
-        let currentFhirRecord = initialFhirRecord;
-        let totalFetched = initialTotalFetched;
-
-        // Step 2: Resolve references within the fetched resources
-        const maxResolveIterations = 3; // Moved constant here or pass as arg
-        const { resolvedFhirRecord, referencesAddedCount } = await resolveFhirReferences(
-            currentFhirRecord,
-            ehrAccessToken,
-            fhirBaseUrl,
-            maxResolveIterations
-        );
-        currentFhirRecord = resolvedFhirRecord;
-        totalFetched += referencesAddedCount;
-        console.log(`[DATA] Total resources after reference resolution: ${totalFetched}`);
-
-
-        // Step 3: Process attachments found in the final set of resources
-        const processedAttachments = await processFhirAttachments(
-            currentFhirRecord,
-            ehrAccessToken,
-            fhirBaseUrl
-        );
-
-        console.log(`[DATA] EHR data fetching and processing complete for Patient: ${patientId}.`);
-        return { fhir: currentFhirRecord, attachments: processedAttachments };
-
-    } catch (error) {
-        console.error(`[DATA] Critical error during EHR data fetch orchestration for Patient ${patientId}:`, error);
-        // Re-throw the error to be handled by the caller (e.g., the background task)
-        throw new Error(`Failed to fetch or process EHR data: ${error instanceof Error ? error.message : String(error)}`);
+        // Populate the database with the provided EHR data
+        console.log(`[SESSION CREATE] Populating database ${db.filename || ':memory:'} for ${newDatabaseId}...`);
+        await ehrToSqlite(ehrData, db);
+        console.log(`[SESSION CREATE] Database population complete for ${newDatabaseId}.`);
+    } catch (populateError) {
+        console.error(`[SESSION CREATE] Failed to populate database ${db.filename || ':memory:'} for ${newDatabaseId}:`, populateError);
+        // Attempt to clean up the DB connection if population fails
+        try { db.close(); } catch (closeErr) { console.error(`[SESSION CREATE] Error closing DB after population failure for ${newDatabaseId}:`, closeErr); }
+        throw new Error(`Database population failed: ${populateError}`);
     }
+
+    // Construct the session object
+    const session: UserSession = {
+        transportSessionId: "", // Will be set by transport connection
+        mcpAccessToken: "", // Will be set upon token exchange
+        fullEhr: ehrData, // Store the original data
+        db: db, // Store the open, populated DB handle
+        mcpClientInfo: mcpClientInfo,
+        mcpAuthCodeChallenge: mcpCodeChallenge,
+        // mcpAuthCode will be added just before storing in sessionsByMcpAuthCode
+    };
+
+    console.log(`[SESSION CREATE] Session successfully created for MCP Client ${mcpClientInfo.client_id} (DB ID internally associated: ${newDatabaseId})`);
+    return session;
 }
 
+// TODO (Future): Implement loadSessionFromDatabaseId if needed
+// async function loadSessionFromDatabaseId(...) { ... }
 
-// --- SQLite Persistence Functions (NEW & REVISED) ---
 
-// Helper to get the file path (REVISED: Takes ehrBaseUrl)
-async function getSqliteFilePath(patientId: string, ehrBaseUrl: string): Promise<string> {
-    if (!ehrBaseUrl) throw new Error("EHR FHIR Base URL is required for persistence path.");
-    const fhirUrl = new URL(ehrBaseUrl);
-    const sanitizedOrigin = fhirUrl.origin
-        .replace(/^https?:\/\//, '')
-        .replace(/[^a-zA-Z0-9]/g, '_');
+// --- SQLite Persistence Functions (REVISED: Needs adaptation for ClientFullEHR) ---
+
+// Helper to get the file path using a unique session database ID
+async function getSqliteFilePath(databaseId: string): Promise<string> {
+    if (!databaseId) throw new Error("Database ID is required for persistence path.");
+    // Simple sanitization for the ID, although UUIDs should be safe
+    const sanitizedDbId = databaseId.replace(/[^a-zA-Z0-9-]/g, '_'); 
     
-    const sanitizedPatientId = patientId.replace(/[^a-zA-Z0-9]/g, '_');
-    
-    return `${config.persistence.directory}/${sanitizedOrigin}__${sanitizedPatientId}.sqlite`;
+    return `${config.persistence.directory}/${sanitizedDbId}.sqlite`;
 }
 
-// Initializes either a file-backed or in-memory DB based on config (REVISED: Takes ehrBaseUrl)
-async function initializeDatabase(patientId: string, ehrBaseUrl: string): Promise<Database> {
+// Initializes either a file-backed or in-memory DB based on config
+async function initializeDatabase(databaseId: string): Promise<Database> {
     if (config.persistence.enabled) {
-    // Pass ehrBaseUrl to get the correct path
-    const filePath = await getSqliteFilePath(patientId, ehrBaseUrl); 
-        console.log(`[SQLITE Init] Initializing persistent database at: ${filePath}`);
+        // Pass databaseId to get the correct path
+        const filePath = await getSqliteFilePath(databaseId); 
+        console.log(`[SQLITE Init] Initializing persistent database for ID ${databaseId} at: ${filePath}`);
         // Bun automatically creates the file if it doesn't exist
         // and handles persistence for file-backed DBs.
         try {
@@ -228,71 +192,27 @@ async function initializeDatabase(patientId: string, ehrBaseUrl: string): Promis
     }
 }
 
-// --- `getSessionDb` (Revised) ---
-// Ensures DB is initialized for the session, using the appropriate backend
+// --- `getSessionDb` (Simplified) ---
+// Returns the existing DB handle from the session, checking if it's still open.
+// Assumes the DB was initialized and populated during session creation.
 async function getSessionDb(session: UserSession): Promise<Database> {
-    // Check if DB exists and is open
-    if (session.db) {
-        try {
-            session.db.query("PRAGMA user_version;").get(); // Simple query to check if open
-            // console.log(`[DB GET] Using existing open DB connection for session (Patient: ${session.ehrPatientId}).`);
-            return session.db;
-        } catch (e) {
-            console.warn(`[DB GET] Session DB for patient ${session.ehrPatientId} was closed or invalid. Reinitializing.`);
-            session.db = undefined; // Clear closed/invalid reference
-        }
+    if (!session.db) {
+        // This should ideally not happen if sessions are created correctly
+        console.error("[DB GET] Critical Error: Session DB handle is missing.");
+        throw new Error("Session database connection is missing unexpectedly.");
     }
 
-    // Initialize new DB connection (file or memory)
-    console.log(`[DB GET] Initializing new DB connection for session (Patient: ${session.ehrPatientId}, EHR: ${session.ehrBaseUrl}). Persistence: ${config.persistence.enabled}`);
-    if (!session.ehrPatientId) {
-         // Should generally not happen if called appropriately, but safety check
-         console.error("[DB GET] Cannot initialize DB without patientId in session.");
-         throw new Error("Cannot initialize database without patient context.");
+    try {
+        // Simple query to check if the connection is still open
+        session.db.query("PRAGMA user_version;").get(); 
+        // console.log(`[DB GET] Using existing open DB connection. File: ${session.db.filename || ':memory:'}`);
+        return session.db;
+    } catch (e) {
+        console.error(`[DB GET] Error: Session DB connection (File: ${session.db.filename || ':memory:'}) appears closed or invalid.`, e);
+        // Should we attempt to re-establish? For now, throw an error as state is likely lost.
+        session.db = undefined; // Clear the invalid reference
+        throw new Error(`Session database connection was closed or became invalid: ${e}`);
     }
-    if (!session.ehrBaseUrl) {
-        // Should not happen if session is correctly initialized
-        console.error("[DB GET] Cannot initialize DB without ehrBaseUrl in session.");
-        throw new Error("Cannot initialize database without EHR context.");
-    }
-    // Pass the session's ehrBaseUrl to initializeDatabase
-    const newDb = await initializeDatabase(session.ehrPatientId, session.ehrBaseUrl); 
-    session.db = newDb; // Store the initialized DB in the session
-
-    // If persistence is DISABLED, we need to populate the new in-memory DB from fullEhr
-    // If persistence is ENABLED, the DB file might already contain data (from previous runs)
-    // or it might be empty (first run). We rely on handleResync or the initial background fetch
-    // to populate it correctly later. reconstructFullEhrFromDb could be used here if needed,
-    // but let's keep population tied to data fetching for now.
-    let shouldPopulate = false;
-    if (!config.persistence.enabled) {
-        console.log("[DB GET] Persistence disabled. Will populate in-memory DB if fullEhr data exists.");
-        shouldPopulate = true;
-        } else {
-        // For persistent DBs, check if it's empty (e.g., first time use)
-        try {
-            const tables = await newDb.query("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'fhir_%' OR name = 'attachments');").all();
-            if (tables.length === 0) {
-                 console.log("[DB GET] Persistent DB is empty. Will populate if fullEhr data exists.");
-                 shouldPopulate = true;
-            } else {
-                 console.log("[DB GET] Persistent DB exists and has tables. Population will be handled by resync/fetch if necessary.");
-             }
-        } catch (dbCheckError) {
-             console.error("[DB GET] Error checking persistent DB tables, attempting population:", dbCheckError);
-             shouldPopulate = true; // Attempt population on error
-         }
-    }
-
-
-    if (shouldPopulate && session.fullEhr && (Object.keys(session.fullEhr.fhir).length > 0 || session.fullEhr.attachments.length > 0)) {
-        console.log("[DB GET] Populating newly initialized DB from existing session fullEhr data.");
-        await ehrToSqlite(session.fullEhr, newDb); // Use the improved ehrToSqlite function instead of populateSqlite
-    } else if (shouldPopulate) {
-         console.warn("[DB GET] DB is new/in-memory but session fullEhr data is empty. Cannot populate.");
-     }
-
-    return session.db;
 }
 
 
@@ -301,11 +221,12 @@ async function getSessionDb(session: UserSession): Promise<Database> {
 const GrepRecordInputSchema = z.object({
     query: z.string().min(1).describe("The text string or JavaScript-style regular expression to search for (case-insensitive). Example: 'heart attack|myocardial infarction|mi'"),
     resource_types: z.array(z.string()).optional().describe(
-        `List of FHIR resource types (e.g., ["DocumentReference"]) or the special keyword "Attachment" to limit the search scope.
-        - If omitted or empty: Searches all loaded resource types AND all attachments.
-        - If ["DocumentReference"]: Searches only DocumentReference resources AND attachments belonging to DocumentReferences.
-        - If ["Attachment"]: Searches ONLY the plaintext content of all attachments.
-        - If ["DocumentReference", "Attachment"]: Searches DocumentReference resources AND ALL attachments.`
+        `Optional list to filter the search scope. Supports FHIR resource type names (e.g., "Patient", "Observation") and the special keyword "Attachment".
+        Behavior based on the list:
+        - **If omitted or an empty list is provided:** Searches EVERYTHING - all FHIR resources and all attachment plaintext.
+        - **List contains only FHIR types (e.g., ["Condition", "Procedure"]):** Searches ONLY the specified FHIR resource types AND the plaintext of attachments belonging *only* to those specified resource types.
+        - **List contains only ["Attachment"]:** Searches ONLY the plaintext content of ALL attachments, regardless of which resource they belong to.
+        - **List contains FHIR types AND "Attachment" (e.g., ["DocumentReference", "Attachment"]):** Searches the specified FHIR resource types (e.g., DocumentReference) AND the plaintext of ALL attachments (including those not belonging to the specified FHIR types).`
     )
 });
 
@@ -350,24 +271,21 @@ const EvalRecordInputSchema = z.object({
     code: z.string().min(1).describe(
         `A string containing the body of an async JavaScript function.
         This function receives the following arguments:
-        1. 'fullEhr': An object containing the patient's EHR data:
-           - 'fullEhr.fhir': An object where keys are FHIR resource type strings (e.g., "Patient", "Observation", "DocumentReference") and values are arrays of the corresponding FHIR resource JSON objects fetched from the EHR.
-           - 'fullEhr.attachments': An array of processed attachment objects. Each object typically includes:
-             - 'resourceType': The FHIR type of the resource the attachment belongs to (e.g., "DocumentReference").
-             - 'resourceId': The ID of the parent FHIR resource.
-             - 'path': The path within the parent resource where the attachment was found (e.g., "content.attachment").
-             - 'contentType': The MIME type of the attachment (e.g., "text/plain", "application/pdf").
-             - 'contentPlaintext': The extracted plaintext content of the attachment, if available and text-based (string or null).
-             - 'contentRaw': Raw attachment bytes as a Buffer, if available (Buffer or null).
-             - 'json': The original JSON string of the attachment node from the FHIR resource.
-        2. 'console': A limited console object (log, warn, error) for capturing output.
-        3. '_': The Lodash library, accessible via the underscore variable.
+        1. 'fullEhr': An object containing the patient's EHR data (ClientFullEHR format):
+           - 'fullEhr.fhir': An object where keys are FHIR resource type strings... and values are arrays of the corresponding FHIR resource JSON objects.
+           - 'fullEhr.attachments': An array of processed attachment objects (ClientProcessedAttachment format). Each object includes:
+             - 'resourceType', 'resourceId', 'path', 'contentType'
+             - 'contentPlaintext': The extracted plaintext content (string or null).
+             - 'contentBase64': Raw content encoded as a base64 string (string or null).
+             - 'json': The original JSON string of the attachment node.
+        2. 'console': A limited console object...
+        3. '_': The Lodash library...
 
-        The function MUST conclude with a 'return' statement providing a JSON-serializable value. Console output will be captured separately.
+        The function MUST conclude with a 'return' statement... Console output will be captured separately.
 
-        Example Input JSON:
+        Example Input (Note: Access .contentBase64 for binary, .contentPlaintext for text):
         {
-          "code": "const conditions = fullEhr.fhir[\\"Condition\\"] || [];\\nconst activeConditions = _.filter(conditions, c => c.clinicalStatus?.coding?.[0]?.code === 'active');\\nconsole.log(\`Found \${activeConditions.length} active conditions.\`);\\nreturn activeConditions.map(c => ({ id: c.id, code: c.code?.text }));"
+          "code": "const conditions = fullEhr.fhir[\"Condition\"] || [];\n//... rest of example code ..."
         }`
     )
 });
@@ -382,7 +300,7 @@ const EvalRecordOutputSchema = z.object({
 // --- Logic Functions ---
 
 async function grepRecordLogic(
-    fullEhr: FullEHR,
+    fullEhr: ClientFullEHR, // Use ClientFullEHR
     query: string,
     inputResourceTypes?: string[]
 ): Promise<z.infer<typeof GrepRecordOutputSchema>> {
@@ -473,6 +391,7 @@ async function grepRecordLogic(
 
         if (matchedAttachmentKeys.has(attachmentKey)) continue;
 
+        // Use contentPlaintext from ClientFullEHR
         if (attachment.contentPlaintext && attachment.contentPlaintext.length > 0) {
             if (regex.test(attachment.contentPlaintext)) {
                 matchedAttachmentKeys.add(attachmentKey);
@@ -481,7 +400,7 @@ async function grepRecordLogic(
                     resourceId: attachment.resourceId,
                     path: attachment.path,
                     contentType: attachment.contentType,
-                    plaintext: attachment.contentPlaintext
+                    plaintext: attachment.contentPlaintext // Return the plaintext content
                 });
             }
         }
@@ -499,6 +418,8 @@ async function grepRecordLogic(
 }
 
 async function queryRecordLogic(db: Database, sql: string): Promise<z.infer<typeof QueryRecordOutputSchema>> {
+    // This function primarily interacts with the DB, 
+    // assumes dbUtils are adapted to store/retrieve ClientFullEHR compatible data
      const sqlLower = sql.trim().toLowerCase();
      if (!sqlLower.startsWith('select')) throw new Error("Only SELECT queries are allowed.");
      const writeKeywords = ['insert', 'update', 'delete', 'drop', 'create', 'alter', 'attach', 'detach', 'replace', 'pragma'];
@@ -510,7 +431,8 @@ async function queryRecordLogic(db: Database, sql: string): Promise<z.infer<type
      } catch (err) { console.error("[SQLITE] Execution Error:", err); throw new Error(`SQL execution failed: ${(err as Error).message}`); }
 }
 
-async function evalRecordLogic(fullEhr: FullEHR, userCode: string): Promise<{ result?: any, logs: string[], errors: string[] }> {
+async function evalRecordLogic(fullEhr: ClientFullEHR, userCode: string): Promise<{ result?: any, logs: string[], errors: string[] }> {
+    // Update sandbox context and documentation string
     const logs: string[] = [];
     const errors: string[] = [];
 
@@ -533,18 +455,19 @@ async function evalRecordLogic(fullEhr: FullEHR, userCode: string): Promise<{ re
     };
 
     const sandbox = {
-        fullEhr: fullEhr,
+        fullEhr: fullEhr, // Pass ClientFullEHR
         console: sandboxConsole,
         _: _,
+        Buffer: Buffer, // Provide Buffer for base64 decoding
         __resultPromise__: undefined as Promise<any> | undefined
     };
 
     const scriptCode = `
-        async function userFunction(fullEhr, console, _) {
+        async function userFunction(fullEhr, console, _, Buffer) {
             "use strict";
             ${userCode}
         }
-        __resultPromise__ = userFunction(fullEhr, console, _);
+        __resultPromise__ = userFunction(fullEhr, console, _, Buffer);
     `;
 
      const context = vm.createContext(sandbox);
@@ -721,6 +644,7 @@ mcpServer.tool(
         const mcpAccessToken = transportEntry.mcpAccessToken;
         const session = activeSessions.get(mcpAccessToken);
         if (!session) throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
+        console.log(`[TOOL grep_record] Session found for token ${mcpAccessToken.substring(0,8)}...`, session.fullEhr);
 
         try {
             const resultData = await grepRecordLogic(session.fullEhr, args.query, args.resource_types);
@@ -852,6 +776,20 @@ async function main() {
         console.log(`[CONFIG] Loading configuration from: ${configPath}`);
         config = await loadConfig(configPath);
 
+        // --- Build the client-side retriever using the determined config ---
+        console.log(`[BUILD] Building ehretriever with config: ${configPath}...`);
+        try {
+            const buildCommand = `bun run build:ehretriever --config ${configPath}`;
+            // Execute synchronously, inherit stdio to see build output/errors
+            execSync(buildCommand, { stdio: 'inherit' }); 
+            console.log(`[BUILD] Successfully built ehretriever.`);
+        } catch (buildError) {
+            console.error(`[BUILD] FATAL ERROR: Failed to build ehretriever with config ${configPath}. See error below.`);
+            // The error from execSync usually includes stdout/stderr, so no need to log buildError directly unless needed
+            process.exit(1); // Exit if build fails
+        }
+        // --- End Build Step ---
+
 // Middleware
         app.use(cors());
         app.use(express.urlencoded({ extended: true }));
@@ -862,232 +800,10 @@ app.use((req, res, next) => {
     next();
 });
 
-        // --- EHR Callback Handling (Revised DB Handling) ---
-        app.get(config.server.ehrCallbackPath, async (req, res) => {
-    // <<<--- START EDIT
-    if (config.staticSession?.enabled) {
-        console.warn(`[STATIC MODE] /ehr-callback endpoint accessed unexpectedly.`);
-        res.status(400).send("Server is in static session mode. This endpoint should not be used.");
-        return;
-    }
-    // --->>> END EDIT
-
-    const ehrCode = req.query.code as string | undefined;
-    const ehrState = req.query.state as string | undefined; // This is the state *we* sent to the EHR
-
-    if (!ehrCode || !ehrState) {
-        res.status(400).send("Missing code or state from EHR.");
-        return;
-    }
-
-            const pendingAuth = pendingEhrAuth.get(ehrState);
-            pendingEhrAuth.delete(ehrState); // State is single-use
-
-    if (!pendingAuth) {
-        res.status(400).send("Invalid or expired state parameter from EHR.");
-        return;
-    }
-            // --- Extract necessary details from pendingAuth ---
-            const { 
-                ehrBaseUrl,
-                ehrClientId, 
-                ehrCodeVerifier,
-                ehrScopes, // We stored this, might be useful for validation? Not used in token exchange itself.
-                mcpClientId,
-                mcpRedirectUri,
-                mcpCodeChallenge,
-                mcpOriginalState
-            } = pendingAuth;
-            console.log(`[AUTH Callback] Processing EHR callback for state: ${ehrState}, MCP Client: ${mcpClientId}, EHR: ${ehrBaseUrl}`);
-
-
-            try {
-                // --- Discover EHR Token Endpoint (using the specific ehrBaseUrl) ---
-                let ehrTokenEndpoint: string | undefined;
-                try {
-                    // Correctly construct the Well-Known URL relative to the full FHIR Base URL path
-                    const wellKnownUrlString = ehrBaseUrl.toString().replace(/\/?$/, '') + "/.well-known/smart-configuration";
-                    const wellKnownUrl = new URL(wellKnownUrlString);
-                    console.log(`[AUTH Callback] Fetching SMART config from: ${wellKnownUrl.toString()}`)
-                    const response = await fetch(wellKnownUrl.toString(), { headers: { 'Accept': 'application/json'} });
-                    if (!response.ok) {
-                        console.warn(`[AUTH Callback] Failed to fetch SMART config (${response.status}) from ${wellKnownUrl.toString()}, falling back.`);
-                    } else {
-                        const smartConfig = await response.json();
-                        if (typeof smartConfig.token_endpoint === 'string') {
-                            ehrTokenEndpoint = smartConfig.token_endpoint;
-                            console.log(`[AUTH Callback] Discovered EHR Token Endpoint: ${ehrTokenEndpoint}`);
-                        } else {
-                            console.warn(`[AUTH Callback] SMART config found but missing 'token_endpoint'.`);
-                        }
-                    }
-                } catch (fetchError) {
-                    console.warn(`[AUTH Callback] Error fetching SMART config: ${fetchError}. Falling back.`);
-                }
-                
-                // Fallback/Default for token endpoint
-                if (!ehrTokenEndpoint) {
-                     // If SMART discovery failed for the user-provided URL, we cannot proceed reliably.
-                     // Throw an error instead of using static config or guessing.
-                     console.error(`[AUTH Callback] Failed to discover token endpoint via SMART config for ${ehrBaseUrl} and no static config applicable.`);
-                     throw new Error(`Could not determine the token endpoint for the provided EHR FHIR Base URL: ${ehrBaseUrl}`);
-                }
-                // --- End Token Endpoint Discovery ---
-
-                console.log(`[AUTH Callback] Exchanging EHR code at ${ehrTokenEndpoint}`);
-        const tokenParams = new URLSearchParams({
-            grant_type: "authorization_code",
-            code: ehrCode,
-                    redirect_uri: `${config.server.baseUrl}${config.server.ehrCallbackPath}`, // Must match what we sent
-                    client_id: ehrClientId, // Use the client ID specific to this EHR connection
-            code_verifier: ehrCodeVerifier, // Use the verifier stored for this state
-        });
-                const tokenResponse = await fetch(ehrTokenEndpoint, { // Use discovered/fallback endpoint
-            method: "POST",
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json"
-            },
-            body: tokenParams,
-        });
-
-        if (!tokenResponse.ok) {
-            const errBody = await tokenResponse.text();
-                    console.error(`[AUTH Callback] EHR token exchange failed (${tokenResponse.status}) for ${ehrBaseUrl}: ${errBody}`);
-            throw new Error(`EHR token exchange failed: ${tokenResponse.statusText}`);
-        }
-                const ehrTokens = await tokenResponse.json() as any;
-                const patientId = ehrTokens.patient;
-        if (!patientId) {
-                    console.error("[AUTH Callback] Crucial Error: Patient ID not returned from EHR token endpoint.");
-            throw new Error("Patient context (patient ID) was not provided by the EHR.");
-        }
-                console.log(`[AUTH Callback] Received EHR tokens (Access Token: ${ehrTokens?.access_token?.substring(0, 8)}..., Patient: ${patientId}) for ${ehrBaseUrl}`);
-
-                // DB will be initialized lazily later by getSessionDb when needed
-                console.log("[AUTH Callback] DB will be initialized on first use (via getSessionDb).");
-
-        let mcpClientInfo: OAuthClientInformationFull | undefined;
-                if (config.security.disableClientChecks) {
-            console.log(`[AUTH Callback] Client checks disabled. Creating placeholder client info for: ${mcpClientId}`);
-            // We need to reconstruct this based on pendingAuth or have a default scope
-            mcpClientInfo = {
-                client_id: mcpClientId,
-                client_name: `Placeholder Client (${mcpClientId})`,
-                        redirect_uris: [mcpRedirectUri],
-                        token_endpoint_auth_method: 'none', // Assuming public for placeholder
-                        scope: 'offline_access', // Default scope?
-                        grant_types: ['authorization_code'],
-                        response_types: ['code'],
-            };
-        } else {
-            mcpClientInfo = await oauthProvider.clientsStore.getClient(mcpClientId);
-            if (!mcpClientInfo) {
-                 console.error(`[AUTH Callback] Failed to retrieve MCP client info for ID: ${mcpClientId} during callback.`);
-                throw new Error("MCP Client information not found during callback processing.");
-            }
-        }
-
-        // --- Create User Session with all required fields ---
-        const session: UserSession = {
-                    transportSessionId: "", // Initialize correctly - will be set by transport later
-                    mcpAccessToken: "", // Will be set upon token exchange
-                    // EHR Connection Details (from pendingAuth)
-                    ehrBaseUrl: ehrBaseUrl,
-                    ehrClientId: ehrClientId,
-                    ehrScopes: ehrScopes, 
-                    // EHR Token Details
-            ehrAccessToken: ehrTokens.access_token,
-            ehrTokenExpiry: ehrTokens.expires_in ? Math.floor(Date.now() / 1000) + ehrTokens.expires_in : undefined,
-            ehrGrantedScopes: ehrTokens.scope, // Store the actual granted scopes
-            ehrPatientId: patientId,
-                    fullEhr: { fhir: {}, attachments: [] }, // Initialize empty
-                    db: undefined, // Initialize as undefined
-                    mcpClientInfo: mcpClientInfo,
-                    // MCP Auth Code Details (to be used in /token)
-                    mcpAuthCodeChallenge: mcpCodeChallenge,
-                };
-
-        const mcpAuthCode = `mcp-code-${uuidv4()}`;
-                session.mcpAuthCode = mcpAuthCode;
-                sessionsByMcpAuthCode.set(mcpAuthCode, session);
-
-        const clientRedirectUrl = new URL(mcpRedirectUri);
-                clientRedirectUrl.searchParams.set("code", mcpAuthCode);
-        if (mcpOriginalState) clientRedirectUrl.searchParams.set("state", mcpOriginalState);
-        console.log(`[AUTH Callback] Redirecting back to MCP Client with MCP Auth Code: ${clientRedirectUrl.toString()}`);
-        res.redirect(302, clientRedirectUrl.toString());
-
-        // --- Trigger Background Data Fetch & Populate --- 
-        console.log(`[AUTH Callback] Triggering background data fetch/populate for patient ${patientId} on EHR ${ehrBaseUrl}...`);
-        (async () => {
-                    const bgPatientId = session.ehrPatientId!;
-                    const bgEhrBaseUrl = session.ehrBaseUrl; // Capture from session
-            console.log(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Starting background task.`);
-            try {
-                         // Ensure we reference the potentially updated session object
-                         // It might have moved from sessionsByMcpAuthCode to activeSessions
-                         const getUpToDateSession = () => activeSessions.get(session.mcpAccessToken) || sessionsByMcpAuthCode.get(session.mcpAuthCode || '');
-
-                         let currentSessionRef = getUpToDateSession();
-                         // Check for necessary fields from the specific session
-                         if (!currentSessionRef?.ehrAccessToken || !currentSessionRef?.ehrBaseUrl || !currentSessionRef?.ehrPatientId) {
-                             console.log(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Session seems inactive or missing info. Aborting background task.`);
-                             return; // Exit if session is gone or lacks info
-                         }
-
-                console.log(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Fetching EHR data...`);
-                        // --- Use the EHR Base URL from the session ---
-                        const fetchedData = await fetchEhrData(currentSessionRef.ehrAccessToken, currentSessionRef.ehrBaseUrl, currentSessionRef.ehrPatientId!); 
-                console.log(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Fetched ${Object.keys(fetchedData.fhir).length} resource types and ${fetchedData.attachments.length} attachments.`);
-
-                        // Re-check session existence before updating/populating
-                        currentSessionRef = getUpToDateSession();
-                        if (currentSessionRef) {
-                            currentSessionRef.fullEhr = fetchedData;
-                    console.log(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Updated session fullEhr in memory.`);
-                    
-                            // Ensure DB is initialized and populate it
-                            try {
-                                // getSessionDb will use session.ehrPatientId and session.ehrBaseUrl (via getSqliteFilePath)
-                                const dbToPopulate = await getSessionDb(currentSessionRef); 
-                        console.log(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Populating database...`);
-                                await ehrToSqlite(currentSessionRef.fullEhr, dbToPopulate); // Use the improved ehrToSqlite function
-                        console.log(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Database population complete.`);
-                            } catch (dbError) {
-                                 console.error(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Error initializing or populating database:`, dbError);
-                    }
-
-                } else {
-                             console.log(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Session became inactive during fetch. Skipping fullEhr update and DB population.`);
-                 }
-
-            } catch (backgroundError) {
-                console.error(`[AUTH Callback BG ${bgPatientId} @ ${bgEhrBaseUrl}] Error during background data fetch/populate:`, backgroundError);
-                        // Consider closing DB if opened? getSessionDb might handle this on next call.
-            }
-                })(); // Immediately invoke
-
-            } catch (error) { // Outer catch for pre-redirect errors
-        console.error("[AUTH Callback] Error processing EHR callback before redirect:", error);
-                const clientRedirectUri = pendingAuth?.mcpRedirectUri || '/error_fallback'; // Use URI from pendingAuth if available
-                try {
-                    const redirectUrl = new URL(clientRedirectUri); 
-                    redirectUrl.searchParams.set("error", "ehr_callback_failed");
-                    redirectUrl.searchParams.set("error_description", error instanceof Error ? error.message : "Processing failed after EHR callback");
-                    if (pendingAuth?.mcpOriginalState) redirectUrl.searchParams.set("state", pendingAuth.mcpOriginalState);
-                     if (!res.headersSent) {
-                         res.redirect(302, redirectUrl.toString());
-                     }
-                } catch (urlError) {
-                     console.error(`[AUTH Callback] Invalid redirect URI provided: ${clientRedirectUri}`);
-                     if (!res.headersSent) {
-                         res.status(500).send("Invalid redirect URI configured for error reporting.");
-                     }
-        }
-    }
-});
-
+// --- Serve Static Files from ./static --- 
+const staticPath = path.resolve(process.cwd(), 'static'); // UPDATED path
+console.log(`[STATIC] Serving static files from: ${staticPath}`);
+app.use('/static', express.static(staticPath)); // UPDATED mount path
 
 // --- MCP Auth Endpoints ---
         // Use config for base URLs
@@ -1130,12 +846,13 @@ app.get("/authorize", async (req, res) => {
                     if (!validatedRedirectUri) {
                          throw new InvalidRequestError("redirect_uri required when client checks are disabled");
                     }
-                    mcpClientInfo = { // Minimal placeholder
+                    // Create minimal placeholder for validation purposes
+                     mcpClientInfo = {
                          client_id: clientId,
                 client_name: `Placeholder Client (${clientId})`,
                          redirect_uris: [validatedRedirectUri],
                 token_endpoint_auth_method: 'none',
-                scope: scope || '', // Include scope if provided
+                scope: scope || '',
                 grant_types: ['authorization_code'],
                 response_types: ['code'],
                      };
@@ -1155,167 +872,53 @@ app.get("/authorize", async (req, res) => {
                 if (!codeChallenge) throw new InvalidRequestError("code_challenge required");
                 if (codeChallengeMethod !== 'S256') throw new InvalidRequestError("code_challenge_method must be 'S256'");
 
-        // <<<--- START STATIC SESSION EDIT ---
-        if (config.staticSession?.enabled) {
-            console.log(`[STATIC MODE] Bypassing EHR flow for static session.`);
-            if (!config.staticSession?.dbPath) {
-                // Should be caught by config validation, but belt-and-suspenders
-                throw new ServerError("Static session is enabled, but dbPath is missing in config.");
-            }
+                // --- Store state and redirect to client-side retriever ---
+                const authFlowId = `mcp-auth-${uuidv4()}`;
 
-            console.log(`[STATIC MODE] Initializing DB from: ${config.staticSession.dbPath}`);
-            let staticDb: Database;
-            try {
-                staticDb = new Database(config.staticSession.dbPath, { readonly: true }); // Open read-only
-            } catch (dbError: any) {
-                console.error(`[STATIC MODE] Failed to open static database at ${config.staticSession.dbPath}:`, dbError);
-                throw new ServerError(`Failed to initialize static session database: ${dbError.message}`);
-            }
+                authFlowStates.set(authFlowId, {
+                    mcpClientId: clientId,
+                    mcpRedirectUri: validatedRedirectUri!, // Store the validated URI for the final redirect
+                    mcpCodeChallenge: codeChallenge,
+                    mcpOriginalState: state, // Pass along the original MCP state
+                    // Nonce isn't strictly needed anymore as we don't render a form server-side
+                    nonce: 'server-redirect', // Placeholder nonce
+                    expiresAt: Date.now() + AUTH_FLOW_EXPIRY_MS 
+                });
+                console.log(`[AUTHORIZE] Stored auth flow state ${authFlowId} for MCP client ${clientId}.`);
 
-            console.log(`[STATIC MODE] Reconstructing FullEHR from database...`);
-            let staticFullEhr: FullEHR;
-            try {
-                staticFullEhr = await sqliteToEhr(staticDb);
-                console.log(`[STATIC MODE] Reconstructed ${Object.keys(staticFullEhr.fhir).length} resource types and ${staticFullEhr.attachments.length} attachments.`);
-            } catch (reconstructError: any) {
-                console.error(`[STATIC MODE] Failed to reconstruct FullEHR from database:`, reconstructError);
-                staticDb.close(); // Close DB on error
-                throw new ServerError(`Failed to load data from static session database: ${reconstructError.message}`);
-            }
+                // Set the session cookie
+                const cookieOptions: cookie.SerializeOptions = {
+                    httpOnly: true,
+                    path: '/',
+                    maxAge: AUTH_FLOW_EXPIRY_MS / 1000, // maxAge is in seconds
+                    secure: config.server.https.enabled, // Use Secure flag only if HTTPS is enabled
+                    sameSite: 'lax' // Recommended for security
+                };
+                res.setHeader('Set-Cookie', cookie.serialize(AUTH_FLOW_COOKIE_NAME, authFlowId, cookieOptions));
 
-            // Determine patientId: Use config first, then try to extract from DB, fallback to placeholder
-            let patientId = 'static_patient_id'; // Fallback placeholder
-
-            const session: UserSession = {
-                transportSessionId: "", // Will be set by transport
-                mcpAccessToken: "", // Will be set upon token exchange
-                // EHR Connection Details (Placeholders)
-                ehrBaseUrl: `static:///${config.staticSession.dbPath}`, // Use path as identifier
-                ehrClientId: 'static_client',
-                ehrScopes: ['patient/*.read', 'offline_access'], // Placeholder scopes
-                // EHR Token Details (Not applicable, but need placeholders)
-                ehrAccessToken: 'static_token',
-                ehrTokenExpiry: undefined,
-                ehrGrantedScopes: 'patient/*.read offline_access', // Placeholder
-                ehrPatientId: patientId, // Use determined/placeholder ID
-                fullEhr: staticFullEhr, // Populated from DB
-                db: staticDb, // Set the DB instance directly
-                mcpClientInfo: mcpClientInfo, // Use the validated/placeholder MCP client info
-                // MCP Auth Code Details
-                mcpAuthCodeChallenge: codeChallenge,
-            };
-
-            const mcpAuthCode = `mcp-static-code-${uuidv4()}`;
-            session.mcpAuthCode = mcpAuthCode;
-            sessionsByMcpAuthCode.set(mcpAuthCode, session); // Store session keyed by code
-
-            const clientRedirectUrl = new URL(validatedRedirectUri!);
-            clientRedirectUrl.searchParams.set("code", mcpAuthCode);
-            if (state) clientRedirectUrl.searchParams.set("state", state);
-            console.log(`[STATIC MODE] Redirecting back to MCP Client with MCP Auth Code: ${clientRedirectUrl.toString()}`);
-            res.redirect(302, clientRedirectUrl.toString());
-            return; // End execution for static mode
-        }
-        // --->>> END STATIC SESSION EDIT ---
-
-
-        // --- Generate HTML Form (Only if NOT in static mode) ---
-        // <<<--- START SESSION STATE EDIT ---
-        const authFlowId = `mcp-auth-${uuidv4()}`; // Renamed variable
-        const nonce = uuidv4(); // Unique nonce for this form instance
-
-        authFlowStates.set(authFlowId, { // Use renamed map and ID
-            mcpClientId: clientId,
-            mcpRedirectUri: validatedRedirectUri!,
-            mcpCodeChallenge: codeChallenge,
-            mcpOriginalState: state,
-            nonce: nonce,
-            expiresAt: Date.now() + AUTH_FLOW_EXPIRY_MS // Use renamed expiry
-        });
-         console.log(`[AUTHORIZE] Stored auth flow state ${authFlowId} with nonce ${nonce}. Expires at ${new Date(Date.now() + AUTH_FLOW_EXPIRY_MS).toISOString()}`);
-
-         // Clean up expired sessions periodically (simple approach)
-         if (Math.random() < 0.1) { // ~10% chance on each request
-             const now = Date.now();
-             let removedCount = 0;
-             authFlowStates.forEach((data, id) => { // Iterate renamed map
-                 if (data.expiresAt < now) {
-                     authFlowStates.delete(id); // Delete from renamed map
-                     removedCount++;
-                 }
-             });
-             if (removedCount > 0) console.log(`[AUTHORIZE Flow State Cleanup] Removed ${removedCount} expired states.`);
-         }
-
-        // Set the session cookie
-        const cookieOptions: cookie.SerializeOptions = {
-            httpOnly: true,
-            path: '/',
-            maxAge: AUTH_FLOW_EXPIRY_MS / 1000, // maxAge is in seconds
-            secure: config.server.https.enabled, // Use Secure flag only if HTTPS is enabled
-            sameSite: 'lax' // Recommended for security
-        };
-        res.setHeader('Set-Cookie', cookie.serialize(AUTH_FLOW_COOKIE_NAME, authFlowId, cookieOptions)); // Use renamed cookie name and ID
-        // --->>> END SESSION STATE EDIT ---
-
-        const defaultEhrBaseUrl = config.ehr?.fhirBaseUrl || ''; // Use optional chaining
-        const defaultEhrClientId = config.ehr?.clientId || ''; // Use optional chaining
-        const defaultEhrScopes = config.ehr?.requiredScopes.join(' ') || 'patient/*.read launch/patient offline_access'; // Default if EHR config missing
-
-        const formHtml = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Connect to EHR</title>
-    <style>
-        body { font-family: sans-serif; padding: 2em; }
-        label { display: block; margin-bottom: 0.5em; }
-        input[type="text"], input[type="url"] { width: 100%; padding: 0.5em; margin-bottom: 1em; box-sizing: border-box; }
-        button { padding: 0.8em 1.5em; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; }
-        .error { color: red; margin-bottom: 1em; }
-    </style>
-</head>
-<body>
-    <h1>Connect to Your Electronic Health Record (EHR)</h1>
-    <p>Please provide the connection details for the FHIR server you wish to use.</p>
-    <form action="/initiate-ehr-auth" method="POST">
-        <!-- Hidden field for CSRF/session linking -->
-        <input type="hidden" name="nonce" value="${_.escape(nonce)}">
-
-        <div>
-            <label for="ehr_base_url">EHR FHIR Base URL:</label>
-            <input type="url" id="ehr_base_url" name="ehr_base_url" value="${_.escape(defaultEhrBaseUrl)}" required>
-        </div>
-        <div>
-            <label for="ehr_client_id">EHR Application Client ID:</label>
-            <input type="text" id="ehr_client_id" name="ehr_client_id" value="${_.escape(defaultEhrClientId)}" required>
-        </div>
-        <div>
-            <label for="ehr_scopes">Requested Scopes (space-separated):</label>
-            <input type="text" id="ehr_scopes" name="ehr_scopes" value="${_.escape(defaultEhrScopes)}" required>
-        </div>
-        <button type="submit">Connect to EHR</button>
-    </form>
-</body>
-</html>`;
-
-            res.setHeader('Content-Type', 'text/html');
-            res.status(200).send(formHtml);
+                // Redirect to the client-side retriever app, instructing it to deliver back here
+                const retrieverUrl = '/static/ehretriever.html#deliver-to:mcp-callback'; // UPDATED: Point to file within /static
+                console.log(`[AUTHORIZE] Redirecting user to client-side retriever: ${retrieverUrl}`);
+                res.redirect(302, retrieverUrl);
+                // --- End State Store and Redirect ---
 
         } catch (error: any) {
             console.error("[AUTHORIZE] /authorize error:", error);
-            let clientRedirectUriOnError = redirectUri || '/error_fallback';
-            if (!config.security.disableClientChecks && clientId && !redirectUri) {
-                try { // Try to get default redirect URI if not provided
+                let clientRedirectUriOnError = redirectUri || '/'; // Fallback redirect
+                // Try to get original redirect URI if possible, even on error
+                if (!config.security.disableClientChecks && clientId) {
+                    try {
                     const info = await oauthProvider.clientsStore.getClient(clientId);
-                    if (info?.redirect_uris?.[0]) clientRedirectUriOnError = info.redirect_uris[0];
-                } catch {} // Ignore errors fetching client info here
+                        if (info?.redirect_uris?.includes(redirectUri!)) {
+                            clientRedirectUriOnError = redirectUri!;
+                        } else if (info?.redirect_uris?.[0]) {
+                            clientRedirectUriOnError = info.redirect_uris[0];
+                        }
+                    } catch {}
             }
 
             try {
-                const redirectUrl = new URL(clientRedirectUriOnError, config.server.baseUrl!); // Use base URL context
+                    const redirectUrl = new URL(clientRedirectUriOnError, config.server.baseUrl || undefined);
                 if (error instanceof OAuthError) {
                     redirectUrl.searchParams.set("error", error.errorCode);
                     redirectUrl.searchParams.set("error_description", error.message);
@@ -1580,195 +1183,6 @@ app.get("/mcp-sse", bearerAuthMiddleware, async (req: Request, res: Response) =>
     }
 });
 
-// --- NEW Endpoint to handle EHR details submission and initiate EHR Auth flow ---
-app.post("/initiate-ehr-auth", express.urlencoded({ extended: true }), async (req, res) => {
-    // <<<--- START EDIT
-    if (config.staticSession?.enabled) {
-        console.warn(`[STATIC MODE] /initiate-ehr-auth endpoint accessed unexpectedly.`);
-        res.status(400).send("Server is in static session mode. This endpoint should not be used.");
-        return;
-    }
-    // --->>> END EDIT
-
-    // <<<--- START SESSION STATE EDIT ---
-    // Parse cookies
-    const cookies = cookie.parse(req.headers.cookie || '');
-    const authFlowId = cookies[AUTH_FLOW_COOKIE_NAME]; // Use renamed cookie name
-
-    // Cookie options needed for clearing
-    const cookieOptions: cookie.SerializeOptions = {
-        httpOnly: true,
-        path: '/',
-        maxAge: -1, // Expire immediately
-        secure: config.server.https.enabled,
-        sameSite: 'lax'
-    };
-    // Clear the auth flow cookie immediately after reading it
-    res.setHeader('Set-Cookie', cookie.serialize(AUTH_FLOW_COOKIE_NAME, '', cookieOptions));
-
-    if (!authFlowId) { // Use renamed variable
-        console.error("[INITIATE EHR] Error: Missing auth flow cookie.");
-        res.status(400).send("Missing session information. Please start the authorization flow again.");
-        return;
-    }
-
-    // Retrieve and immediately delete session data
-    const authFlowData = authFlowStates.get(authFlowId); // Use renamed map and ID
-    authFlowStates.delete(authFlowId); // Remove state regardless of validity for security
-
-    if (!authFlowData) { // Check retrieved data
-        console.error(`[INITIATE EHR] Error: Invalid or expired auth flow ID: ${authFlowId}`);
-        res.status(400).send("Invalid or expired session. Please start the authorization flow again.");
-        return;
-    }
-
-    // Check expiration just in case cleanup didn't run
-    if (authFlowData.expiresAt < Date.now()) {
-        console.error(`[INITIATE EHR] Error: Expired auth flow ID: ${authFlowId}`);
-        res.status(400).send("Session expired. Please start the authorization flow again.");
-        return;
-    }
-
-    // Extract form data
-    const submittedNonce = req.body.nonce as string | undefined;
-    const ehrBaseUrlInput = req.body.ehr_base_url as string | undefined;
-    const ehrClientIdInput = req.body.ehr_client_id as string | undefined;
-    const ehrScopesInput = req.body.ehr_scopes as string | undefined; // Space-separated string
-
-    // Validate nonce
-    if (!submittedNonce || submittedNonce !== authFlowData.nonce) {
-        console.error(`[INITIATE EHR] Error: Nonce mismatch for auth flow ${authFlowId}. Expected: ${authFlowData.nonce}, Received: ${submittedNonce}`);
-        res.status(400).send("Invalid form submission. Please try again.");
-        return;
-    }
-
-    // Retrieve MCP parameters from session data
-    const { mcpClientId, mcpRedirectUri, mcpCodeChallenge, mcpOriginalState } = authFlowData; // Use retrieved data
-    console.log(`[INITIATE EHR] Valid auth flow state ${authFlowId} processed. MCP Client: ${mcpClientId}, EHR URL: ${ehrBaseUrlInput}`);
-    // --->>> END SESSION STATE EDIT ---
-
-    try {
-        // --- Basic Validation (already have MCP params from session) ---
-        if (!mcpClientId || !mcpRedirectUri || !mcpCodeChallenge) {
-            throw new InvalidRequestError("Missing required MCP authorization parameters.");
-        }
-        if (!ehrBaseUrlInput || !ehrClientIdInput || !ehrScopesInput) {
-            throw new InvalidRequestError("Missing required EHR connection details (Base URL, Client ID, Scopes).");
-        }
-
-        // Validate EHR Base URL format (simple check)
-        let ehrBaseUrl: URL;
-        try {
-            ehrBaseUrl = new URL(ehrBaseUrlInput);
-        } catch (e) {
-            throw new InvalidRequestError("Invalid EHR FHIR Base URL format.");
-        }
-
-        // Validate scopes (simple check - ensure it's not empty)
-        const ehrScopesArray = ehrScopesInput.trim().split(/\s+/).filter(s => s.length > 0);
-        if (ehrScopesArray.length === 0) {
-            throw new InvalidRequestError("EHR Scopes cannot be empty.");
-        }
-
-        // --- Prepare for EHR Redirect ---
-        const ehrState = uuidv4(); // Unique state for this EHR auth leg
-        const { code_verifier: ehrCodeVerifier, code_challenge: ehrCodeChallenge } = await pkceChallenge();
-
-        // Store the complete pending state, including user-provided EHR details
-        pendingEhrAuth.set(ehrState, {
-            ehrState,
-            ehrCodeVerifier,
-            ehrBaseUrl: ehrBaseUrl.toString(), // Store the validated URL string
-            ehrClientId: ehrClientIdInput,
-            ehrScopes: ehrScopesArray,
-            mcpClientId: mcpClientId,
-            mcpRedirectUri: mcpRedirectUri,
-            mcpCodeChallenge: mcpCodeChallenge,
-            mcpOriginalState: mcpOriginalState,
-        });
-
-        // --- Construct EHR Authorization URL --- 
-        // Use user-provided EHR Base URL to find the auth endpoint (common pattern, but might need config)
-        // Attempting discovery via .well-known/smart-configuration
-        let ehrAuthorizationEndpoint: string | undefined;
-        try {
-            // Correctly construct the Well-Known URL relative to the full FHIR Base URL path
-            const wellKnownUrlString = ehrBaseUrl.toString().replace(/\/?$/, '') + "/.well-known/smart-configuration";
-            const wellKnownUrl = new URL(wellKnownUrlString);
-            console.log(`[INITIATE EHR] Fetching SMART config from: ${wellKnownUrl.toString()}`)
-            const response = await fetch(wellKnownUrl.toString(), { headers: { 'Accept': 'application/json'} });
-            if (!response.ok) {
-                console.warn(`[INITIATE EHR] Failed to fetch SMART config (${response.status}) from ${wellKnownUrl.toString()}, falling back.`);
-            } else {
-                const smartConfig = await response.json();
-                if (typeof smartConfig.authorization_endpoint === 'string') {
-                    ehrAuthorizationEndpoint = smartConfig.authorization_endpoint;
-                    console.log(`[INITIATE EHR] Discovered EHR Auth Endpoint: ${ehrAuthorizationEndpoint}`);
-                } else {
-                     console.warn(`[INITIATE EHR] SMART config found but missing 'authorization_endpoint'.`);
-                }
-            }
-        } catch (fetchError) {
-            console.warn(`[INITIATE EHR] Error fetching SMART config: ${fetchError}. Falling back.`);
-        }
-        
-        // Fallback or default if discovery fails - ASSUMPTION: might need adjustment based on common EHRs
-        if (!ehrAuthorizationEndpoint) {
-            // Look for a config override first
-            if (config.ehr?.authUrl) {
-                 console.warn(`[INITIATE EHR] Using configured EHR Auth URL: ${config.ehr.authUrl}`);
-                ehrAuthorizationEndpoint = config.ehr.authUrl;
-             } else {
-                 // Simple fallback - THIS IS A GUESS!
-                 ehrAuthorizationEndpoint = new URL("/authorize", ehrBaseUrl).toString(); 
-                 console.warn(`[INITIATE EHR] Fallback EHR Auth Endpoint guess: ${ehrAuthorizationEndpoint}`);
-             }
-        }
-
-        const ehrAuthRedirectUrl = new URL(ehrAuthorizationEndpoint);
-        ehrAuthRedirectUrl.searchParams.set("response_type", "code");
-        ehrAuthRedirectUrl.searchParams.set("client_id", ehrClientIdInput); // User-provided EHR Client ID
-        ehrAuthRedirectUrl.searchParams.set("scope", ehrScopesArray.join(" ")); // User-provided scopes
-        ehrAuthRedirectUrl.searchParams.set("redirect_uri", `${config.server.baseUrl}${config.server.ehrCallbackPath}`); // Our callback
-        ehrAuthRedirectUrl.searchParams.set("state", ehrState); // The unique EHR state
-        ehrAuthRedirectUrl.searchParams.set("aud", ehrBaseUrl.toString()); // Audience is the user-provided FHIR server
-        ehrAuthRedirectUrl.searchParams.set("code_challenge", ehrCodeChallenge);
-        ehrAuthRedirectUrl.searchParams.set("code_challenge_method", "S256");
-
-        console.log(`[INITIATE EHR] Redirecting user to discovered/configured EHR endpoint: ${ehrAuthRedirectUrl.toString()}`);
-        res.redirect(302, ehrAuthRedirectUrl.toString());
-
-    } catch (error: any) {
-        console.error("[INITIATE EHR] Error:", error);
-        // On error, redirect back to the MCP client's original redirect URI with error parameters
-        try {
-            if (!mcpRedirectUri) {
-                 // Should not happen if validation passed, but safety check
-                 res.status(500).send("Internal error: Cannot determine redirect URI for error reporting.");
-                 return;
-            }
-            const redirectUrl = new URL(mcpRedirectUri); // Assume absolute or handle base later?
-            if (error instanceof OAuthError) {
-                redirectUrl.searchParams.set("error", error.errorCode);
-                redirectUrl.searchParams.set("error_description", error.message);
-            } else {
-                redirectUrl.searchParams.set("error", "server_error");
-                redirectUrl.searchParams.set("error_description", "Failed to initiate EHR authorization: " + (error?.message || 'Unknown reason'));
-            }
-            if (mcpOriginalState) redirectUrl.searchParams.set("state", mcpOriginalState); // Pass back original MCP state
-            
-            console.log(`[INITIATE EHR] Redirecting back to MCP client with error: ${redirectUrl.toString()}`);
-            if (!res.headersSent) {
-                res.redirect(302, redirectUrl.toString());
-            }
-        } catch (urlError) {
-            console.error(`[INITIATE EHR] Invalid MCP redirect URI for error reporting: ${mcpRedirectUri}`, urlError);
-            if (!res.headersSent) {
-                res.status(500).send("Server error during EHR initiation and invalid error redirect URI.");
-            }
-        }
-    }
-});
 
 // --- Error Handling Middleware ---
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -1825,14 +1239,14 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
         for (const [id, session] of activeSessions.entries()) {
             if (session.db) {
                 try {
-                         console.log(`[Shutdown] Closing DB for session ${id} (Patient: ${session.ehrPatientId})`);
+                         console.log(`[Shutdown] Closing DB for session ${id}`);
                     session.db.close();
                      } catch (e) { console.error(`[Shutdown] Error closing DB for session ${id}:`, e); }
             }
         }
         activeSessions.clear();
          // Also clear pending auth map? Probably good practice.
-         pendingEhrAuth.clear();
+         // pendingEhrAuth.clear(); // Ensure this is commented or removed
          sessionsByMcpAuthCode.clear(); // Clear temporary auth codes
          activeSseTransports.clear(); // Clear active transports
 
@@ -1853,4 +1267,117 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 
 // Start the application
 main();
+
+// New callback endpoint for the client-side retriever
+app.post("/ehr-retriever-callback", express.json({ limit: '50mb' }), async (req: Request, res: Response, next: NextFunction) => {
+    console.log("[MCP CB] Received POST from client-side retriever.");
+
+    // 1. Get Auth Flow ID from cookie
+    const cookies = cookie.parse(req.headers.cookie || '');
+    const authFlowId = cookies[AUTH_FLOW_COOKIE_NAME];
+
+    // Clear the cookie immediately
+    const cookieOptions: cookie.SerializeOptions = {
+        httpOnly: true, path: '/', maxAge: -1, secure: config.server.https.enabled, sameSite: 'lax'
+    };
+    res.setHeader('Set-Cookie', cookie.serialize(AUTH_FLOW_COOKIE_NAME, '', cookieOptions));
+
+    if (!authFlowId) {
+        console.error("[MCP CB] Error: Missing auth flow cookie.");
+        // Respond with JSON error instead of redirecting
+        res.status(400).json({ success: false, error: "missing_session", error_description: "Auth flow cookie missing." });
+        return;
+    }
+
+    // 2. Retrieve original MCP request details
+    const authFlowData = authFlowStates.get(authFlowId);
+    authFlowStates.delete(authFlowId); // Consume the state
+
+    if (!authFlowData) {
+        console.error(`[MCP CB] Error: Invalid or expired auth flow ID: ${authFlowId}`);
+        // Respond with JSON error instead of redirecting
+        res.status(400).json({ success: false, error: "invalid_session", error_description: "Invalid or expired auth flow session." });
+        return;
+    }
+    if (authFlowData.expiresAt < Date.now()) {
+        console.error(`[MCP CB] Error: Expired auth flow ID: ${authFlowId}`);
+        // Respond with JSON error instead of redirecting
+        res.status(400).json({ success: false, error: "expired_session", error_description: "Auth flow session expired." });
+        return;
+    }
+
+    const { mcpClientId, mcpRedirectUri, mcpCodeChallenge, mcpOriginalState } = authFlowData;
+    console.log(`[MCP CB] Retrieved state for MCP Client: ${mcpClientId}`);
+
+    try {
+        // Wrap the core logic in a try block
+        // 3. Parse incoming ClientFullEHR data
+        // Ensure body parsing middleware (express.json) was used
+        const clientFullEhr: ClientFullEHR = req.body;
+        if (!clientFullEhr || !clientFullEhr.fhir || !clientFullEhr.attachments) {
+             console.error("[MCP CB] Error: Invalid or missing ClientFullEHR data in request body.");
+             throw new InvalidRequestError("Missing or invalid EHR data in request body.");
+        }
+        console.log(`[MCP CB] Received ClientFullEHR: ${Object.keys(clientFullEhr.fhir).length} resource types, ${clientFullEhr.attachments.length} attachments.`);
+
+        // 4. Get MCP Client Info (needed for UserSession)
+        let mcpClientInfo: OAuthClientInformationFull | undefined;
+        if (config.security.disableClientChecks) {
+            console.log(`[MCP CB] Client checks disabled. Creating placeholder client info for: ${mcpClientId}`);
+            // Reconstruct minimal info needed for session
+            mcpClientInfo = {
+                client_id: mcpClientId,
+                client_name: `Placeholder Client (${mcpClientId})`,
+                redirect_uris: [mcpRedirectUri], // Essential for final redirect logic
+                token_endpoint_auth_method: 'none',
+                // Other fields like scope, grant_types aren't strictly needed here but could be added
+            };
+        } else {
+            mcpClientInfo = await oauthProvider.clientsStore.getClient(mcpClientId);
+            if (!mcpClientInfo) {
+                console.error(`[MCP CB] Failed to retrieve MCP client info for ID: ${mcpClientId}.`);
+                throw new Error("MCP Client information not found during callback processing.");
+            }
+             // Validate redirect URI again just in case
+             if (!mcpClientInfo.redirect_uris.includes(mcpRedirectUri)) {
+                 console.error(`[MCP CB] Stored redirect URI ${mcpRedirectUri} not valid for client ${mcpClientId}.`);
+                 throw new InvalidRequestError("Redirect URI mismatch.");
+             }
+        }
+
+        // 5. Create User Session using the new function
+        const session = await createSessionFromEhrData(
+            mcpClientInfo, 
+            mcpCodeChallenge, 
+            clientFullEhr
+        );
+
+        // 6. Generate MCP Auth Code & Store Session
+        const mcpAuthCode = `mcp-code-${uuidv4()}`;
+        session.mcpAuthCode = mcpAuthCode; // Add the auth code to the session
+        sessionsByMcpAuthCode.set(mcpAuthCode, session);
+        console.log(`[MCP CB] Stored UserSession, generated MCP Auth Code: ${mcpAuthCode.substring(0,12)}...`);
+
+        // 7. Redirect back to MCP Client
+        const clientRedirectUrl = new URL(mcpRedirectUri);
+        clientRedirectUrl.searchParams.set("code", mcpAuthCode);
+        if (mcpOriginalState) clientRedirectUrl.searchParams.set("state", mcpOriginalState);
+        console.log(`[MCP CB] Redirecting back to MCP Client: ${clientRedirectUrl.toString()}`);
+        // Instead of redirect, send JSON with the target URL
+        res.json({ success: true, redirectTo: clientRedirectUrl.toString() });
+        return;
+
+    } catch (error: any) {
+        // Catch any errors from the try block and respond with JSON error
+        console.error("[MCP CB] Caught error in main handler logic:", error);
+        const errorCode = error instanceof OAuthError ? error.errorCode : "server_error";
+        const errorDesc = error instanceof Error ? error.message : "Internal server error during callback processing.";
+        // Ensure headers aren't already sent (though unlikely here with explicit returns)
+        if (!res.headersSent) {
+            res.status(error instanceof InvalidRequestError ? 400 : 500)
+               .json({ success: false, error: errorCode, error_description: errorDesc });
+        }
+        // No longer calling next(error)
+    }
+});
 

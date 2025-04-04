@@ -44,6 +44,12 @@
         <p id="status-message">Loading...</p>
     </div>
 
+    <div id="progress-container" style="display: none; margin-top: 1em;">
+        <h3>Fetch Progress</h3>
+        <progress id="fetch-progress" max="100" value="0" style="width: 90%; max-width: 400px;"></progress>
+        <span id="progress-text" style="margin-left: 10px;">(0/0)</span>
+    </div>
+
     <!-- Bundled script will be included here -->
     <script src="./dist/ehretriever.bundle.js"></script>
 </body>

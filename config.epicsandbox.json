@@ -1,5 +1,9 @@
-
 {
+  "deliveryEndpoints": {
+    "mcp-callback": {
+      "postUrl": "/ehr-retriever-callback"
+    }
+  },
   "ehr": {
     "fhirBaseUrl": "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4/",
     "clientId": "45310fa2-e74c-4b3c-96e3-74202b700ea0",

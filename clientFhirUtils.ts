@@ -1,6 +1,73 @@
 import { ClientFullEHR, ClientProcessedAttachment } from './clientTypes';
 import { KNOWN_ATTACHMENT_PATHS, AttachmentLike } from './src/types'; // Reuse server types where applicable
 import { getInitialFhirSearchQueries } from './src/fhirSearchQueries'; // Import shared query function
+import _ from 'lodash'; // Make sure lodash is installed (bun add lodash @types/lodash)
+
+// --- Configuration --- 
+const MAX_CONCURRENCY = 5;
+const MAX_FOLLOW_REFERENCES_DEPTH = 2; // How many levels deep to follow references like subject, encounter
+const MAX_ATTACHMENT_SIZE_MB = 10;
+const REQUEST_TIMEOUT_MS = 30000; // 30 seconds timeout per request
+
+// --- Interfaces & Types ---
+interface FetchTask {
+    url: string;
+    description: string; // For progress reporting
+    isAttachment?: boolean;
+    resourceType?: string; // For attachment context
+    resourceId?: string;   // For attachment context
+    attachmentPath?: string; // For attachment context
+    originalResourceJson?: any; // For attachments, the resource it belongs to
+    depth: number; // For reference following
+}
+
+interface FetchResult {
+    url: string;
+    data?: any;
+    error?: Error;
+    isAttachment?: boolean;
+    isBundle?: boolean;
+}
+
+export type ProgressCallback = (completed: number, total: number, message?: string) => void;
+
+// --- Concurrency Manager ---
+class ConcurrencyManager {
+    private limit: number;
+    private activeCount: number = 0;
+    private waitingQueue: (() => void)[] = [];
+
+    constructor(limit: number) {
+        this.limit = limit;
+    }
+
+    async acquire(): Promise<void> {
+        if (this.activeCount < this.limit) {
+            this.activeCount++;
+            return Promise.resolve();
+        } else {
+            // Wait for a slot
+            return new Promise(resolve => {
+                this.waitingQueue.push(() => {
+                    // This function is called by release() when a slot is free
+                    this.activeCount++;
+                    resolve();
+                });
+            });
+        }
+    }
+
+    release(): void {
+        this.activeCount--;
+        if (this.waitingQueue.length > 0) {
+            const nextResolve = this.waitingQueue.shift();
+            if (nextResolve) {
+                // Run in next microtask to avoid potential stack overflows
+                Promise.resolve().then(nextResolve); 
+            }
+        }
+    }
+}
 
 // --- Helper: Fetch with Authorization Header ---
 async function fetchWithToken(url: string, accessToken: string, options: RequestInit = {}): Promise<Response> {
@@ -43,347 +110,414 @@ function blobToBase64(blob: Blob): Promise<string> {
     });
 }
 
-// --- Function to fetch initial set of resources ---
-async function fetchInitialFhirResourcesClient(accessToken: string, fhirBaseUrl: string, patientId: string): Promise<{ initialFhirRecord: Record<string, any[]>; initialTotalFetched: number }> {
-    console.log(`[CLIENT FETCH] Fetching initial resources for Patient: ${patientId}`);
-    const initialFhirRecord: Record<string, any[]> = {};
-    let initialTotalFetched = 0;
+// --- Core Fetching Function with Timeout --- 
+async function fetchWithTimeout(url: string, options: RequestInit, timeout = REQUEST_TIMEOUT_MS): Promise<Response> {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
 
-    // 1. Fetch Patient resource
-    const patientUrl = `${fhirBaseUrl}/Patient/${patientId}`;
-    const patientResource = await fetchResource(patientUrl, accessToken);
-    if (!patientResource) {
-        throw new Error(`Failed to fetch core Patient resource at ${patientUrl}`);
-    }
-    initialFhirRecord['Patient'] = [patientResource];
-    initialTotalFetched++;
-
-    // 2. Get shared search queries for this patient
-    const searchQueries = getInitialFhirSearchQueries(patientId);
-    const MAX_BUNDLE_PAGES = 100; // Limit pagination to prevent excessive requests
-    const searchPromises = searchQueries.map(async (query) => {
-        const { resourceType, params } = query;
-        // Construct params, ensuring _count is added but patient is already present from getInitialFhirSearchQueries
-        const searchParams = new URLSearchParams({
-            _count: '1000', // Add count here for consistency
-            ...(params || {}), // Spread parameters from config (includes patientId)
+    try {
+        const response = await fetch(url, {
+            ...options,
+            signal: controller.signal
         });
-
-        let url: string | undefined = `${fhirBaseUrl}/${resourceType}?${searchParams.toString()}`;
-        let pageCount = 0;
-        initialFhirRecord[resourceType] = initialFhirRecord[resourceType] || []; // Ensure array exists
-
-        console.log(`[CLIENT FETCH] Starting fetch for ${resourceType} with params: ${JSON.stringify(params || {})}`);
-        while (url && pageCount < MAX_BUNDLE_PAGES) {
-            pageCount++;
-            console.log(`[CLIENT FETCH] Fetching ${resourceType} page ${pageCount}: ${url.replace(fhirBaseUrl, '')}`);
-            try {
-                const response = await fetchWithToken(url, accessToken);
-                if (!response.ok) {
-                    console.warn(`[CLIENT FETCH] Failed page fetch for ${resourceType} (${response.status}): ${url}`);
-                    break; // Stop pagination on error for this type
-                }
-                const bundle = await response.json();
-                if (bundle.entry && Array.isArray(bundle.entry)) {
-                    // Process each entry individually and place in the correct bucket
-                    for (const entry of bundle.entry) {
-                        const resource = entry.resource;
-                        if (resource && resource.resourceType) {
-                            const actualResourceType = resource.resourceType;
-                            // Ensure the array for the actual type exists
-                            if (!initialFhirRecord[actualResourceType]) {
-                                initialFhirRecord[actualResourceType] = [];
-                            }
-                            // Add the resource to the correct bucket
-                            initialFhirRecord[actualResourceType].push(resource);
-                            initialTotalFetched++; // Increment total fetched count
-                        } else if (entry.response && entry.response.outcome) {
-                            // Handle OperationOutcome entries if needed (e.g., log warnings)
-                            console.warn(`[CLIENT FETCH] Bundle for ${resourceType} included an OperationOutcome: ${JSON.stringify(entry.response.outcome)}`);
-                        } else {
-                             console.warn(`[CLIENT FETCH] Bundle entry for ${resourceType} missing resource or resourceType:`, entry);
-                         }
-                    }
-                }
-                // Find the 'next' link for pagination
-                const nextLink = bundle.link?.find((link: any) => link.relation === 'next');
-                url = nextLink?.url;
-            } catch (error) {
-                console.error(`[CLIENT FETCH] Error processing page for ${resourceType}:`, error);
-                url = undefined; // Stop pagination on error
-            }
+        clearTimeout(id);
+        return response;
+    } catch (error) {
+        clearTimeout(id);
+        if (error instanceof DOMException && error.name === 'AbortError') {
+            throw new Error(`Request timed out after ${timeout / 1000}s: ${url}`);
         }
-        if (pageCount === MAX_BUNDLE_PAGES && url) {
-            console.warn(`[CLIENT FETCH] Reached max page limit (${MAX_BUNDLE_PAGES}) for ${resourceType}. Data may be incomplete.`);
-        }
-        console.log(`[CLIENT FETCH] Finished fetch for ${resourceType}. Found ${initialFhirRecord[resourceType].length} resources.`);
-    });
-
-    await Promise.all(searchPromises);
-
-    console.log(`[CLIENT FETCH] Initial fetch complete. Total resources: ${initialTotalFetched}`);
-    return { initialFhirRecord, initialTotalFetched };
+        throw error;
+    }
 }
 
-// --- Function to resolve references ---
-async function resolveFhirReferencesClient(
-    currentRecord: Record<string, any[]>,
+// --- Task Extraction Helpers --- 
+
+// Finds FHIR references (like { reference: "Patient/123" }) within a resource
+function findReferences(obj: any): { reference: string }[] {
+    let refs: { reference: string }[] = [];
+    if (!obj || typeof obj !== 'object') return refs;
+
+    for (const key in obj) {
+        if (key === 'reference' && typeof obj[key] === 'string' && obj[key].split('/').length === 2) { // Basic validation
+            refs.push({ reference: obj[key] });
+        } else if (typeof obj[key] === 'object') {
+            refs = refs.concat(findReferences(obj[key]));
+        }
+    }
+    return _.uniqWith(refs, _.isEqual); // Avoid duplicate references within the same resource
+}
+
+// Finds FHIR Attachment structures within a resource
+function findAttachments(obj: any, currentPath: string = ''): { attachment: any, path: string }[] {
+    let attachments: { attachment: any, path: string }[] = [];
+    if (!obj || typeof obj !== 'object') return attachments;
+
+    for (const key in obj) {
+        if (!obj.hasOwnProperty(key)) continue;
+        const value = obj[key];
+        const newPath = currentPath ? `${currentPath}.${key}` : key;
+
+        // Heuristic: Check if the object looks like an Attachment type
+        if (typeof value === 'object' && value !== null && value.contentType && (value.url || value.data)) {
+            attachments.push({ attachment: value, path: newPath });
+        } else if (typeof value === 'object') {
+            attachments = attachments.concat(findAttachments(value, newPath));
+        }
+    }
+    return attachments;
+}
+
+// Resolves relative FHIR references (e.g., "Patient/123") to absolute URLs
+function resolveReferenceUrl(reference: string, baseUrl: string): string | null {
+    try {
+        if (reference.startsWith('http://') || reference.startsWith('https://')) {
+            return reference; // Already absolute
+        }
+        const parts = reference.split('/');
+        if (parts.length === 2 && parts[0] && parts[1]) {
+            const base = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/';
+            return `${base}${reference}`;
+        }
+        if (reference.startsWith('#')) {
+             console.log(`Skipping internal contained resource reference: ${reference}`);
+             return null;
+        }
+        console.warn(`Cannot resolve non-standard reference: ${reference}`);
+        return null;
+    } catch (e) {
+        console.error(`Error resolving reference URL (${reference}, ${baseUrl}):`, e);
+        return null;
+    }
+}
+
+// --- Resource and Attachment Processing --- 
+
+// Extracts new fetch tasks (references, attachments) from a single FHIR resource
+function extractTasksFromResource(resource: any, fhirBaseUrl: string, currentDepth: number): FetchTask[] {
+    const newTasks: FetchTask[] = [];
+    if (!resource || typeof resource !== 'object' || !resource.resourceType || !resource.id) return newTasks;
+
+    // 1. Follow References (if depth allows)
+    if (currentDepth < MAX_FOLLOW_REFERENCES_DEPTH) {
+        const references = findReferences(resource);
+        for (const ref of references) {
+            const url = resolveReferenceUrl(ref.reference, fhirBaseUrl);
+            if (url) {
+                newTasks.push({ 
+                    url: url, 
+                    description: `Reference: ${ref.reference}`, 
+                    depth: currentDepth + 1 
+                });
+            }
+        }
+    }
+
+    // 2. Find Attachments to fetch
+    const attachments = findAttachments(resource);
+    for (const { attachment, path } of attachments) {
+        if (attachment.url && typeof attachment.url === 'string') {
+            // Only fetch if URL is present and size is reasonable
+            if (!attachment.size || attachment.size <= MAX_ATTACHMENT_SIZE_MB * 1024 * 1024) {
+                const attachmentUrl = resolveReferenceUrl(attachment.url, fhirBaseUrl);
+                if (attachmentUrl) {
+                    newTasks.push({ 
+                        url: attachmentUrl, 
+                        description: `Attachment for ${resource.resourceType}/${resource.id}`, 
+                        isAttachment: true,
+                        resourceType: resource.resourceType,
+                        resourceId: resource.id,
+                        attachmentPath: path,
+                        originalResourceJson: resource, // Pass context
+                        depth: currentDepth // Attachments don't increase depth level
+                    });
+                }
+            } else {
+                 console.warn(`Skipping large attachment (${(attachment.size / 1024 / 1024).toFixed(1)} MB) for ${resource.resourceType}/${resource.id} at path ${path}`);
+            }
+        } 
+        // Note: Inline attachments (attachment.data) are handled separately after all fetches
+    }
+
+    return newTasks;
+}
+
+// Processes the Blob data from a fetched attachment
+async function processAttachmentData(fetchResultData: Blob, task: FetchTask, clientAttachments: ClientProcessedAttachment[]): Promise<void> {
+     if (!task.isAttachment || !task.resourceType || !task.resourceId || !task.attachmentPath || !task.originalResourceJson) {
+         console.warn('Skipping attachment processing due to missing task context', { task });
+         return;
+     }
+    
+     const originalAttachmentNode = _.get(task.originalResourceJson, task.attachmentPath);
+     if (!originalAttachmentNode) {
+         console.warn(`Could not find original attachment node at path ${task.attachmentPath} for ${task.resourceType}/${task.resourceId}`);
+         return;
+     }
+
+     let contentBase64: string | null = null;
+     let contentPlaintext: string | null = null;
+     const contentType = originalAttachmentNode.contentType || 'application/octet-stream';
+     const blob = fetchResultData;
+
+     try {
+         // Convert Blob to Base64
+         contentBase64 = await new Promise((resolve, reject) => {
+             const reader = new FileReader();
+             reader.onloadend = () => resolve((reader.result as string).split(',', 2)[1]);
+             reader.onerror = reject;
+             reader.readAsDataURL(blob);
+         });
+
+         // Attempt plaintext extraction for common types
+         if (contentType.startsWith('text/') || contentType === 'application/json' || contentType === 'application/fhir+json') {
+                             contentPlaintext = await blob.text();
+         } 
+
+         const newAttachment: ClientProcessedAttachment = {
+             resourceType: task.resourceType,
+             resourceId: task.resourceId,
+             path: task.attachmentPath,
+             contentType: contentType,
+             contentPlaintext: contentPlaintext,
+             contentBase64: contentBase64,
+             json: JSON.stringify(originalAttachmentNode) 
+         };
+
+         // Avoid duplicates
+          const attachmentKey = `${newAttachment.resourceType}/${newAttachment.resourceId}#${newAttachment.path}`;
+          if (!clientAttachments.some(a => `${a.resourceType}/${a.resourceId}#${a.path}` === attachmentKey)){
+               clientAttachments.push(newAttachment);
+          }
+
+     } catch (error) {
+         console.error(`Error processing attachment data for ${task.resourceType}/${task.resourceId} at ${task.attachmentPath}:`, error);
+     }
+}
+
+// Processes inline base64 encoded attachments found in already fetched resources
+function processInlineAttachments(clientFullEhr: ClientFullEHR): void {
+    console.log("Processing inline attachments...");
+    let processedCount = 0;
+    for (const resourceType in clientFullEhr.fhir) {
+        for (const resource of clientFullEhr.fhir[resourceType]) {
+            const attachments = findAttachments(resource);
+            for (const { attachment, path } of attachments) {
+                 if (attachment.data && !attachment.url && resource.id && resource.resourceType) { // Inline data only
+                     const alreadyProcessed = clientFullEhr.attachments.some(att => 
+                         att.resourceType === resource.resourceType && 
+                         att.resourceId === resource.id && 
+                         att.path === path
+                     );
+                     if (!alreadyProcessed) {
+                         let contentBase64: string | null = attachment.data;
+                         let contentPlaintext: string | null = null;
+                         const contentType = attachment.contentType || 'application/octet-stream';
+                         try {
+                             if (contentBase64 && (contentType.startsWith('text/') || contentType === 'application/json' || contentType === 'application/fhir+json')) {
+                                try { contentPlaintext = atob(contentBase64); } catch (decodeError) {
+                                     console.warn(`Failed to decode base64 for inline text attachment ${resource.resourceType}/${resource.id} at ${path}:`, decodeError);
+                                }
+                             }
+                              clientFullEhr.attachments.push({
+                                 resourceType: resource.resourceType,
+                                 resourceId: resource.id,
+                                 path: path,
+                                 contentType: contentType,
+                                 contentPlaintext: contentPlaintext,
+                                 contentBase64: contentBase64,
+                                 json: JSON.stringify(attachment)
+                             });
+                             processedCount++;
+                         } catch (inlineError) {
+                             console.error(`Error processing inline attachment for ${resource.resourceType}/${resource.id} at ${path}:`, inlineError);
+                         }
+                     }
+                 }
+            }
+        }
+    }
+    console.log(`Finished processing ${processedCount} inline attachments.`);
+}
+
+
+// --- Simplified Parallel Fetch Orchestrator --- 
+export async function fetchAllEhrDataClientSideParallel(
     accessToken: string,
     fhirBaseUrl: string,
-    maxIterations: number = 3
-): Promise<{ resolvedFhirRecord: Record<string, any[]>; referencesAddedCount: number }> {
-    console.log(`[CLIENT RESOLVE] Starting reference resolution (Max Iterations: ${maxIterations})...`);
-    let referencesAddedCount = 0;
-    let unresolvedReferences = new Set<string>();
-    const fetchedReferenceUrls = new Set<string>(); // Track URLs already fetched/being fetched
+    patientId: string,
+    progressCallback: ProgressCallback
+): Promise<ClientFullEHR> {
 
-    // Function to add a resource to the record
-    const addResource = (resource: any) => {
-        if (!resource || !resource.resourceType || !resource.id) return false;
-        const type = resource.resourceType;
-        if (!currentRecord[type]) {
-            currentRecord[type] = [];
-        }
-        // Avoid adding duplicates
-        if (!currentRecord[type].some(existing => existing.id === resource.id)) {
-            currentRecord[type].push(resource);
-            return true;
-        }
-        return false;
+    const clientFullEhr: ClientFullEHR = { fhir: {}, attachments: [] };
+    const fetchedUrls = new Set<string>(); // Tracks URLs already added to a batch
+    const pool = new ConcurrencyManager(MAX_CONCURRENCY);
+    let completedFetches = 0;
+    let totalTasks = 0; 
+
+    const headers = {
+        'Authorization': `Bearer ${accessToken}`,
+        'Accept': 'application/fhir+json, application/json, */*' 
     };
 
-    // Helper to extract references from an object/array
-    const extractReferences = (obj: any) => {
-        if (!obj) return;
-        if (Array.isArray(obj)) {
-            obj.forEach(extractReferences);
-        } else if (typeof obj === 'object') {
-            if (obj.reference && typeof obj.reference === 'string' && !obj.reference.startsWith('#')) {
-                const refUrl = new URL(obj.reference, fhirBaseUrl).toString();
-                // Basic check to avoid fetching things that look like external URLs or URNs immediately
-                if (refUrl.startsWith(fhirBaseUrl) && !refUrl.includes('urn:')) {
-                    unresolvedReferences.add(refUrl);
-                }
+    // --- Fetch and Process Single Task Function (Uses pool, updates clientFullEhr directly) ---
+    async function fetchAndProcessTask(task: FetchTask): Promise<FetchTask[]> { 
+        await pool.acquire(); // Wait for a slot
+        
+        let discoveredTasks: FetchTask[] = [];
+        let taskCompletedSuccessfully = false;
+
+        try {
+            progressCallback(completedFetches, totalTasks, `Fetching: ${task.description}...`);
+            const response = await fetchWithTimeout(task.url, { headers }, REQUEST_TIMEOUT_MS);
+            
+            let resultData: any = null;
+            let isJson = false;
+            let isAttachmentBlob = false;
+            const contentType = response.headers.get('content-type') || '';
+
+            if (contentType.includes('json')) {
+                resultData = await response.json(); isJson = true;
+            } else if (task.isAttachment) {
+                resultData = await response.blob(); isAttachmentBlob = true;
+            } else { // Fallback for unexpected types
+                console.warn(`Unexpected content type (${contentType}) for ${task.url}, attempting text.`);
+                resultData = await response.text();
             }
-            Object.values(obj).forEach(extractReferences);
-        }
-    };
 
-    for (let i = 0; i < maxIterations; i++) {
-        console.log(`[CLIENT RESOLVE] Iteration ${i + 1}`);
-        unresolvedReferences.clear();
-
-        // Find all references in the current record
-        Object.values(currentRecord).flat().forEach(extractReferences);
-
-        const referencesToFetch = [...unresolvedReferences].filter(url => !fetchedReferenceUrls.has(url));
-
-        if (referencesToFetch.length === 0) {
-            console.log(`[CLIENT RESOLVE] No new unresolved references found in iteration ${i + 1}.`);
-            break; // No new references to resolve
-        }
-
-        console.log(`[CLIENT RESOLVE] Found ${referencesToFetch.length} unique, new references to fetch in iteration ${i + 1}.`);
-        referencesToFetch.forEach(url => fetchedReferenceUrls.add(url)); // Mark as being fetched
-
-        const fetchPromises = referencesToFetch.map(url => fetchResource(url, accessToken));
-        const resolvedResources = (await Promise.all(fetchPromises)).filter(Boolean);
-
-        let iterationAddedCount = 0;
-        resolvedResources.forEach(resource => {
-            if (addResource(resource)) {
-                iterationAddedCount++;
+            if (!response.ok) { // Handle HTTP errors
+                let errorMsg = `HTTP ${response.status} for ${task.url}`;
+                if (isJson && resultData?.issue?.[0]?.diagnostics) { errorMsg += `: ${resultData.issue[0].diagnostics}`; }
+                else if (typeof resultData === 'string') { errorMsg += `: ${resultData.substring(0, 100)}`; }
+                throw new Error(errorMsg);
             }
-        });
 
-        console.log(`[CLIENT RESOLVE] Added ${iterationAddedCount} new resources in iteration ${i + 1}.`);
-        referencesAddedCount += iterationAddedCount;
-
-        if (iterationAddedCount === 0 && i > 0) {
-             console.log(`[CLIENT RESOLVE] No new resources added in iteration ${i + 1}, stopping early.`);
-             break; // Optimization: stop if an iteration adds no new resources
-         }
-    }
-
-    if (unresolvedReferences.size > 0) {
-        console.warn(`[CLIENT RESOLVE] ${unresolvedReferences.size} references might still be unresolved after ${maxIterations} iterations.`);
-    }
-
-    console.log(`[CLIENT RESOLVE] Reference resolution finished. Total resources added: ${referencesAddedCount}`);
-    return { resolvedFhirRecord: currentRecord, referencesAddedCount };
-}
-
-// --- Function to process attachments ---
-async function processFhirAttachmentsClient(
-    fhirRecord: Record<string, any[]>,
-    accessToken: string,
-    fhirBaseUrl: string
-): Promise<ClientProcessedAttachment[]> {
-    console.log('[CLIENT ATTACH] Processing attachments...');
-    const processedAttachments: ClientProcessedAttachment[] = [];
-    const attachmentPromises: Promise<void>[] = [];
-
-    // Helper to find attachments within a resource
-    const findAttachments = (resource: any, pathPrefix: string = '') => {
-        if (!resource) return;
-
-        const currentPaths = KNOWN_ATTACHMENT_PATHS.get(resource.resourceType);
-        if (currentPaths) {
-            for (const attachmentPath of currentPaths) {
-                // Simple path traversal for now (e.g., 'content.attachment')
-                // Might need a more robust solution like lodash.get if paths get complex
-                let obj = resource;
-                const parts = attachmentPath.split('.');
-                try {
-                    for (const part of parts) {
-                        if (!part) break; // Handle empty parts like for Binary
-                        obj = obj[part];
-                        if (!obj) break;
-                    }
-                    if (obj) {
-                        // Handle cases where the path leads to an array of attachments
-                        const attachments = Array.isArray(obj) ? obj : [obj];
-                        for (const attachment of attachments) {
-                            if (typeof attachment === 'object' && (attachment.url || attachment.data)) {
-                                attachmentPromises.push(processSingleAttachment(resource, attachmentPath, attachment, accessToken, fhirBaseUrl, processedAttachments));
+            // --- Process Success Result ---
+            if (isJson && resultData?.resourceType === 'Bundle' && resultData.entry) { // Process Bundle
+                const entries = resultData.entry;
+                for (const entry of entries) {
+                    if (entry.resource) {
+                        const res = entry.resource;
+                        if (res.resourceType && res.id) { 
+                            if (!clientFullEhr.fhir[res.resourceType]) clientFullEhr.fhir[res.resourceType] = [];
+                            // Add resource if new
+                            if (!clientFullEhr.fhir[res.resourceType].some(r => r.id === res.id)) {
+                                clientFullEhr.fhir[res.resourceType].push(res);
+                                discoveredTasks = discoveredTasks.concat(extractTasksFromResource(res, fhirBaseUrl, task.depth));
                             }
                         }
                     }
-                } catch (e) { /* Ignore errors traversing paths that don't exist */ }
-            }
-        }
-    };
-
-    // Iterate through all resources and find attachments
-    Object.values(fhirRecord).flat().forEach(resource => findAttachments(resource));
-
-    await Promise.all(attachmentPromises);
-    console.log(`[CLIENT ATTACH] Finished processing. Found ${processedAttachments.length} attachments.`);
-    return processedAttachments;
-}
-
-// Helper to process a single attachment object
-async function processSingleAttachment(
-    resource: any,
-    path: string,
-    attachment: AttachmentLike,
-    accessToken: string,
-    fhirBaseUrl: string,
-    outputList: ClientProcessedAttachment[]
-): Promise<void> {
-    const contentType = attachment.contentType || 'application/octet-stream';
-    let contentBase64: string | null = null;
-    let contentPlaintext: string | null = null;
-
-    try {
-        if (attachment.data) {
-            // Assume data is base64 already
-            contentBase64 = attachment.data;
-            // Attempt decoding if it looks like text
-            if (contentType.startsWith('text/')) {
-                try {
-                    contentPlaintext = atob(contentBase64); // Simple base64 to text
-                } catch (e) {
-                    console.warn(`[CLIENT ATTACH] Failed to decode base64 text for ${resource.resourceType}/${resource.id} at ${path}:`, e);
                 }
+            } else if (task.isAttachment && isAttachmentBlob && resultData instanceof Blob) { // Process Attachment Blob
+                await processAttachmentData(resultData, task, clientFullEhr.attachments);
+            } else if (isJson && resultData?.resourceType && resultData.id) { // Process Single Resource
+                const res = resultData;
+                if (!clientFullEhr.fhir[res.resourceType]) clientFullEhr.fhir[res.resourceType] = [];
+                // Add resource if new
+                 if (!clientFullEhr.fhir[res.resourceType].some(r => r.id === res.id)) {
+                    clientFullEhr.fhir[res.resourceType].push(res);
+                    discoveredTasks = discoveredTasks.concat(extractTasksFromResource(res, fhirBaseUrl, task.depth));
+                }
+            } else { // Log other successful fetches
+                 console.log(`Successfully fetched non-FHIR, non-attachment URL: ${task.url}`);
             }
-        } else if (attachment.url) {
-            const attachmentUrl = new URL(attachment.url, fhirBaseUrl).toString();
-            console.log(`[CLIENT ATTACH] Fetching attachment URL: ${attachmentUrl}`);
-            const response = await fetchWithToken(attachmentUrl, accessToken);
-            if (response.ok) {
-                const blob = await response.blob();
-                contentBase64 = await blobToBase64(blob);
+            taskCompletedSuccessfully = true; // Mark as success for progress message
 
-                // Attempt text decoding for known text types
-                if (contentType.startsWith('text/') || contentType.includes('json') || contentType.includes('xml')) {
-                    try {
-                        // Use TextDecoder for better charset handling if possible
-                        // Extract charset from contentType if present, e.g., text/plain; charset=utf-8
-                        const charsetMatch = contentType.match(/charset=([^;]+)/);
-                        const encoding = charsetMatch ? charsetMatch[1].trim() : 'utf-8'; // Default to utf-8
-                        contentPlaintext = await new TextDecoder(encoding, { fatal: false }).decode(await blob.arrayBuffer());
-                        console.log(`[CLIENT ATTACH] Decoded text content for ${contentType}`);
-                    } catch (e) {
-                        console.warn(`[CLIENT ATTACH] Failed to decode text content for ${resource.resourceType}/${resource.id} at ${path} (type: ${contentType}):`, e);
-                        // Fallback: try reading blob as text directly (might get encoding wrong)
-                        try {
-                            contentPlaintext = await blob.text();
-                        } catch { /* Ignore fallback error */ }
+        } catch (error) {
+            // Log fetch/processing error (already includes URL from error message usually)
+            console.error(`Error processing task "${task.description}":`, error);
+        } finally {
+            // This task is complete (either success or failure)
+            completedFetches++;
+            const statusMsg = taskCompletedSuccessfully ? `Completed: ${task.description}` : `Failed: ${task.description}`;
+            progressCallback(completedFetches, totalTasks, statusMsg); // Update progress
+            pool.release(); // IMPORTANT: Release the pool slot
+        }
+        return discoveredTasks; // Return tasks discovered from this resource
+    }
+    // --- End of fetchAndProcessTask ---
+
+    // --- Initialize Task List ---
+    let currentTasks: FetchTask[] = [];
+    const initialResourceTypes = [ // Define types for initial fetch
+        'Observation', 'Condition', 'MedicationRequest', 'Procedure', 
+        'AllergyIntolerance', 'Immunization', 'DiagnosticReport', 'DocumentReference', 
+        'Encounter' 
+    ];
+    
+    // Add initial search tasks
+    initialResourceTypes.forEach(type => {
+        const url = `${fhirBaseUrl}/${type}?patient=${patientId}`; // Add _count=500 if needed/supported
+        const normalizedUrl = url.replace(/\/$/, ''); 
+        if (!fetchedUrls.has(normalizedUrl)) {
+            fetchedUrls.add(normalizedUrl);
+            currentTasks.push({ url: url, description: `Initial ${type}`, depth: 0 });
+        }
+    });
+    // Add direct patient fetch task
+    const patientUrl = `${fhirBaseUrl}/Patient/${patientId}`;
+    const normalizedPatientUrl = patientUrl.replace(/\/$/, '');
+    if (!fetchedUrls.has(normalizedPatientUrl)) {
+        fetchedUrls.add(normalizedPatientUrl);
+        currentTasks.push({ url: patientUrl, description: "Patient Record", depth: 0 });
+    }
+    
+    totalTasks = currentTasks.length;
+    progressCallback(0, totalTasks, 'Starting initial fetch batch...');
+    if (totalTasks === 0) {
+         console.warn("No initial tasks generated.");
+         return clientFullEhr; 
+    }
+
+    // --- Main Processing Loop (Batching) ---
+    while (currentTasks.length > 0) {
+        const batchDescription = `Batch of ${currentTasks.length} tasks`;
+        console.log(`Starting ${batchDescription}...`); // Log batch start
+        
+        // Start all fetch-and-process operations for the current batch.
+        // The ConcurrencyManager limits how many actually run simultaneously.
+        const promises = currentTasks.map(task => fetchAndProcessTask(task));
+        
+        // Wait for all promises in the current batch to settle (complete or fail)
+        const results = await Promise.allSettled(promises);
+
+        // Prepare the list of tasks for the *next* batch
+        const nextBatchTasks: FetchTask[] = [];
+        results.forEach(settledResult => {
+            // Check if the promise was fulfilled and returned new tasks
+            if (settledResult.status === 'fulfilled' && Array.isArray(settledResult.value)) {
+                const newTasksFromResult: FetchTask[] = settledResult.value; 
+                for (const newTask of newTasksFromResult) {
+                    // Only add the task if the URL hasn't been fetched before
+                    const normalizedUrl = newTask.url.replace(/\/$/, ''); 
+                    if (!fetchedUrls.has(normalizedUrl)) {
+                         fetchedUrls.add(normalizedUrl); // Mark as added
+                         nextBatchTasks.push(newTask);
+                         totalTasks++; // Increment total count for progress UI
                     }
                 }
-            } else {
-                console.warn(`[CLIENT ATTACH] Failed to fetch attachment URL ${attachmentUrl}: ${response.status}`);
-            }
-        }
-
-        outputList.push({
-            resourceType: resource.resourceType,
-            resourceId: resource.id,
-            path: path,
-            contentType: contentType,
-            json: JSON.stringify(attachment), // Store original attachment JSON
-            contentBase64: contentBase64,
-            contentPlaintext: contentPlaintext
+            } 
+            // No special handling needed for 'rejected' status here, error logged within fetchAndProcessTask
         });
+        
+        console.log(`${batchDescription} finished. Found ${nextBatchTasks.length} new unique tasks.`);
+        
+        // Update progress after batch completes (totalTasks might have increased)
+        progressCallback(completedFetches, totalTasks, `${batchDescription} finished. Starting next...`);
 
-    } catch (error) {
-        console.error(`[CLIENT ATTACH] Error processing attachment for ${resource.resourceType}/${resource.id} at ${path}:`, error);
-        // Still add entry, but with null content
-        outputList.push({
-            resourceType: resource.resourceType,
-            resourceId: resource.id,
-            path: path,
-            contentType: contentType,
-            json: JSON.stringify(attachment),
-            contentBase64: null,
-            contentPlaintext: null
-        });
+        currentTasks = nextBatchTasks; // Set up tasks for the next iteration
     }
-}
+    // --- End of Main Loop ---
 
+    console.log(`All fetch batches completed. Final progress: ${completedFetches}/${totalTasks}`);
+    
+    // --- Final Processing ---
+    progressCallback(completedFetches, totalTasks, "Processing inline data..."); // Update status before final step
+    processInlineAttachments(clientFullEhr);
 
-// --- Main Orchestration Function (Client-Side) ---
-export async function fetchAllEhrDataClientSide(accessToken: string, fhirBaseUrl: string, patientId: string): Promise<ClientFullEHR> {
-    console.log(`[CLIENT ORCHESTRATE] Starting data fetch for Patient: ${patientId}`);
-
-    try {
-        // Step 1: Fetch initial resources
-        const { initialFhirRecord, initialTotalFetched } = await fetchInitialFhirResourcesClient(accessToken, fhirBaseUrl, patientId);
-        let currentFhirRecord = initialFhirRecord;
-        let totalFetched = initialTotalFetched;
-        console.log(`[CLIENT ORCHESTRATE] Initial fetch complete: ${totalFetched} resources.`);
-
-        // Step 2: Resolve references
-        const MAX_RESOLVE_ITERATIONS = 3;
-        const { resolvedFhirRecord, referencesAddedCount } = await resolveFhirReferencesClient(
-            currentFhirRecord,
-            accessToken,
-            fhirBaseUrl,
-            MAX_RESOLVE_ITERATIONS
-        );
-        currentFhirRecord = resolvedFhirRecord;
-        totalFetched += referencesAddedCount;
-        console.log(`[CLIENT ORCHESTRATE] Reference resolution complete: ${totalFetched} resources total.`);
-
-        // Step 3: Process attachments
-        const processedAttachments = await processFhirAttachmentsClient(
-            currentFhirRecord,
-            accessToken,
-            fhirBaseUrl
-        );
-        console.log(`[CLIENT ORCHESTRATE] Attachment processing complete: ${processedAttachments.length} attachments.`);
-
-        const clientFullEHR: ClientFullEHR = {
-            fhir: currentFhirRecord,
-            attachments: processedAttachments
-        };
-
-        console.log(`[CLIENT ORCHESTRATE] Data retrieval finished successfully.`);
-        return clientFullEHR;
-
-    } catch (error) {
-        console.error(`[CLIENT ORCHESTRATE] Critical error during data fetch/processing:`, error);
-        throw new Error(`Client-side data retrieval failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    progressCallback(completedFetches, totalTasks, "All fetching complete."); // Final progress update
+    console.log(`Finished fetching. Resources: ${Object.keys(clientFullEhr.fhir).length} types, Attachments: ${clientFullEhr.attachments.length}`);
+    
+    console.log("Returning ClientFullEHR object from fetchAllEhrDataClientSideParallel.");
+    return clientFullEhr; // Return the populated object
 } 

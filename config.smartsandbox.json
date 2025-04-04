@@ -1,4 +1,9 @@
 {
+  "deliveryEndpoints": {
+    "mcp-callback": {
+      "postUrl": "/ehr-retriever-callback"
+    }
+  },
   "ehr": {
     "fhirBaseUrl": "https://launch.smarthealthit.org/v/r4/sim/WzMsIjE0ODY3ZGJhLWZiMTEtNGRmMy05ODI5LThlOGUwODFiMzllNiIsIiIsIkFVVE8iLDAsMSwwLCIiLCIiLCIiLCIiLCIiLCIiLCIiLDAsMSwiIl0/fhir",
     "clientId": "mcp-client",

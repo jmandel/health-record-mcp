@@ -10,16 +10,13 @@
   },
   "deliveryEndpoints": {
     "mcp-callback": {
-      "postUrl": "http://localhost:3000/ehr-retriever-callback",
-      "redirectUrl": "http://localhost:3000/callback-placeholder"
+      "postUrl": "http://localhost:3000/ehr-retriever-callback"
     },
     "local-server": {
-      "postUrl": "http://localhost:8080/data-sink", 
-      "redirectUrl": "http://localhost:8080/retrieval-complete?status=done"
+      "postUrl": "http://localhost:8080/data-sink"
     },
     "prod-server": {
-      "postUrl": "https://example.com/api/receive-ehr",
-      "redirectUrl": "https://example.com/thank-you"
+      "postUrl": "https://example.com/api/receive-ehr"
     }
   }
 } 

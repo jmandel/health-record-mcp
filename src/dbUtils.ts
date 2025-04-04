@@ -1,5 +1,6 @@
 import { Database } from 'bun:sqlite';
-import { FullEHR, ProcessedAttachment } from './types';
+import { ProcessedAttachment } from './types';
+import { ClientFullEHR, ClientProcessedAttachment } from '../clientTypes';
 
 /**
  * Populates a SQLite database with data from a FullEHR object.
@@ -9,7 +10,7 @@ import { FullEHR, ProcessedAttachment } from './types';
  * @param db - An open SQLite database connection
  * @returns The same database instance after population
  */
-export async function ehrToSqlite(fullEhr: FullEHR, db: Database): Promise<Database> {
+export async function ehrToSqlite(fullEhr: ClientFullEHR, db: Database): Promise<Database> {
     console.log("[DB:POPULATE] Starting database population from FullEHR");
     
     try {
@@ -72,7 +73,7 @@ export async function ehrToSqlite(fullEhr: FullEHR, db: Database): Promise<Datab
                     attachment.path,
                     attachment.contentType,
                     attachment.json,
-                    attachment.contentRaw,
+                    attachment.contentBase64,
                     attachment.contentPlaintext
                 );
                 attachmentCount++;
@@ -121,7 +122,7 @@ interface AttachmentRow {
  * @param db - An open SQLite database connection
  * @returns A Promise resolving to a FullEHR object
  */
-export async function sqliteToEhr(db: Database): Promise<FullEHR> {
+export async function sqliteToEhr(db: Database): Promise<ClientFullEHR> {
     console.log("[DB:RECONSTRUCT] Reconstructing FullEHR from database");
     
     try {
@@ -152,13 +153,13 @@ export async function sqliteToEhr(db: Database): Promise<FullEHR> {
             FROM fhir_attachments
         `);
         
-        const attachments: ProcessedAttachment[] = attachmentsQuery.all().map(row => ({
+        const attachments: ClientProcessedAttachment[] = attachmentsQuery.all().map(row => ({
             resourceType: row.resource_type,
             resourceId: row.resource_id,
             path: row.path,
             contentType: row.content_type,
             json: row.json,
-            contentRaw: row.content_raw ? Buffer.from(row.content_raw) : null,
+            contentBase64: row.content_raw ? Buffer.from(row.content_raw).toString('base64') : null,
             contentPlaintext: row.content_plaintext
         }));
         
