@@ -10,44 +10,35 @@ import { OAuthClientInformationFull, OAuthClientMetadata, OAuthTokenRevocationRe
 import {
     ErrorCode,
     Implementation,
-    McpError,
-    ServerCapabilities
+    McpError
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { Database } from 'bun:sqlite';
 import cors from 'cors';
-import express, { Request, Response, NextFunction } from 'express';
+import express, { NextFunction, Request, Response } from 'express';
+import fs from 'fs/promises';
 import http from 'http';
 import https from 'https';
-import fs from 'fs/promises';
-import _ from 'lodash';
 import { verifyChallenge } from 'pkce-challenge';
 import { v4 as uuidv4 } from 'uuid';
-// import vm from 'vm'; // No longer needed here
-import { z } from 'zod';
+import { execSync } from 'child_process'; // Import for running build command
 import { Command } from 'commander';
 import cookie from 'cookie'; // Need to parse cookies
 import path from 'path'; // Import path module
-import { execSync } from 'child_process'; // Import for running build command
-import { ParamsDictionary } from 'express-serve-static-core';
-import { ParsedQs } from 'qs';
 
 // --- Configuration Loading ---
-import { loadConfig, AppConfig } from './src/config.js'; // Import config loader
 import { ClientFullEHR } from './clientTypes.js'; // Import client types
+import { AppConfig, loadConfig } from './src/config.js'; // Import config loader
 import { ehrToSqlite, sqliteToEhr } from './src/dbUtils.js'; // Import the functions
 
 // --- Tool Schemas & Logic (Imported) ---
 import {
-    GrepRecordInputSchema,
-    GrepRecordOutputSchema,
-    QueryRecordInputSchema,
-    QueryRecordOutputSchema,
     EvalRecordInputSchema,
-    EvalRecordOutputSchema,
+    evalRecordLogic,
+    GrepRecordInputSchema,
     grepRecordLogic,
-    queryRecordLogic,
-    evalRecordLogic
+    QueryRecordInputSchema,
+    queryRecordLogic
 } from './src/tools.js'; // Import from the new file
 
 // --- Add Type Declaration for req.auth ---
@@ -62,18 +53,10 @@ declare module "express-serve-static-core" {
 let config: AppConfig;
 
 // --- Runtime Checks (Using Config) ---
-const SERVER_INFO: Implementation = { name: "EHR-Search-MCP-Server-SMART-Public-Bun", version: "0.5.0" };
-const SERVER_CAPABILITIES: ServerCapabilities = { tools: {}, sampling: {} };
-const SERVER_OPTIONS = {
-    capabilities: SERVER_CAPABILITIES,
-    instructions: "Server using SMART on FHIR (Public Client) via Bun to search and query patient EHR data (USCDI)."
-};
-
-
-// --- In-Memory Stores (Demo purposes only!) ---
+const SERVER_INFO: Implementation = { name: "Health Record Search MCP", version: "0.5.0" };
 
 // State store for the temporary /authorize -> /ehr-retriever-callback flow
-interface AuthFlowState { // RENAMED: Was AuthorizeSessionData
+interface AuthFlowState {
     mcpClientId: string;
     mcpRedirectUri: string;
     mcpCodeChallenge: string;
@@ -275,15 +258,6 @@ async function getSessionDb(session: UserSession): Promise<Database> {
     }
 }
 
-
-// --- Tool Schemas & Logic ---
-
-// MOVED TO src/tools.ts
-
-
-// --- Logic Functions ---
-
-// MOVED TO src/tools.ts
 
 
 // --- OAuth Provider Implementation ---
@@ -640,45 +614,6 @@ app.get('/api/list-stored-records', async (req, res) => { // Renamed endpoint
     }
 });
 
-// Endpoint called by db-picker.js when "New EHR" is clicked
-// Needs express.json() to parse the body
-app.post('/store-auth-flow', express.json(), (req, res) => {
-    console.log("[/store-auth-flow] Received request to store MCP params.");
-    try {
-        // Basic validation of expected parameters in the body
-        const { 
-            client_id: mcpClientId, 
-            redirect_uri: mcpRedirectUri, 
-            code_challenge: mcpCodeChallenge, 
-            state: mcpOriginalState 
-            // Add other essential params if needed by authFlowStates structure
-        } = req.body;
-
-        if (!mcpClientId || !mcpRedirectUri || !mcpCodeChallenge) {
-            console.error("[/store-auth-flow] Missing required MCP parameters in request body.");
-            res.status(400).json({ error: "invalid_request", error_description: "Missing required MCP parameters." });
-            return;
-        }
-
-        const authFlowId = `mcp-auth-${uuidv4()}`;
-        authFlowStates.set(authFlowId, {
-            mcpClientId: mcpClientId,
-            mcpRedirectUri: mcpRedirectUri,
-            mcpCodeChallenge: mcpCodeChallenge,
-            mcpOriginalState: mcpOriginalState, // Can be undefined
-            nonce: 'db-picker-new-ehr', // Indicate origin
-            expiresAt: Date.now() + AUTH_FLOW_EXPIRY_MS
-        });
-
-        console.log(`[/store-auth-flow] Stored auth flow state ${authFlowId} for MCP client ${mcpClientId}.`);
-        res.status(200).json({ authFlowId: authFlowId });
-
-    } catch (error: any) {
-        console.error("[/store-auth-flow] Error storing auth flow state:", error);
-        res.status(500).json({ error: "server_error", error_description: "Failed to store auth flow state." });
-    }
-});
-
 // Endpoint called by db-picker.js when an existing session tile is clicked
 app.get('/initiate-session-from-db', async (req, res) => {
     // Only read databaseId and pickerSessionId from query
@@ -704,8 +639,6 @@ app.get('/initiate-session-from-db', async (req, res) => {
 
         // Log retrieved state
         console.log(`[/initiate-session-from-db] Retrieved picker state for client ${pickerState.clientId}`);
-
-        // --- Removed validation for MCP params from req.query --- 
 
         // --- Load Session Data ---
         const { fullEhr, db } = await loadSessionFromDb(databaseId);
@@ -1393,10 +1326,10 @@ app.get("/mcp-sse", bearerAuthMiddleware, async (req: Request, res: Response) =>
                  console.log(`[SSE Closed] Cleared transportSessionId for MCP Token ${mcpAccessToken.substring(0, 8)}...`);
             }
 
-            // TODO Stop deleting
+            // Only if we want to delete sessions when the transport closes
+            // (Useful debugging with MCP Inspector tppl)
             // console.log(`[SSE Closed] Deleting session for MCP Token ${mcpAccessToken.substring(0, 8)}...`);
             // activeSessions.delete(mcpAccessToken);
-            // MCP Server SDK might also have cleanup via transport.close() internally
         });
 
         // --- Connect the MCP Server to the Transport ---
