@@ -1,39 +1,225 @@
 # Smart EHR MCP Server (Bun Implementation)
 
-This project implements a Model Context Protocol (MCP) server using Bun and TypeScript. It acts as a bridge between an MCP client (like an AI model or agent) and a SMART on FHIR-enabled Electronic Health Record (EHR) system. The server allows authorized clients to securely access and interact with patient data through a set of predefined tools.
+This project provides a Model Context Protocol (MCP) server that acts as a bridge between AI agents or other MCP clients and Electronic Health Record (EHR) systems.
 
-This implementation uses the **SMART App Launch Framework (Public Client profile)** for EHR authentication and authorization.
+## Core Features
 
-## Vision
+**Connect to any EHR with SMART on FHIR:**
+Leveraging the widely adopted SMART App Launch Framework, this server can connect to virtually any EHR system that supports this standard. It uses the public client profile (Authorization Code Grant with PKCE) to securely authenticate and authorize access on behalf of the user.
 
-The goal of this project is to demonstrate how EHR workflows can seamlessly connect to powerful external tools (like AI models) for purposes such as clinical question answering or automated prior authorization determinations. By leveraging the Model Context Protocol (MCP) on top of standard SMART on FHIR, we can achieve this integration without needing complex, pre-configured agreements about specific message flows or data formats between the EHR and the tool provider. MCP provides the dynamic discovery and interaction layer needed for flexible, context-aware tool use directly within clinical workflows.
+**Extract Comprehensive Patient Data:**
+Once connected, the server performs a thorough extraction of the patient's record. This includes:
+*   **Structured Data:** Key FHIR resources like Problems (Conditions), Medications, Allergies, Procedures, Observations, Encounters, Immunizations, and Patient Demographics.
+*   **Clinical Notes & Attachments:** It automatically identifies and fetches linked documents (e.g., from `DocumentReference`) and other attachments (like PDFs, RTF, HTML, XML, text found in `Binary` or other resources). It attempts to extract plaintext content from common formats, making unstructured text available alongside structured data.
 
-## Key Features
+The fetched data is aggregated into a `ClientFullEHR` object, containing both the raw FHIR JSON and processed attachment details.
 
-*   **MCP Compliance:** Implements the core MCP specification for server discovery, tool listing, and tool execution via Server-Sent Events (SSE).
-*   **SMART on FHIR Integration:** Authenticates with EHRs using the SMART App Launch public client flow (Authorization Code Grant with PKCE).
-*   **EHR Data Fetching:** Retrieves patient data (demographics, observations, conditions, medications, etc.) from the FHIR server.
-*   **In-Memory SQLite Cache:** Stores fetched FHIR resources in an in-memory SQLite database for efficient querying within a session.
-*   **Attachment Processing:** Extracts and processes text content from common attachment types found in FHIR resources (e.g., DocumentReference, Binary).
-*   **Data Querying Tools:** Provides MCP tools for:
-    *   `grep_record`: Text/regex search across FHIR resources and attachment content.
-    *   `query_record`: Execute read-only SQL queries against the cached FHIR data.
-    *   `eval_record`: Execute sandboxed JavaScript code against the fetched FHIR data (with Lodash available).
-    *   `resync_record`: Manually trigger a re-fetch of data from the EHR.
-*   **OAuth 2.0 Provider:** Implements necessary OAuth endpoints (`/authorize`, `/token`, `/revoke`, `/register`, `/.well-known/oauth-authorization-server`) for MCP client authorization.
-*   **SQLite Persistence (Optional):** Can persist the SQLite database for a patient session to disk to speed up subsequent connections for the same patient on the same FHIR server.
-*   **Configuration via JSON:** Server behavior is controlled through a simple JSON configuration file.
-*   **Built with Bun:** Leverages the Bun runtime for execution.
+**Powerful MCP Tools for Data Interaction:**
+The server exposes the aggregated EHR data through three core MCP tools, allowing clients to analyze the full record:
+*   `grep_record`: Performs text or regular expression searches across all fetched FHIR resources *and* the extracted plaintext of attachments. Ideal for finding mentions of specific terms, diagnoses, or medications anywhere in the record.
+*   `query_record`: Executes read-only SQL `SELECT` queries against the structured FHIR data, which is loaded into an in-memory SQLite database for efficient querying during the session.
+*   `eval_record`: Runs sandboxed JavaScript code directly against the complete `ClientFullEHR` object (including FHIR resources and attachments). This allows for complex custom logic, data transformation, or analysis using the provided Lodash library.
 
-## Configuration
+## How it Works: Connection and Data Flow
 
-The server can be configured using a JSON configuration file. You can specify the path to the configuration file using the `--config` command-line option:
+This project offers two primary modes of operation, catering to different integration needs:
 
-```bash
-bun run index.ts --config my-config.json
+1.  **Full Server with SSE Transport (`index.ts`):**
+    *   **Transport:** Uses Server-Sent Events (SSE) for real-time MCP communication.
+    *   **Data Fetch:** Integrates the SMART on FHIR authentication and data fetching process directly into the MCP client's authorization flow. When an MCP client initiates the OAuth 2.0 `/authorize` request with this server, the user is redirected to their EHR for login and consent. Upon successful authorization, the server immediately fetches the patient's data *before* issuing the final MCP access token to the client. The fetched data is then held in memory for the duration of the SSE session.
+    *   **Use Case:** Ideal for web-based MCP clients or scenarios where the data fetch should happen seamlessly as part of establishing the MCP connection.
+
+    ```mermaid
+    sequenceDiagram
+        participant Client [MCP Client]
+        participant Server [Full Server (index.ts)]
+        participant Browser [User's Browser]
+        participant EHR
+
+        Client->>Server: Request /authorize (OAuth)
+        Server->>Browser: Redirect to EHR Login
+        Browser->>EHR: User Logs In / Authorizes
+        EHR->>Browser: Returns Auth Code
+        Browser->>Server: Sends Auth Code via Redirect
+        Server->>EHR: Exchanges Code for Token
+        EHR->>Server: Returns Access Token + Patient ID
+        Server->>EHR: Fetches Patient Data (FHIR + Attachments)
+        EHR->>Server: Returns Data
+        Server->>Server: Holds Data in Memory
+        Server->>Client: Issues MCP Access Token
+        Client->>Server: Connects to /mcp-sse with Token
+        Client->>Server: callTool(grep_record, ...)
+        Server->>Server: Executes tool against in-memory data
+        Server->>Client: Returns tool result via SSE
+    end
+    ```
+
+2.  **Command-Line Interface with Stdio Transport (`src/cli.ts`):**
+    *   **Transport:** Uses standard input/output (stdio) for MCP communication.
+    *   **Data Fetch:** Requires a separate, **up-front** data fetching step using the `--create-db` flag. This command runs a temporary local web server, guides the user through the SMART flow in their browser, fetches the data, and saves it persistently to a local SQLite database file.
+    *   **MCP Server Launch:** Once the database file exists, the CLI is run again, pointing to the database (`--db path`). It loads the data from the SQLite file into memory and then listens for MCP messages on stdin, sending responses to stdout.
+    *   **Use Case:** Suitable for local development tools (like Cursor), testing, or scenarios where data persistence is desired, and the data fetching process can occur independently before the MCP session starts.
+
+    *(See the Mermaid diagram under 'CLI Usage' below for this flow)*
+
+## Setup
+
+1.  **Prerequisites:**
+    *   Bun runtime installed (`curl -fsSL https://bun.sh/install | bash`)
+    *   Git (for cloning, if necessary)
+
+2.  **Clone the repository (if applicable):**
+    ```bash
+    git clone <repository-url>
+    cd <repository-directory>
+    ```
+
+3.  **Install Dependencies:**
+    ```bash
+    bun install
+    ```
+
+## Running the Full Server (SSE Transport - `index.ts`)
+
+1.  **Configure:**
+    *   Copy `config.json.example` to `config.json`.
+    *   Edit `config.json` and provide your EHR details, minimally `ehr.clientId` and `ehr.fhirBaseUrl`. The server needs a client ID registered with the target EHR.
+    *   Set the desired `server.port`.
+
+2.  **Run:**
+    ```bash
+    bun run index.ts
+    # or bun run index.ts --config my-other-config.json
+    ```
+
+The server will start, perform SMART discovery using the details in `config.json`, and listen for incoming MCP client OAuth requests and SSE connections on the configured port.
+
+## CLI Usage (Stdio Transport - `src/cli.ts`)
+
+The `src/cli.ts` script provides the stdio transport mechanism.
+
+**Workflow Overview:**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI_CreateDB [CLI (src/cli.ts --create-db)]
+    participant Browser [Web Browser]
+    participant EHR
+    participant SQLiteDB [SQLite Database File]
+    participant CLI_Stdio [CLI (src/cli.ts --db)]
+    participant MCPClient [MCP Client (e.g., Cursor)]
+
+    User->>CLI_CreateDB: bun src/cli.ts --create-db --db ./my_ehr.sqlite
+    CLI_CreateDB->>User: Provides URL (e.g., http://localhost:8088/start)
+    User->>Browser: Opens provided URL
+    Browser->>CLI_CreateDB: Requests /start
+    CLI_CreateDB->>Browser: Redirects to ehretriever.html
+    Browser->>Browser: User enters EHR details
+    Browser->>EHR: Initiates SMART Auth Flow
+    EHR->>Browser: User authenticates/authorizes
+    Browser->>EHR: Exchanges code for token
+    EHR->>Browser: Returns access token
+    Browser->>EHR: Fetches FHIR data (Patient, Obs, etc.)
+    EHR->>Browser: Returns FHIR data
+    Browser->>Browser: Processes data & attachments
+    Browser->>CLI_CreateDB: POSTs ClientFullEHR to /ehr-data
+    CLI_CreateDB->>SQLiteDB: Writes data using ehrToSqlite()
+    CLI_CreateDB->>User: Logs success, server shuts down
+
+    User->>MCPClient: Configure server command
+    MCPClient->>CLI_Stdio: bun src/cli.ts --db ./my_ehr.sqlite
+    CLI_Stdio->>SQLiteDB: Reads data using sqliteToEhr()
+    CLI_Stdio->>MCPClient: Ready (via stdio transport)
+    MCPClient->>CLI_Stdio: callTool(grep_record, ...)
+    CLI_Stdio->>CLI_Stdio: Executes grepRecordLogic() against in-memory EHR data
+    CLI_Stdio->>MCPClient: Returns tool result via stdio
 ```
 
-If no configuration file is specified, the server will look for a file named `config.json` in the current directory. If the file doesn't exist, the server will throw an error.
+**Step 1: Creating the Database (`--create-db`)**
+
+This mode starts a temporary web server to guide you through the SMART authentication process in your browser. Once authentication is complete and data is fetched, it's saved to the specified SQLite file.
+
+```bash
+# Create a new database file (requires user interaction in browser)
+bun run src/cli.ts --create-db -d ./data/my_patient_data.sqlite
+
+# Options:
+# --port <port> : Specify port for the temporary web server (default 8088)
+# --force-overwrite : Delete the DB file if it exists before creating
+```
+
+Follow the instructions printed in the terminal:
+1.  Open the provided `http://localhost:<port>/start` URL in your browser.
+2.  Fill in the EHR details (FHIR Base URL, Client ID, Scopes).
+3.  Complete the EHR login and authorization steps.
+4.  The browser fetches the data and sends it back to the local CLI server.
+5.  The CLI saves the data to the SQLite file (`--db path`) and shuts down.
+
+**Step 2: Running the MCP Server (stdio mode)**
+
+Once the SQLite database file exists, run the CLI pointing to it:
+
+```bash
+# Run the MCP server, reading from the created database
+bun run src/cli.ts --db ./data/my_patient_data.sqlite
+```
+
+The CLI loads data into memory and listens for MCP messages on stdin/stdout.
+
+**Step 3: Integrating with an MCP Client (e.g., Cursor)**
+
+Configure your stdio-compatible client (like Cursor's `.mcp/servers.json`):
+
+```json
+{
+  "mcpServers": {
+    "local-ehr": {
+      "name": "Local EHR Search",
+      "command": "bun", // Or your Bun executable path
+      "args": [
+          // *Absolute path* to cli.ts
+          "/full/path/to/your/project/smart-mcp/src/cli.ts",
+          "--db",
+          // *Absolute path* to your database file
+          "/full/path/to/your/project/smart-mcp/data/my_patient_data.sqlite"
+      ],
+      // Optional: Set working directory if needed
+      // "cwd": "/full/path/to/your/project/smart-mcp"
+    }
+  }
+}
+```
+*Ensure you use absolute paths for `cli.ts` and the database file.*
+
+## MCP Tools Details
+
+*   **`grep_record`**: Searches FHIR resources and attachment plaintext.
+    *   **Input:** `{ "query": string, "resource_types": string[] | undefined }` (Query is text or JS regex, `resource_types` filters scope, omit or empty for all, `["Attachment"]` for only attachments).
+    *   **Output:** `{ "results": string }` (JSON string containing matches, truncated if necessary).
+*   **`query_record`**: Executes read-only SQL against cached FHIR data.
+    *   **Input:** `{ "sql": string }` (SQL `SELECT` statement against `fhir_resources` table (cols: `resource_type`, `resource_id`, `json`) and `fhir_attachments` table).
+    *   **Output:** `{ "results": string }` (JSON string of query results, truncated if necessary).
+*   **`eval_record`**: Executes sandboxed JavaScript against the full `ClientFullEHR` object.
+    *   **Input:** `{ "code": string }` (JS code snippet using `fullEhr`, `console`, `_` (lodash), `Buffer`. Must `return` a JSON-serializable value).
+    *   **Output:** `{ "results": string }` (JSON string containing `{ result: any, logs: string[], error?: string }`, truncated if necessary).
+
+*(Note: The `resync_record` tool mentioned in older versions is not implemented in the current main flows described.)*
+
+## OAuth 2.0 Endpoints (Full Server `index.ts` only)
+
+The full server (`index.ts`) acts as an OAuth 2.0 Authorization Server for MCP clients:
+*   **Metadata:** `GET /.well-known/oauth-authorization-server`
+*   **Authorization:** `GET /authorize` (Triggers SMART flow)
+*   **Token:** `POST /token` (Exchanges EHR code for MCP token)
+*   **Registration:** `POST /register` (Dynamic client registration)
+*   **Revocation:** `POST /revoke`
+
+## Configuration Details (`config.json` for `index.ts`)
+
+*(This section remains largely the same as before, detailing the JSON structure for `clientId`, `fhirBaseUrl`, `port`, `baseUrl`, `persistence`, `security` etc. for the full server mode.)*
+
+(... include the previous detailed configuration options table/explanation here ...)
 
 ### Sample Configuration
 
@@ -83,7 +269,7 @@ The configuration file has the following structure:
 
 #### Required Configuration
 
-Only the following fields are required:
+Only the following fields are required for the full server:
 
 ```json
 {
@@ -125,81 +311,3 @@ All other fields will be derived or set to sensible defaults.
 #### Security Configuration
 
 - `disableClientChecks`: Whether to disable client authentication checks (optional, defaults to false, not recommended for production)
-
-## Setup and Running
-
-1.  **Prerequisites:**
-    *   Bun runtime installed (`curl -fsSL https://bun.sh/install | bash`)
-    *   Git (for cloning, if necessary)
-
-2.  **Clone the repository (if applicable):**
-    ```bash
-    git clone <repository-url>
-    cd <repository-directory>
-    ```
-
-3.  **Install Dependencies:**
-    ```bash
-    bun install
-    ```
-
-4.  **Configure:**
-    *   Create a `config.json` file in the project root.
-    *   Add the necessary configuration options (see Configuration section). Minimally, you'll need to specify `ehr.clientId`, `ehr.fhirBaseUrl`, and `server.port`.
-
-5.  **Run the Server:**
-    ```bash
-    bun run index.ts
-    ```
-    Or, if `index.ts` is executable (`chmod +x index.ts`):
-    ```bash
-    ./index.ts
-    ```
-
-The server will start, perform configuration checks (including SMART discovery if needed), and begin listening on the configured port.
-
-## MCP Tools
-
-The server exposes the following tools to authorized MCP clients:
-
-*   **`grep_record`**:
-    *   **Input:** `{ "query": string, "resource_types": string[] | undefined }`
-    *   **Output:** `{ "matched_resources": [], "matched_attachments": [], ...counts }`
-    *   Searches the patient's cached FHIR resources (as JSON strings) and the extracted plaintext of attachments using a case-insensitive string or JavaScript regex. Can be scoped to specific resource types or attachments.
-
-*   **`query_record`**:
-    *   **Input:** `{ "sql": string }`
-    *   **Output:** `Array<Record<string, unknown>>`
-    *   Executes a read-only `SELECT` SQL query against the in-memory SQLite database containing the FHIR resources. Table names are typically `fhir_<ResourceType>` (e.g., `fhir_Patient`, `fhir_Observation`) and `attachments`.
-
-*   **`eval_record`**:
-    *   **Input:** `{ "code": string }`
-    *   **Output:** `{ "result": any | undefined, "logs": string[], "errors": string[] }`
-    *   Executes a snippet of asynchronous JavaScript code in a sandbox. The code receives the full patient record (`record: Record<string, any[]>`), a limited `console` object, and the Lodash library (`_`). It must return a JSON-serializable value. Console output and errors are captured.
-
-*   **`resync_record`**:
-    *   **Input:** `{}`
-    *   **Output:** `{ "message": string }`
-    *   Discards the current cached data and re-fetches all FHIR resources from the EHR. Useful if the underlying data may have changed.
-
-## OAuth 2.0 Endpoints
-
-This server acts as an OAuth 2.0 Authorization Server for MCP clients wishing to access its tools.
-
-*   **Metadata:** `GET /.well-known/oauth-authorization-server`
-    *   Provides standard OAuth server metadata.
-*   **Authorization:** `GET /authorize`
-    *   Initiates the OAuth Authorization Code flow for an MCP client. This triggers the SMART App Launch flow with the EHR.
-*   **Token:** `POST /token`
-    *   Exchanges an MCP authorization code (obtained after successful EHR login and consent) for an MCP access token. Also handles client authentication and PKCE verification.
-*   **Registration:** `POST /register`
-    *   Allows dynamic registration of MCP clients (metadata required in the request body).
-*   **Revocation:** `POST /revoke`
-    *   Allows an authenticated MCP client to revoke one of its access tokens.
-
-## MCP Communication
-
-*   **SSE Endpoint:** `GET /mcp-sse`
-    *   Authenticated MCP clients establish a Server-Sent Events connection here after obtaining an access token. MCP messages (requests and responses) are exchanged over this connection. Requires a `Bearer` token.
-*   **Message Endpoint:** `POST /mcp-messages`
-    *   The MCP client sends request messages (like `callTool`) to this endpoint, associated with the established SSE session via a `sessionId` query parameter. Authentication is implicitly handled by the valid `sessionId`.
