@@ -45,7 +45,6 @@ sequenceDiagram
     Client->>Server: Use Tool: grep_record(...)
     Server->>Server: Running Tool on Memory Data
     Server->>Client: Here are the results! (SSE)
-end
 ```
 
 **2. The Command-Line Helper (Stdio Transport via `src/cli.ts`)**
@@ -92,7 +91,6 @@ sequenceDiagram
     MCPClient->>CLI_Stdio: Use Tool: grep_record(...)
     CLI_Stdio->>CLI_Stdio: Running Tool on Memory Data
     CLI_Stdio->>MCPClient: Here are the results! (via stdio)
-end
 ```
 
 ## Getting Started: Setup
