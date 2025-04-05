@@ -522,9 +522,9 @@ app.use((req, res, next) => {
 });
 
 // --- Serve Static Files from ./static --- 
-const staticPath = path.resolve(process.cwd(), 'static'); // UPDATED path
+const staticPath = path.resolve(process.cwd(), 'static'); 
 console.log(`[STATIC] Serving static files from: ${staticPath}`);
-app.use('/static', express.static(staticPath)); // UPDATED mount path
+app.use('/static', express.static(staticPath)); 
 
 // --- API Endpoints (New) ---
 
@@ -1539,7 +1539,6 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 // Start the application
 main();
 
-// New GET route to redirect to the static retriever page
 app.get('/ehr-callback', (req, res) => {
     console.log("[GET /ehr-callback] Redirecting to static retriever page, preserving query parameters.");
     const originalUrl = req.originalUrl; // e.g., '/ehr-callback?foo=bar'
