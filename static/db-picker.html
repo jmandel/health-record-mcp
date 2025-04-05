@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Select EHR Session</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; }
+        .container { max-width: 800px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #333; }
+        .picker-options { display: flex; flex-wrap: wrap; gap: 15px; justify-content: center; margin-top: 20px; }
+        .session-tile, .new-session-btn {
+            border: 1px solid #ddd;
+            padding: 15px;
+            border-radius: 6px;
+            background-color: #fff;
+            cursor: pointer;
+            transition: box-shadow 0.2s ease, transform 0.2s ease;
+            text-align: center;
+            min-width: 150px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+        .session-tile:hover {
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            transform: translateY(-2px);
+        }
+        .session-tile h3 { margin: 0 0 10px 0; color: #0056b3; }
+        .session-tile p { margin: 5px 0; font-size: 0.9em; color: #555; }
+        .new-session-btn {
+            background-color: #28a745;
+            color: white;
+            font-weight: bold;
+            border-color: #218838;
+        }
+        .new-session-btn:hover {
+            background-color: #218838;
+             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+             transform: translateY(-2px);
+        }
+        #loading-message, #error-message { text-align: center; margin-top: 20px; padding: 10px; border-radius: 4px; }
+        #loading-message { color: #555; }
+        #error-message { color: #D8000C; background-color: #FFD2D2; display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Select Stored Record</h1>
+        <div id="loading-message">Loading stored records...</div>
+        <div id="error-message"></div>
+        <div class="picker-options" id="picker-options">
+            <!-- Record tiles will be loaded here -->
+             <!-- "New Session" button will be added here -->
+        </div>
+    </div>
+
+    <script src="/static/db-picker.js"></script>
+</body>
+</html> 

@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "bun run index.ts",
-    "build:ehretriever": "bun run ./build-ehretriever.ts"
+    "build:ehretriever": "bun run ./scripts/build-ehretriever.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.1",

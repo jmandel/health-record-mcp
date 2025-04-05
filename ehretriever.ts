@@ -261,7 +261,20 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                     // --- Handle named endpoint delivery --- 
                     else {
-                        const deliveryEndpoints = typeof __DELIVERY_ENDPOINTS__ !== 'undefined' ? __DELIVERY_ENDPOINTS__ : {};
+                        // Parse the injected endpoints string
+                        let deliveryEndpoints: Record<string, { postUrl: string }> = {};
+                        if (typeof __DELIVERY_ENDPOINTS__ === 'string') {
+                            try {
+                                deliveryEndpoints = JSON.parse(__DELIVERY_ENDPOINTS__);
+                            } catch (e) {
+                                console.error("Error parsing injected __DELIVERY_ENDPOINTS__ string:", __DELIVERY_ENDPOINTS__, e);
+                                // Keep deliveryEndpoints as {}
+                            }
+                        } else if (typeof __DELIVERY_ENDPOINTS__ !== 'undefined') {
+                             console.warn("__DELIVERY_ENDPOINTS__ was defined but not a string. Using empty endpoints.");
+                        }
+                        // --- End parsing ---
+                        
                         const endpointConfig = deliveryEndpoints[deliveryTargetName]; // Get the config object
 
                         if (endpointConfig && endpointConfig.postUrl) {
@@ -293,6 +306,13 @@ document.addEventListener('DOMContentLoaded', () => {
                                         console.log(`Redirecting to: ${jsonData.redirectTo}`);
                                         window.location.href = jsonData.redirectTo; // Perform client-side redirect
                                         return; // Stop further execution after redirect
+                                    } else if (jsonData.success === true && !jsonData.redirectTo) {
+                                        // Server indicated success but no redirect needed (e.g., CLI mode)
+                                        finalStatus += ` Data POST successful. You may now close this window.`;
+                                        updateStatus(finalStatus);
+                                        console.log('Delivery successful, no redirect specified.');
+                                        // Optional: Could attempt window.close() here, but it might be blocked
+                                        // window.close(); 
                                     } else {
                                         // Server indicated failure or response missing redirectTo
                                         const serverError = jsonData.error || 'unknown_server_error';
