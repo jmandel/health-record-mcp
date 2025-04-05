@@ -301,6 +301,7 @@ document.addEventListener('DOMContentLoaded', () => {
                                 // --- Process JSON response and redirect --- 
                                 try {
                                     const jsonData = await deliveryResponse.json();
+                                    console.log("JSON response from delivery endpoint:", jsonData);
                                     if (jsonData.success === true && typeof jsonData.redirectTo === 'string' && jsonData.redirectTo) {
                                         updateStatus(`${finalStatus} Data POST successful. Redirecting to complete flow...`);
                                         console.log(`Redirecting to: ${jsonData.redirectTo}`);
