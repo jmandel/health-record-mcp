@@ -44,18 +44,18 @@ const PKCE_METHOD_S256 = 'S256';
 // --- Internal State Management ---
 
 // Temporary store for MCP authorization requests before user picks DB/connects EHR
-interface PickerSessionState {
-    pickerSessionId: string; // Unique ID for this picker interaction
+export interface AuthzRequestState { 
+    authzRequestId: string;
     mcpClientId: string;
     mcpRedirectUri: string;
     mcpCodeChallenge?: string;
     mcpCodeChallengeMethod?: string;
     mcpState?: string;
-    mcpScope?: string; // Store requested scope
+    mcpScope?: string;
     createdAt: number;
 }
-const pickerSessions = new Map<string, PickerSessionState>(); // Keyed by pickerSessionId
-const PICKER_SESSION_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+const authzRequests = new Map<string, AuthzRequestState>(); // Renamed from pickerSessions
+const AUTHZ_REQUEST_EXPIRY_MS = 5 * 60 * 1000; // Renamed from PICKER_SESSION_EXPIRY_MS
 
 // Temporary store for state between initiating new EHR flow and the callback
 interface AuthFlowState {
@@ -191,6 +191,12 @@ class MyOAuthServerProvider implements OAuthServerProvider {
         if (session) {
             console.log(`[AUTH Provider] Found and consuming session for auth code ${code.substring(0,8)}...`);
             sessionsByMcpAuthCode.delete(code);
+            // Ensure the authzRequestState is present if expected (it should be)
+            if (!session.authzRequestState) {
+                 console.error(`[AUTH Provider] CRITICAL: Session ${session.sessionId.substring(0,8)} found for auth code ${code.substring(0,8)} but is missing authzRequestState!`);
+                 // Decide how to handle - maybe throw an error? For now, return undefined as if session wasn't found.
+                 return undefined;
+            }
             return session;
         } else {
              console.warn(`[AUTH Provider] Auth code ${code.substring(0,8)}... not found or expired.`);
@@ -207,15 +213,16 @@ class MyOAuthServerProvider implements OAuthServerProvider {
              this.activeSessions.set(token, session);
         } else {
              const existingSession = this.activeSessions.get(token)!;
-             existingSession.mcpClientInfo = session.mcpClientInfo;
+             existingSession.mcpClientInfo = session.mcpClientInfo; // Keep this - general client info for the session
+             existingSession.authzRequestState = session.authzRequestState; // Ensure authz state is also updated if needed
         }
 
-        // Use 'scopes' instead of 'scope'
+        // Use 'scopes' from AuthzRequestState if available, otherwise default
+        const scopesArray = (session.authzRequestState?.mcpScope || '').split(' ').filter(s => s);
         const authInfo: AuthInfo = {
             token: token,
-            clientId: clientId,
-            // Split the scope string into an array
-            scopes: (scope || session.mcpClientInfo.scope || '').split(' ').filter(s => s), // Split and filter empty strings
+            clientId: clientId, // clientId here is confirmed during token exchange
+            scopes: scopesArray,
         };
 
         console.log(`[AUTH Provider] Token created: ${token.substring(0,8)}... for client ${clientId}`);
@@ -229,12 +236,13 @@ class MyOAuthServerProvider implements OAuthServerProvider {
             return undefined;
         }
 
-        // Use 'scopes' instead of 'scope'
+        // Use 'scopes' from AuthzRequestState if available
+        const scopesArray = (session.authzRequestState?.mcpScope || '').split(' ').filter(s => s);
         const authInfo: AuthInfo = {
             token: token,
-            clientId: session.mcpClientInfo.client_id,
-            // Split the scope string into an array
-            scopes: (session.mcpClientInfo.scope || '').split(' ').filter(s => s), // Split and filter empty strings
+            // Client ID associated with the session (verified at token exchange)
+            clientId: session.mcpClientInfo.client_id, 
+            scopes: scopesArray,
         };
         return authInfo;
     }
@@ -261,7 +269,7 @@ class MyOAuthServerProvider implements OAuthServerProvider {
     }
 
     async verifyAccessToken(mcpAccessToken: string): Promise<AuthInfo> {
-        console.log(`[AUTH Provider] Verifying MCP token: ${mcpAccessToken.substring(0, 8)}...`);
+        console.log(`[AUTH Provider] Verifying MCP token: ${mcpAccessToken}...`);
         const session = this.activeSessions.get(mcpAccessToken);
 
         if (!session) {
@@ -292,15 +300,16 @@ class MyOAuthServerProvider implements OAuthServerProvider {
         console.log(`[AUTH Provider] challengeForAuthorizationCode() called for client ${client.client_id}.`);
         // Use the passed authorizationCode
         const session = sessionsByMcpAuthCode.get(authorizationCode);
-        if (session && session.mcpCodeChallenge) {
+        // Check against authzRequestState
+        if (session && session.authzRequestState?.mcpCodeChallenge) {
             // Ensure the code belongs to the correct client
-            if (session.mcpClientInfo.client_id !== client.client_id) {
-                console.warn(`[AUTH Provider] challengeForAuthorizationCode: Client mismatch. Expected ${session.mcpClientInfo.client_id}, got ${client.client_id}.`);
+            if (session.authzRequestState.mcpClientId !== client.client_id) {
+                console.warn(`[AUTH Provider] challengeForAuthorizationCode: Client mismatch. Expected ${session.authzRequestState.mcpClientId}, got ${client.client_id}.`);
                  sessionsByMcpAuthCode.delete(authorizationCode); // Consume the code to prevent reuse
                 throw new InvalidGrantError("Authorization code client mismatch.");
             }
             // Return only the challenge string
-            return session.mcpCodeChallenge;
+            return session.authzRequestState.mcpCodeChallenge;
         }
         console.warn(`[AUTH Provider] challengeForAuthorizationCode: No session or challenge found for code ${authorizationCode.substring(0,8)}...`);
         // Throw error as the interface expects a string promise
@@ -335,7 +344,7 @@ export function addOauthRoutesAndProvider(
 
     function cleanupExpiredState() {
         const now = Date.now();
-        pickerSessions.forEach((state, id) => { if (now > state.createdAt + PICKER_SESSION_EXPIRY_MS) { console.log(`[AUTH State Cleanup] Expiring picker session: ${id}`); pickerSessions.delete(id); } });
+        authzRequests.forEach((state, id) => { if (now > state.createdAt + AUTHZ_REQUEST_EXPIRY_MS) { console.log(`[AUTH State Cleanup] Expiring authz request: ${id}`); authzRequests.delete(id); } }); // Renamed
         authFlowStates.forEach((state, id) => { if (now > state.createdAt + AUTH_FLOW_EXPIRY_MS) { console.log(`[AUTH State Cleanup] Expiring auth flow state: ${id}`); authFlowStates.delete(id); } });
     }
     setInterval(cleanupExpiredState, 60 * 1000);
@@ -375,9 +384,9 @@ export function addOauthRoutesAndProvider(
             }
 
             cleanupExpiredState();
-            const pickerSessionId = uuidv4();
-            const pickerState: PickerSessionState = {
-                pickerSessionId: pickerSessionId,
+            const authzRequestId = uuidv4(); // Renamed
+            const authzState: AuthzRequestState = { // Renamed
+                authzRequestId: authzRequestId, // Renamed
                 mcpClientId: client_id,
                 mcpRedirectUri: redirect_uri,
                 mcpCodeChallenge: code_challenge,
@@ -386,10 +395,10 @@ export function addOauthRoutesAndProvider(
                 mcpScope: typeof scope === 'string' ? scope : undefined,
                 createdAt: Date.now(),
             };
-            pickerSessions.set(pickerSessionId, pickerState);
+            authzRequests.set(authzRequestId, authzState); // Renamed
 
-            console.log(`[/authorize GET] Stored picker session ${pickerSessionId} for client ${client_id}. Redirecting to picker UI.`);
-            const pickerUrl = `/static/db-picker.html?pickerSessionId=${pickerSessionId}`;
+            console.log(`[/authorize GET] Stored authz request ${authzRequestId} for client ${client_id}. Redirecting to picker UI.`); // Renamed
+            const pickerUrl = `/static/db-picker.html?authzRequestId=${authzRequestId}`; // Renamed
             res.redirect(pickerUrl);
 
         } catch (error) {
@@ -401,45 +410,45 @@ export function addOauthRoutesAndProvider(
     app.get('/initiate-session-from-db', async (req, res, next): Promise<void> => {
         console.log("[/initiate-session-from-db GET] Received request query:", req.query);
         const databaseId = req.query.databaseId as string | undefined;
-        const pickerSessionId = req.query.pickerSessionId as string | undefined;
+        const authzRequestId = req.query.authzRequestId as string | undefined; // Renamed
 
-        let pickerState: PickerSessionState | undefined = undefined;
+        let authzRequestState: AuthzRequestState | undefined = undefined; // Renamed
         let loadedSession: UserSession | null = null; // Keep track of loaded session for cleanup
 
         try {
             // --- Parameter Validation (Query Params) ---
             if (!databaseId) throw new InvalidRequestError("Missing required query parameter: databaseId");
-            if (!pickerSessionId) throw new InvalidRequestError("Missing required query parameter: pickerSessionId");
-            console.log(`[/initiate-session-from-db GET] Params: dbId=${databaseId}, pickerId=${pickerSessionId}`);
+            if (!authzRequestId) throw new InvalidRequestError("Missing required query parameter: authzRequestId"); // Renamed
+            console.log(`[/initiate-session-from-db GET] Params: dbId=${databaseId}, authzId=${authzRequestId}`); // Renamed
 
-            // --- Retrieve and Validate Picker Session State ---
-            pickerState = pickerSessions.get(pickerSessionId);
-            if (!pickerState) {
-                console.warn(`[/initiate-session-from-db GET] Picker session not found or expired: ${pickerSessionId}`);
+            // --- Retrieve and Validate Authz Request State --- // Renamed
+            authzRequestState = authzRequests.get(authzRequestId); // Renamed
+            if (!authzRequestState) {
+                console.warn(`[/initiate-session-from-db GET] Authz request state not found or expired: ${authzRequestId}`); // Renamed
                 // Don't throw immediately, try to redirect with error if possible later
             } else {
-                 pickerSessions.delete(pickerSessionId); // Consume the state only if found
-                 console.log(`[/initiate-session-from-db GET] Retrieved picker state for client ${pickerState.mcpClientId}`);
-                 // Optional: Add expiry check if PickerSessionState has expiry property
-                 // if (pickerState.expiresAt < Date.now()) throw new InvalidRequestError("Picker session expired.");
+                 authzRequests.delete(authzRequestId); // Consume the state only if found // Renamed
+                 console.log(`[/initiate-session-from-db GET] Retrieved authz state for client ${authzRequestState.mcpClientId}`); // Renamed
+                 // Optional: Add expiry check if AuthzRequestState has expiry property
             }
-             // Ensure pickerState exists before proceeding
-             if (!pickerState) throw new InvalidRequestError("Invalid or expired picker session ID.");
+             // Ensure authzRequestState exists before proceeding
+             if (!authzRequestState) throw new InvalidRequestError("Invalid or expired authorization request ID."); // Renamed
 
 
-             // --- Get/Validate MCP Client Info (using pickerState) ---
+             // --- Get/Validate MCP Client Info (using authzRequestState) --- // Renamed
              // Need client info *before* calling loadSessionFromDb
-             const client = await oauthProvider.getClient(pickerState.mcpClientId);
+             const client = await oauthProvider.getClient(authzRequestState.mcpClientId);
              if (!client) {
-                 console.error(`[/initiate-session-from-db GET] Client ${pickerState.mcpClientId} not found after retrieving picker state.`);
-                 throw new InvalidClientError(`MCP Client not found: ${pickerState.mcpClientId}`);
+                 console.error(`[/initiate-session-from-db GET] Client ${authzRequestState.mcpClientId} not found after retrieving authz state.`); // Renamed
+                 throw new InvalidClientError(`MCP Client not found: ${authzRequestState.mcpClientId}`);
              }
-             if (!client.redirect_uris.includes(pickerState.mcpRedirectUri)) {
-                  console.error(`[/initiate-session-from-db GET] Redirect URI mismatch. Client: ${client.redirect_uris}, Picker: ${pickerState.mcpRedirectUri}`);
-                 throw new InvalidRequestError("Redirect URI from picker session does not match client registration.");
+             if (!client.redirect_uris.includes(authzRequestState.mcpRedirectUri)) {
+                  console.error(`[/initiate-session-from-db GET] Redirect URI mismatch. Client: ${client.redirect_uris}, Authz: ${authzRequestState.mcpRedirectUri}`); // Renamed
+                 throw new InvalidRequestError("Redirect URI from authorization request does not match client registration.");
              }
-             // Assign scope from picker state to the client info we'll use
-             client.scope = pickerState.mcpScope;
+             // Assign scope from authz state to the client info we'll use
+             // This might be redundant if we rely solely on authzRequestState.scope later
+             // client.scope = authzRequestState.mcpScope;
 
             // --- Load Session Data --- Requires client info and dbPath
             if (!config.persistence?.directory) {
@@ -455,25 +464,26 @@ export function addOauthRoutesAndProvider(
                 throw new ServerError("Failed to load specified record."); // Or InvalidRequestError?
             }
 
-            // --- Update UserSession Object --- PKCE details etc.
-            loadedSession.mcpCodeChallenge = pickerState.mcpCodeChallenge;
-            loadedSession.mcpCodeChallengeMethod = pickerState.mcpCodeChallengeMethod;
-            // Ensure client info potentially updated with scope is on the session
-            loadedSession.mcpClientInfo = client;
+            // --- Update UserSession Object --- Assign the entire AuthzRequestState
+            loadedSession.authzRequestState = authzRequestState;
+            // Remove individual assignments:
+            // loadedSession.mcpCodeChallenge = authzRequestState.mcpCodeChallenge;
+            // loadedSession.mcpCodeChallengeMethod = authzRequestState.mcpCodeChallengeMethod;
+            // loadedSession.mcpRedirectUri = authzRequestState.mcpRedirectUri;
+            // Ensure client info is still on the session (might be needed elsewhere)
+            // loadedSession.mcpClientInfo = client; // Already done by loadSessionFromDb
 
             // --- Generate MCP Auth Code & Store Session --- 
             const mcpAuthCode = await oauthProvider.createAuthCode(loadedSession);
 
             console.log(`[/initiate-session-from-db GET] Session loaded from DB ${databaseId}. Adding to sessionsByMcpAuthCode with code ${mcpAuthCode.substring(0,8)}...`);
-            // The createAuthCode function already stored it in sessionsByMcpAuthCode
-            // sessionsByMcpAuthCode.set(mcpAuthCode, loadedSession);
 
             // --- Redirect back to MCP Client --- 
-            const redirectUrl = new URL(pickerState.mcpRedirectUri);
+            const redirectUrl = new URL(authzRequestState.mcpRedirectUri);
             redirectUrl.searchParams.set('code', mcpAuthCode);
-            if (pickerState.mcpState) redirectUrl.searchParams.set('state', pickerState.mcpState);
+            if (authzRequestState.mcpState) redirectUrl.searchParams.set('state', authzRequestState.mcpState);
 
-            console.log(`[/initiate-session-from-db GET] Success. Redirecting client ${pickerState.mcpClientId} to ${redirectUrl.toString()}`);
+            console.log(`[/initiate-session-from-db GET] Success. Redirecting client ${authzRequestState.mcpClientId} to ${redirectUrl.toString()}`);
             res.redirect(302, redirectUrl.toString());
 
         } catch (error: any) {
@@ -491,7 +501,7 @@ export function addOauthRoutesAndProvider(
             }
             
             // Try to redirect back to the MCP client with an error
-            const clientRedirectUriOnError = pickerState?.mcpRedirectUri; // Use optional chaining
+            const clientRedirectUriOnError = authzRequestState?.mcpRedirectUri; // Use optional chaining
             if (clientRedirectUriOnError && !res.headersSent) {
                 try {
                     const redirectUrl = new URL(clientRedirectUriOnError);
@@ -502,8 +512,8 @@ export function addOauthRoutesAndProvider(
                         redirectUrl.searchParams.set("error", "server_error");
                         redirectUrl.searchParams.set("error_description", "Failed to initialize session from stored record: " + (error?.message || 'Unknown error'));
                     }
-                    if (pickerState?.mcpState) { // Use optional chaining
-                        redirectUrl.searchParams.set("state", pickerState.mcpState);
+                    if (authzRequestState?.mcpState) { // Use optional chaining
+                        redirectUrl.searchParams.set("state", authzRequestState.mcpState);
                     }
                     
                     console.log(`[/initiate-session-from-db GET] Redirecting to client with error: ${redirectUrl.toString()}`);
@@ -530,44 +540,42 @@ export function addOauthRoutesAndProvider(
         }
     });
 
-    // Restore GET method, query params, and redirect logic
+    // Still uses authzRequestId from query param
     app.get('/initiate-new-ehr-flow', async (req, res) => {
          console.log("[/initiate-new-ehr-flow GET] Received request query:", req.query);
-         const pickerSessionId = req.query.pickerSessionId as string | undefined;
+         const authzRequestId = req.query.authzRequestId as string | undefined; // Renamed
 
-         if (!pickerSessionId || typeof pickerSessionId !== 'string') {
-            console.error("[/initiate-new-ehr-flow GET] Missing or invalid pickerSessionId query parameter.");
-            res.status(400).send("Missing or invalid pickerSessionId parameter.");
+         if (!authzRequestId || typeof authzRequestId !== 'string') {
+            console.error("[/initiate-new-ehr-flow GET] Missing or invalid authzRequestId query parameter."); // Renamed
+            res.status(400).send("Missing or invalid authzRequestId parameter."); // Renamed
             return;
          }
 
-         const pickerState = pickerSessions.get(pickerSessionId);
-         if (!pickerState) {
-              console.warn(`[/initiate-new-ehr-flow GET] Picker session not found or expired: ${pickerSessionId}`);
-             res.status(400).send("Invalid or expired picker session.");
+         const authzState = authzRequests.get(authzRequestId); // Renamed
+         if (!authzState) {
+              console.warn(`[/initiate-new-ehr-flow GET] Authz request state not found or expired: ${authzRequestId}`); // Renamed
+             res.status(400).send("Invalid or expired authorization request."); // Renamed
              return;
          }
          // Consume the state *after* validation
-         pickerSessions.delete(pickerSessionId);
-         console.log(`[/initiate-new-ehr-flow GET] Starting flow for picker session ${pickerSessionId}, client ${pickerState.mcpClientId}`);
-         // Optional: Add expiry check if PickerSessionState has expiry
-         // if (pickerState.expiresAt < Date.now()) { ... }
+         authzRequests.delete(authzRequestId); // Renamed
+         console.log(`[/initiate-new-ehr-flow GET] Starting flow for authz request ${authzRequestId}, client ${authzState.mcpClientId}`); // Renamed
 
          try {
              cleanupExpiredState(); // Clean up any other expired states first
              const authFlowId = uuidv4();
-             const flowState: AuthFlowState = {
+             const flowState: AuthFlowState = { // Keep AuthFlowState for cookie-based linking
                  authFlowId: authFlowId,
-                 mcpClientId: pickerState.mcpClientId,
-                 mcpRedirectUri: pickerState.mcpRedirectUri,
-                 mcpCodeChallenge: pickerState.mcpCodeChallenge,
-                 mcpCodeChallengeMethod: pickerState.mcpCodeChallengeMethod,
-                 mcpState: pickerState.mcpState,
-                 mcpScope: pickerState.mcpScope,
+                 mcpClientId: authzState.mcpClientId,
+                 mcpRedirectUri: authzState.mcpRedirectUri,
+                 mcpCodeChallenge: authzState.mcpCodeChallenge,
+                 mcpCodeChallengeMethod: authzState.mcpCodeChallengeMethod,
+                 mcpState: authzState.mcpState,
+                 mcpScope: authzState.mcpScope,
                  createdAt: Date.now(),
              };
              authFlowStates.set(authFlowId, flowState);
-             console.log(`[/initiate-new-ehr-flow GET] Created auth flow state ${authFlowId} for client ${pickerState.mcpClientId}.`);
+             console.log(`[/initiate-new-ehr-flow GET] Created auth flow state ${authFlowId} for client ${authzState.mcpClientId}.`);
 
              res.setHeader('Set-Cookie', cookie.serialize(AUTH_FLOW_COOKIE_NAME, authFlowId, {
                  httpOnly: true,
@@ -582,7 +590,7 @@ export function addOauthRoutesAndProvider(
              res.redirect(302, retrieverUrl); // Use 302 for redirect
 
          } catch (error: any) {
-            console.error(`[/initiate-new-ehr-flow GET] Error initiating new EHR flow for picker session ${pickerSessionId}:`, error);
+            console.error(`[/initiate-new-ehr-flow GET] Error initiating new EHR flow for authz request ${authzRequestId}:`, error);
             // Generic error back to browser if something unexpected happens
              if (!res.headersSent) {
                  res.status(500).send("Internal server error initiating EHR flow.");
@@ -654,9 +662,21 @@ export function addOauthRoutesAndProvider(
                  persistenceDir // Pass potentially undefined string
              );
 
-             // Store PKCE challenge details directly on the session object
-             newSession.mcpCodeChallenge = flowState.mcpCodeChallenge;
-             newSession.mcpCodeChallengeMethod = flowState.mcpCodeChallengeMethod;
+             // Construct and store the AuthzRequestState on the session
+             const authzStateForSession: AuthzRequestState = {
+                 authzRequestId: flowState.authFlowId, // Use authFlowId as the original ID is gone
+                 mcpClientId: flowState.mcpClientId,
+                 mcpRedirectUri: flowState.mcpRedirectUri,
+                 mcpCodeChallenge: flowState.mcpCodeChallenge,
+                 mcpCodeChallengeMethod: flowState.mcpCodeChallengeMethod,
+                 mcpState: flowState.mcpState,
+                 mcpScope: flowState.mcpScope,
+                 createdAt: flowState.createdAt // Reflects start of auth flow
+             };
+             newSession.authzRequestState = authzStateForSession;
+             // newSession.mcpCodeChallenge = flowState.mcpCodeChallenge;
+             // newSession.mcpCodeChallengeMethod = flowState.mcpCodeChallengeMethod;
+             // newSession.mcpRedirectUri = flowState.mcpRedirectUri;
 
              const mcpAuthCode = await oauthProvider.createAuthCode(newSession);
 
@@ -709,32 +729,48 @@ export function addOauthRoutesAndProvider(
 
             if (grant_type === AuthGrantType.AuthorizationCode) {
                 if (!code || typeof code !== 'string') return next(new InvalidRequestError('Missing authorization code.'));
-                // if (!redirect_uri || typeof redirect_uri !== 'string') return next(new InvalidRequestError('Missing redirect_uri.'));
-                // if (!client.redirect_uris.includes(redirect_uri)) {
-                //      console.error(`[/token POST] Redirect URI mismatch for client ${client.client_id}. Provided: ${redirect_uri}, Allowed: ${client.redirect_uris}`);
-                //     return next(new InvalidRequestError('Invalid redirect_uri.'));
-                // }
-
 
                 if (!code_verifier || typeof code_verifier !== 'string') return next(new InvalidRequestError('Missing PKCE code_verifier.'));
                 const session = await oauthProvider.getSessionByAuthCode(code);
-                if (!session) {
-                    console.warn(`[/token POST] Invalid or expired authorization code: ${code.substring(0,8)}...`);
+                if (!session || !session.authzRequestState) { // Check for session and state
+                    console.warn(`[/token POST] Invalid or expired authorization code (or missing state): ${code.substring(0,8)}...`);
                     return next(new InvalidGrantError('Invalid or expired authorization code.'));
                 }
-                if (session.mcpClientInfo.client_id !== client.client_id) {
-                      console.error(`[/token POST] Client ID mismatch! Token requested by ${client.client_id}, but code belongs to ${session.mcpClientInfo.client_id}.`);
-                     await oauthProvider.revokeToken(client, { token: session.sessionId });
+                // Verify client ID against the one stored in the authz request state
+                if (session.authzRequestState.mcpClientId !== client.client_id) {
+                      console.error(`[/token POST] Client ID mismatch! Token requested by ${client.client_id}, but code belongs to client ${session.authzRequestState.mcpClientId}.`);
+                     // Session is consumed by getSessionByAuthCode, just deny grant
                      return next(new InvalidGrantError('Client ID does not match the authorization code grant.'));
                  }
 
+                 // --- Conditional Redirect URI Verification ---
+                 const skipRedirectUriCheck = config.security.disableClientChecks;
+                 // Access redirect URI from authzRequestState
+                 const originalRedirectUri = session.authzRequestState.mcpRedirectUri;
+                 if (!skipRedirectUriCheck && originalRedirectUri) {
+                     if (!redirect_uri) {
+                          console.error(`[/token POST] Missing redirect_uri in token request, required because present in authz request for client ${client.client_id}.`);
+                          return next(new InvalidGrantError('Missing redirect_uri parameter, required because it was present in the authorization request.'));
+                     }
+                     if (redirect_uri !== originalRedirectUri) {
+                          console.error(`[/token POST] Redirect URI mismatch for client ${client.client_id}. Provided: ${redirect_uri}, Expected: ${originalRedirectUri}`);
+                          return next(new InvalidGrantError('Invalid redirect_uri: Does not match the one used in the authorization request.'));
+                     }
+                      console.log(`[/token POST] Redirect URI verified successfully for client ${client.client_id}.`);
+                 } else if (originalRedirectUri) {
+                      console.log(`[/token POST] Skipping redirect_uri check for client ${client.client_id} due to config.`);
+                 } else {
+                      console.log(`[/token POST] No redirect_uri check needed for client ${client.client_id} as it wasn't in the original auth request.`);
+                 }
+
                  // --- PKCE Verification using crypto ---
-                 const challenge = session.mcpCodeChallenge;
-                 const method = session.mcpCodeChallengeMethod || PKCE_METHOD_S256;
+                 // Access challenge and method from authzRequestState
+                 const challenge = session.authzRequestState.mcpCodeChallenge;
+                 const method = session.authzRequestState.mcpCodeChallengeMethod || PKCE_METHOD_S256;
 
                  if (!challenge) {
-                     console.error(`[/token POST] Missing code_challenge in session for client ${client.client_id}. PKCE was required.`);
-                      await oauthProvider.revokeToken(client, { token: session.sessionId });
+                     console.error(`[/token POST] Missing code_challenge in session authz state for client ${client.client_id}. PKCE was required.`);
+                     // Don't revoke token as it wasn't issued, just deny grant
                      return next(new InvalidGrantError('PKCE challenge failed: Challenge missing from authorization request.'));
                  }
 
@@ -749,25 +785,25 @@ export function addOauthRoutesAndProvider(
                                                    .replace(/=+$/, ''); // Remove trailing =
                     } catch (pkceError) {
                         console.error(`[/token POST] Error generating PKCE challenge from verifier:`, pkceError);
-                         await oauthProvider.revokeToken(client, { token: session.sessionId });
+                        // Don't revoke token, just deny grant
                         return next(new InvalidGrantError('PKCE challenge failed: Error during verification.'));
                     }
                  } else {
-                     console.error(`[/token POST] Unsupported PKCE method found in session: ${method}`);
-                     await oauthProvider.revokeToken(client, { token: session.sessionId });
+                     console.error(`[/token POST] Unsupported PKCE method found in session authz state: ${method}`);
+                     // Don't revoke token, just deny grant
                      return next(new InvalidGrantError('PKCE challenge failed: Unsupported method.'));
                  }
 
                  console.log(`[/token POST] PKCE Check. Stored: ${challenge}, Derived: ${calculatedChallenge}`);
                  if (challenge !== calculatedChallenge) {
                       console.error(`[/token POST] PKCE challenge mismatch for client ${client.client_id}.`);
-                      await oauthProvider.revokeToken(client, { token: session.sessionId });
+                      // Don't revoke token, just deny grant
                      return next(new InvalidGrantError('PKCE challenge failed: Verifier does not match challenge.'));
                  }
                  console.log(`[/token POST] PKCE verification successful for client ${client.client_id}.`);
 
-                // Use 'scopes'
-                const tokenInfo = await oauthProvider.createToken(session, client.client_id, session.mcpClientInfo.scope);
+                // Use 'scopes' from authzRequestState
+                const tokenInfo = await oauthProvider.createToken(session, client.client_id, session.authzRequestState.mcpScope);
 
                 // Remove expires_in from response
                 res.json({

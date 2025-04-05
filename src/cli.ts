@@ -23,7 +23,8 @@ import { sqliteToEhr, ehrToSqlite } from './dbUtils.js'; // Assumes dbUtils.ts i
 import {
     GrepRecordInputSchema, QueryRecordInputSchema, EvalRecordInputSchema, grepRecordLogic,
     queryRecordLogic,
-    evalRecordLogic
+    evalRecordLogic,
+    registerEhrTools
 } from './tools.js'; // Assumes tools.ts is in src/
 
 // --- Server Info ---
@@ -329,78 +330,18 @@ async function main() {
 
         // --- Register Tools (Using Imported Logic) ---
 
-        server.tool(
-            "grep_record",
-            GrepRecordInputSchema.shape,
-            async (args) => {
-                console.error(`[TOOL grep_record] Received request. Query: "${args.query}", Types: ${args.resource_types?.join(',') || 'All'}`);
-                try {
-                    // Call the imported logic function which now handles truncation
-                    const resultString = await grepRecordLogic(fullEhr, args.query, args.resource_types);
+        // Context retrieval function for CLI stdio environment
+        async function getCliContext(
+            toolName: 'grep_record' | 'query_record' | 'eval_record',
+            extra?: Record<string, any> 
+        ): Promise<{ fullEhr?: ClientFullEHR, db?: Database }> {
+             // In CLI stdio mode, db and fullEhr are pre-loaded in the outer scope
+             // We don't need 'extra' here
+             return { fullEhr, db };
+        }
 
-                    // Determine if the result indicates an error
-                    const isError = resultString.includes('"error":');
-
-                    // Directly return the string from the logic function
-                    return { content: [{ type: "text", text: resultString }], isError: isError };
-                } catch (error: any) { // Catch unexpected errors
-                    console.error(`[TOOL grep_record] Unexpected error in handler:`, error.message);
-                    const errorResult = JSON.stringify({ error: `Internal server error during handler execution: ${error.message}` });
-                    return { content: [{ type: "text", text: errorResult }], isError: true };
-                }
-            }
-        );
-
-        server.tool(
-            "query_record",
-            QueryRecordInputSchema.shape,
-            async (args) => {
-                console.error(`[TOOL query_record] Received request. SQL: ${args.sql.substring(0, 100)}...`);
-                // Ensure DB is defined before proceeding
-                if (!db) {
-                     console.error(`[TOOL query_record] Error: Database connection is not available.`);
-                     const errorResult = JSON.stringify({ error: "Database connection is not available." });
-                     return { content: [{ type: "text", text: errorResult }], isError: true };
-                }
-                try {
-                    // Call the imported logic function which now handles truncation
-                    const resultString = await queryRecordLogic(db, args.sql);
-
-                    // Determine if the result indicates an error
-                    const isError = resultString.includes('"error":');
-
-                    // Directly return the string from the logic function
-                    return { content: [{ type: "text", text: resultString }], isError: isError };
-                } catch (error: any) { // Catch unexpected errors
-                    console.error(`[TOOL query_record] Unexpected error in handler:`, error.message);
-                    const errorResult = JSON.stringify({ error: `Internal server error during handler execution: ${error.message}` });
-                    return { content: [{ type: "text", text: errorResult }], isError: true };
-                }
-            }
-        );
-
-        server.tool(
-            "eval_record",
-            EvalRecordInputSchema.shape,
-            async (args) => {
-                console.error(`[TOOL eval_record] Received request. Code length: ${args.code.length}`);
-                try {
-                    // Call the imported logic function which now handles truncation and errors
-                    const resultString = await evalRecordLogic(fullEhr, args.code);
-
-                    // Determine if the result indicates an error
-                    const isError = resultString.includes('"error":') || resultString.includes('Execution Error:');
-
-                    // Directly return the string from the logic function
-                    return { content: [{ type: "text", text: resultString }], isError: isError };
-
-                } catch (error: any) { // Catch unexpected errors
-                    console.error(`[TOOL eval_record] Unexpected error in handler:`, error.message);
-                    const errorResult = JSON.stringify({ error: `Internal server error during handler execution: ${error.message}` });
-                    return { content: [{ type: "text", text: errorResult}], isError: true };
-                }
-            }
-        );
+        // Register tools using the centralized function
+        registerEhrTools(server, getCliContext);
 
         // --- Start Stdio Transport ---
         const transport = new StdioServerTransport();

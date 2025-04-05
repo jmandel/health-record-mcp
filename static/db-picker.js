@@ -20,15 +20,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 1. Extract Picker Session ID from the current URL
     const currentUrlParams = new URLSearchParams(window.location.search);
-    const pickerSessionId = currentUrlParams.get('pickerSessionId');
+    const authzRequestId = currentUrlParams.get('authzRequestId');
 
-    if (!pickerSessionId) {
-        displayError("Missing pickerSessionId in URL.");
+    if (!authzRequestId) {
+        displayError("Missing authzRequestId in URL.");
         return;
     }
-    console.log("[DB Picker] Picker Session ID:", pickerSessionId);
+    console.log("[DB Picker] Picker Session ID:", authzRequestId);
 
-    // Helper to build URL with parameters (Only takes pickerSessionId now for new flows)
+    // Helper to build URL with parameters (Only takes authzRequestId now for new flows)
     function buildUrl(baseUrl, params) {
         const url = new URL(baseUrl, window.location.origin);
         Object.entries(params).forEach(([key, value]) => {
@@ -71,10 +71,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 `;
                 tile.addEventListener('click', () => {
                     console.log(`[DB Picker] Tile clicked for DB ID: ${record.databaseId}`);
-                    // Redirect to initiate-session-from-db with dbId and pickerSessionId
+                    // Redirect to initiate-session-from-db with dbId and authzRequestId
                     const targetUrl = buildUrl('/initiate-session-from-db', {
                         databaseId: record.databaseId,
-                        pickerSessionId: pickerSessionId // Pass only the picker session ID
+                        authzRequestId // Pass only the picker session ID
                     });
                     console.log("[DB Picker] Redirecting to:", targetUrl);
                     window.location.href = targetUrl;
@@ -96,7 +96,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             try {
                  // Redirect to the new backend endpoint to handle this flow
                  const targetUrl = buildUrl('/initiate-new-ehr-flow', {
-                     pickerSessionId: pickerSessionId // Pass only the picker session ID
+                     authzRequestId // Pass only the picker session ID
                  });
                  console.log("[DB Picker] Redirecting to initiate new EHR flow:", targetUrl);
                  window.location.href = targetUrl;

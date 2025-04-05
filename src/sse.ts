@@ -18,21 +18,15 @@ import { Command } from 'commander';
 import path from 'path'; // Import path module
 
 // --- Local Imports ---
-import { AppConfig, loadConfig } from './src/config.ts'; 
-import { addOauthRoutesAndProvider } from './src/oauth.ts'; 
-import { getSessionDb, loadSessionFromDb, activeSessions, activeSseTransports } from './src/sessionUtils.js'; // Import session/DB utils and state
+import { ClientFullEHR } from '../clientTypes.js'; // Import ClientFullEHR
+import { AppConfig, loadConfig } from './config.ts'; 
+import { addOauthRoutesAndProvider } from './oauth.ts'; 
+import { getSessionDb, loadSessionFromDb, activeSessions, activeSseTransports } from './sessionUtils.js'; // Import session/DB utils and state
 import {
-    EvalRecordInputSchema,
-    evalRecordLogic,
-    GrepRecordInputSchema,
-    grepRecordLogic,
-    QueryRecordInputSchema,
-    queryRecordLogic
-} from './src/tools.js'; // Import from the new file
+    registerEhrTools // Import the new function
+} from './tools.js'; 
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
-
 
 // --- Add Type Declaration for req.auth ---
 declare module "express-serve-static-core" {
@@ -53,97 +47,43 @@ const mcpServer = new McpServer(SERVER_INFO);
 
 // --- Register Tools ---
 
-mcpServer.tool(
-    "grep_record",
-    GrepRecordInputSchema.shape,
-    async (args, extra) => {
-        const transportSessionId = extra.sessionId;
-        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
-        const transportEntry = activeSseTransports.get(transportSessionId);
-        if (!transportEntry) throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
-        const mcpAccessToken = transportEntry.mcpAccessToken;
-        const session = activeSessions.get(mcpAccessToken);
-        if (!session || !session.fullEhr) throw new McpError(ErrorCode.InternalError, "Session data (fullEhr) not found for active connection.");
-        console.log(`[TOOL grep_record] Session found for token ${mcpAccessToken.substring(0,8)}...`);
-
-        try {
-            // Call the imported logic function which now handles truncation
-            const resultString = await grepRecordLogic(session.fullEhr, args.query, args.resource_types);
-
-            // Determine if the result indicates an error (e.g., contains '"error":')
-            const isError = resultString.includes('"error":');
-
-            // Directly return the string from the logic function
-            return { content: [{ type: "text", text: resultString }], isError: isError };
-        } catch (error: any) { // Catch errors from session finding or *unexpected* logic errors
-            console.error(`[TOOL grep_record] Unexpected error in handler:`, error);
-            const errorResult = JSON.stringify({ error: `Internal server error during handler execution: ${error.message}` });
-            return { content: [{ type: "text", text: errorResult }], isError: true };
-        }
+// Context retrieval function for SSE environment
+async function getSseContext(
+    toolName: 'grep_record' | 'query_record' | 'eval_record',
+    extra?: Record<string, any>
+): Promise<{ fullEhr?: ClientFullEHR, db?: Database }> {
+    const transportSessionId = extra?.sessionId as string | undefined;
+    if (!transportSessionId) {
+        throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
     }
-);
-
-mcpServer.tool(
-    "query_record",
-    QueryRecordInputSchema.shape,
-    async (args, extra) => {
-        const transportSessionId = extra.sessionId;
-        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
-        const transportEntry = activeSseTransports.get(transportSessionId);
-        if (!transportEntry) throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
-        const mcpAccessToken = transportEntry.mcpAccessToken;
-        const session = activeSessions.get(mcpAccessToken);
-        if (!session) throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
-
-        try {
-            // Ensure DB is available (potentially initializing/loading)
-            const db = await getSessionDb(session); // Use the helper to get the validated DB handle
-
-            // Call the imported logic function which now handles truncation
-            const resultString = await queryRecordLogic(db, args.sql);
-
-            // Determine if the result indicates an error
-            const isError = resultString.includes('"error":');
-
-            // Directly return the string from the logic function
-            return { content: [{ type: "text", text: resultString }], isError: isError };
-        } catch (error: any) { // Catch errors from session/DB getting or *unexpected* logic errors
-            console.error(`[TOOL query_record] Error executing logic or getting DB:`, error);
-            const errorResult = JSON.stringify({ error: `Internal server error during handler execution: ${error.message}` });
-            return { content: [{ type: "text", text: errorResult }], isError: true };
-        }
+    const transportEntry = activeSseTransports.get(transportSessionId);
+    if (!transportEntry) {
+        throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
     }
-);
-
-mcpServer.tool(
-    "eval_record",
-    EvalRecordInputSchema.shape,
-    async (args, extra) => {
-         const transportSessionId = extra.sessionId;
-        if (!transportSessionId) throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
-         const transportEntry = activeSseTransports.get(transportSessionId);
-        if (!transportEntry) throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
-         const mcpAccessToken = transportEntry.mcpAccessToken;
-         const session = activeSessions.get(mcpAccessToken);
-        if (!session || !session.fullEhr) throw new McpError(ErrorCode.InternalError, "Session data (fullEhr) not found for active connection.");
-
-        try {
-            // Call the imported logic function which now handles truncation and errors
-            const resultString = await evalRecordLogic(session.fullEhr, args.code);
-
-            // Determine if the result indicates an error (contains "Execution Error:" or other "error": key)
-            const isError = resultString.includes('"error":') || resultString.includes('Execution Error:');
-
-            // Directly return the string from the logic function
-            return { content: [{ type: "text", text: resultString }], isError: isError };
-
-        } catch (error: any) { // Catch unexpected errors during the handler itself
-             console.error(`[TOOL eval_record] Unexpected error in handler:`, error);
-              const errorResult = JSON.stringify({ error: `Internal server error during handler execution: ${error.message}` });
-              return { content: [{ type: "text", text: errorResult}], isError: true };
-        }
+    const mcpAccessToken = transportEntry.mcpAccessToken;
+    const session = activeSessions.get(mcpAccessToken);
+    if (!session) {
+        throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
     }
-);
+
+    let db: Database | undefined = undefined;
+    let fullEhr: ClientFullEHR | undefined = undefined;
+
+    if (toolName === 'query_record') {
+        db = await getSessionDb(session); // Handles DB loading/creation
+    } else {
+        // grep and eval need fullEhr
+        if (!session.fullEhr) {
+            throw new McpError(ErrorCode.InternalError, "Session data (fullEhr) not found for active connection.");
+        }
+        fullEhr = session.fullEhr;
+    }
+
+    return { fullEhr, db };
+}
+
+// Register tools using the centralized function
+registerEhrTools(mcpServer, getSseContext);
 
 // --- Express Server Setup ---
 const app = express();

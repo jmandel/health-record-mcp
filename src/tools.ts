@@ -3,6 +3,8 @@ import { z } from 'zod';
 import _ from 'lodash';
 import { Database } from 'bun:sqlite';
 import vm from 'vm';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 
 import { ClientFullEHR } from '../clientTypes.js'; // Import using relative path
 
@@ -416,4 +418,87 @@ export async function evalRecordLogic(
     // Truncate the final compiled output if needed
     const finalData = truncateIfNeeded(finalOutput, MAX_EVAL_JSON_LENGTH, 'eval');
     return JSON.stringify(finalData, null, 2);
+}
+
+/**
+ * Registers the standard EHR interaction tools (grep, query, eval) with an McpServer instance.
+ * This function abstracts the context retrieval (finding EHR data and DB connection)
+ * to allow reuse in different server environments (e.g., SSE, CLI).
+ *
+ * @param mcpServer The McpServer instance to register tools with.
+ * @param getContext A function that resolves the necessary context (fullEhr, db) based on the tool name and optional extra data (like session ID).
+ */
+export function registerEhrTools(
+    mcpServer: McpServer,
+    getContext: (
+        toolName: 'grep_record' | 'query_record' | 'eval_record',
+        extra?: Record<string, any>
+    ) => Promise<{ fullEhr?: ClientFullEHR, db?: Database }>
+): void {
+
+    mcpServer.tool(
+        "grep_record",
+        GrepRecordInputSchema.shape,
+        async (args, extra) => {
+            try {
+                const { fullEhr } = await getContext("grep_record", extra);
+                if (!fullEhr) {
+                    throw new McpError(ErrorCode.InternalError, "EHR data context not found for this session/request.");
+                }
+                console.error(`[TOOL grep_record] Context retrieved. Query: "${args.query}", Types: ${args.resource_types?.join(',') || 'All'}`);
+                const resultString = await grepRecordLogic(fullEhr, args.query, args.resource_types);
+                const isError = resultString.includes('"error":');
+                return { content: [{ type: "text", text: resultString }], isError: isError };
+            } catch (error: any) {
+                console.error(`[TOOL grep_record] Error during context retrieval or execution:`, error);
+                const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+                const errorResult = JSON.stringify({ error: errorMessage });
+                return { content: [{ type: "text", text: errorResult }], isError: true };
+            }
+        }
+    );
+
+    mcpServer.tool(
+        "query_record",
+        QueryRecordInputSchema.shape,
+        async (args, extra) => {
+            try {
+                const { db } = await getContext("query_record", extra);
+                if (!db) {
+                    throw new McpError(ErrorCode.InternalError, "Database context not found for this session/request.");
+                }
+                console.error(`[TOOL query_record] Context retrieved. SQL: ${args.sql.substring(0, 100)}...`);
+                const resultString = await queryRecordLogic(db, args.sql);
+                const isError = resultString.includes('"error":');
+                return { content: [{ type: "text", text: resultString }], isError: isError };
+            } catch (error: any) {
+                console.error(`[TOOL query_record] Error during context retrieval or execution:`, error);
+                 const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+                const errorResult = JSON.stringify({ error: errorMessage });
+                return { content: [{ type: "text", text: errorResult }], isError: true };
+            }
+        }
+    );
+
+    mcpServer.tool(
+        "eval_record",
+        EvalRecordInputSchema.shape,
+        async (args, extra) => {
+            try {
+                const { fullEhr } = await getContext("eval_record", extra);
+                 if (!fullEhr) {
+                     throw new McpError(ErrorCode.InternalError, "EHR data context not found for this session/request.");
+                 }
+                console.error(`[TOOL eval_record] Context retrieved. Code length: ${args.code.length}`);
+                const resultString = await evalRecordLogic(fullEhr, args.code);
+                const isError = resultString.includes('"error":') || resultString.includes('Execution Error:');
+                return { content: [{ type: "text", text: resultString }], isError: isError };
+            } catch (error: any) {
+                console.error(`[TOOL eval_record] Error during context retrieval or execution:`, error);
+                 const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+                const errorResult = JSON.stringify({ error: errorMessage });
+                return { content: [{ type: "text", text: errorResult }], isError: true };
+            }
+        }
+    );
 }

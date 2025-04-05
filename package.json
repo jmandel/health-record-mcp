@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "start": "bun run index.ts",
+    "start": "bun run src/sse.ts",
     "build:ehretriever": "bun run ./scripts/build-ehretriever.ts"
   },
   "dependencies": {

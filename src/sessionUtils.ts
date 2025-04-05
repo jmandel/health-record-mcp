@@ -11,6 +11,7 @@ import {
 } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import type { AuthzRequestState } from './oauth'; // Import the renamed type
 
 // --- Session and State Types ---
 
@@ -20,6 +21,7 @@ export interface UserSession {
     sessionId: string;
     // Information about the MCP client that initiated the session
     mcpClientInfo: OAuthClientInformationFull; // Use the imported type
+    authzRequestState?: AuthzRequestState; // Store the state from the original /authorize request
     // Full EHR data loaded into memory
     fullEhr?: ClientFullEHR;
     // Path to the SQLite file (if persisted)
@@ -30,9 +32,7 @@ export interface UserSession {
     createdAt: number;
     // ID of the active transport connection, if any
     transportSessionId?: string;
-    // Add PKCE challenge details needed for token exchange verification
-    mcpCodeChallenge?: string;
-    mcpCodeChallengeMethod?: string;
+    ehrData?: ClientFullEHR; // Store the raw EHR data (optional)
 }
 
 export interface ActiveTransportEntry {

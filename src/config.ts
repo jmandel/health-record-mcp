@@ -21,8 +21,8 @@ const ServerConfigSchema = z.object({
     https: z.object({
         enabled: z.boolean(),
         certPath: z.string().optional(),
-        keyPath: z.string().optional()
-    })
+        keyPath: z.string().optional(),
+    }),
 });
 
 const PersistenceConfigSchema = z.object({
