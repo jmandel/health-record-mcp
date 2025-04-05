@@ -321,7 +321,10 @@ export async function processFhirAttachments(
                         if (result.mode === 'html') {
                             console.log(`[DATA:ATTACHMENT Process] RTF contained HTML, converting to text.`);
                             try {
-                                contentPlaintext = htmlToText(result.text.toString(), { wordwrap: false });
+                                contentPlaintext = htmlToText(result.text.toString(), { 
+                                    wordwrap: false,
+                                    selectors: [{ selector: 'img', format: 'skip' }] 
+                                });
                             } catch (htmlErr) {
                                 console.error(`[DATA:ATTACHMENT Process] HTML parsing error after RTF extraction in ${resourceType}/${resourceId} at ${path}:`, htmlErr);
                                 contentPlaintext = '[Error parsing HTML from RTF]';
@@ -339,7 +342,10 @@ export async function processFhirAttachments(
                     }
                 } else if (finalContentType.startsWith('text/html')) {
                     try {
-                        contentPlaintext = htmlToText(contentRaw.toString('utf8'), { wordwrap: false });
+                        contentPlaintext = htmlToText(contentRaw.toString('utf8'), { 
+                            wordwrap: false,
+                            selectors: [{ selector: 'img', format: 'skip' }] 
+                        });
                     } catch (htmlErr) {
                         console.error(`[DATA:ATTACHMENT Process] HTML parsing error in ${resourceType}/${resourceId} at ${path}:`, htmlErr);
                         contentPlaintext = '[Error parsing HTML]';

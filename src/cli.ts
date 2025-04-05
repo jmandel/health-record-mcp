@@ -76,11 +76,8 @@ async function startEhrFetchServer(
         // 2. Initial endpoint to start the flow
         app.get('/start', (req, res) => {
             console.error('[Server] /start requested. Redirecting to retriever UI...');
-            // The retriever UI needs a redirect URI for its *own* auth flow.
             // This CLI server provides a placeholder for that.
-            const retrieverRedirectUri = `http://localhost:${port}/ehr-callback-placeholder`;
-            // The #deliver-to: tells the retriever where to POST the final data.
-            const retrieverUrl = `/static/ehretriever.html?redirectUri=${encodeURIComponent(retrieverRedirectUri)}#deliver-to:cli-callback`;
+            const retrieverUrl = `/static/ehretriever.html#deliver-to:cli-callback`;
             res.redirect(retrieverUrl);
         });
 
@@ -187,6 +184,9 @@ async function main() {
         .option('--create-db', 'Initiate EHR fetch via browser UI and save to the --db path.')
         .option('-c, --config <path>', 'Optional path to config file (used by retriever build in --create-db mode).')
         .option('--port <port>', 'Port for the temporary web server (for --create-db).', '8088')
+        // Add new mutually exclusive flags for handling existing DB in --create-db mode
+        .option('--force-overwrite', 'If --db exists in --create-db mode, delete it before creating a new one.')
+        .option('--force-concat', 'If --db exists in --create-db mode, add new data to the existing file.')
         .parse(process.argv);
 
     const options = program.opts();
@@ -201,6 +201,42 @@ async function main() {
              console.error('[CLI] Error: Invalid port number provided.');
              process.exit(1);
         }
+
+        // --- Upfront check for existing DB file ---
+        try {
+            await fs.access(dbPath); // Check if file exists (throws if not)
+            console.warn(`[CLI] Database file "${dbPath}" already exists.`);
+            if (options.forceOverwrite && options.forceConcat) {
+                console.error('[CLI] Error: --force-overwrite and --force-concat cannot be used together.');
+                process.exit(1);
+            } else if (options.forceOverwrite) {
+                console.warn(`[CLI] --force-overwrite specified. Deleting existing file: ${dbPath}`);
+                try {
+                    await fs.unlink(dbPath);
+                    console.error(`[CLI] Successfully deleted existing file.`);
+                } catch (unlinkError: any) {
+                    console.error(`[CLI] Error deleting existing file "${dbPath}": ${unlinkError.message}`);
+                    process.exit(1);
+                }
+            } else if (options.forceConcat) {
+                console.warn(`[CLI] --force-concat specified. New data will be added to the existing file.`);
+                // No action needed here, the database will be opened and appended to later.
+            } else {
+                console.error(`[CLI] Error: Database file "${dbPath}" already exists.`);
+                console.error('[CLI] Use --force-overwrite to delete it or --force-concat to add to it.');
+                process.exit(1);
+            }
+        } catch (accessError: any) {
+            if (accessError.code === 'ENOENT') {
+                // File doesn't exist, which is the normal case, proceed silently.
+                console.error(`[CLI] Database file "${dbPath}" does not exist, will be created.`);
+            } else {
+                // Other access error (e.g., permissions)
+                console.error(`[CLI] Error checking database path "${dbPath}": ${accessError.message}`);
+                process.exit(1);
+            }
+        }
+        // --- End upfront check ---
 
         // --- Dynamically build ehretriever.ts for CLI mode ---
 

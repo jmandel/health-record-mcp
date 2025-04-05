@@ -395,7 +395,10 @@ export async function processAttachmentData(fetchResultData: Blob, task: FetchTa
         if (contentType.startsWith('text/html')) {
              try {
                  const htmlContent = await blob.text();
-                 contentPlaintext = htmlToText(htmlContent, { wordwrap: false });
+                 contentPlaintext = htmlToText(htmlContent, { 
+                     wordwrap: false,
+                     selectors: [{ selector: 'img', format: 'skip' }] 
+                 });
              } catch (htmlErr) {
                  console.error(`[ATTACHMENT:HTML] HTML parsing error in ${task.resourceType}/${task.resourceId} at ${task.attachmentPath}:`, htmlErr);
                  contentPlaintext = '[Error parsing HTML]';
@@ -477,7 +480,10 @@ function processInlineAttachments(clientFullEhr: ClientFullEHR): void {
                                  if (decodedText !== null) {
                                      if (contentType.startsWith('text/html')) {
                                         try {
-                                            contentPlaintext = htmlToText(decodedText, { wordwrap: false });
+                                            contentPlaintext = htmlToText(decodedText, { 
+                                                wordwrap: false,
+                                                selectors: [{ selector: 'img', format: 'skip' }] 
+                                            });
                                         } catch (htmlErr) {
                                             console.error(`[INLINE:HTML] HTML parsing error for inline ${resource.resourceType}/${resource.id} at ${path}:`, htmlErr);
                                             contentPlaintext = '[Error parsing inline HTML]';

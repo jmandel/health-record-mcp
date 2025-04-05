@@ -15,7 +15,7 @@ const MAX_QUERY_ROWS = 500; // Limit rows for query results before stringificati
 // --- Tool Schemas ---
 
 export const GrepRecordInputSchema = z.object({
-    query: z.string().min(1).describe("The text string or JavaScript-style regular expression to search for (case-insensitive). Example: 'heart attack|myocardial infarction|mi'"),
+    query: z.string().min(1).describe("The text string or JavaScript-style regular expression to search for (case-insensitive). Example: 'heart attack|myocardial infarction|mi'. Best for finding specific text/keywords or variations across *all* record parts (FHIR+notes). Use regex with `|` for related terms (e.g., `'diabetes|diabetic'`)."),
     resource_types: z.array(z.string()).optional().describe(
         `Optional list to filter the search scope. Supports FHIR resource type names (e.g., "Patient", "Observation") and the special keyword "Attachment".
         Behavior based on the list:
@@ -44,11 +44,11 @@ export const GrepRecordOutputSchema = z.object({
     resources_matched_count: z.number().int().describe("Number of unique FHIR resources matched."),
     attachments_matched_count: z.number().int().describe("Number of unique attachments matched."),
     error: z.string().optional().describe("Error message if truncation failed or result is still too large.")
-}).describe("Results of the text search across the patient's record using a case-insensitive string or JavaScript-style regular expression, returning full matching resources or attachment text.");
+}).describe("Results of the text search across the patient's record using a case-insensitive string or JavaScript-style regular expression, returning full matching resources or attachment text. Use for initial exploration or finding mentions in unstructured text. May require follow-up with Query/Eval for structured data.");
 
 
 export const QueryRecordInputSchema = z.object({
-    sql: z.string().min(1).describe("The read-only SQL SELECT statement to execute against the in-memory FHIR data. FHIR resources are stored in the 'fhir_resources' table with columns 'resource_type', 'resource_id', and 'json'. For example, 'SELECT json FROM fhir_resources WHERE resource_type = \"Patient\"' or 'SELECT json FROM fhir_resources WHERE resource_type = \"Observation\" AND json LIKE \"%diabetes%\"'.")
+    sql: z.string().min(1).describe("The read-only SQL SELECT statement to execute against the in-memory FHIR data. FHIR resources are stored in the 'fhir_resources' table with columns 'resource_type', 'resource_id', and 'json'. For example, 'SELECT json FROM fhir_resources WHERE resource_type = \"Patient\"' or 'SELECT json FROM fhir_resources WHERE resource_type = \"Observation\" AND json LIKE \"%diabetes%\"'. Best for precisely selecting specific FHIR resources or fields using known structure (e.g., Observations by LOINC). Limited to structured FHIR data.")
 });
 export const QueryRecordOutputSchema = z.union([
     z.array(z.record(z.unknown())).describe("An array of rows returned by the SQL query. Each row is an object where keys are column names."),
@@ -92,7 +92,8 @@ export const EvalRecordInputSchema = z.object({
         Example Input (Note: Access .contentBase64 for binary, .contentPlaintext for text):
         {
           "code": "const conditions = fullEhr.fhir['Condition'] || [];\\nconst activeProblems = conditions.filter(c => c.clinicalStatus?.coding?.[0]?.code === 'active');\\nconst diabeteConditions = activeProblems.filter(c => JSON.stringify(c.code).toLowerCase().includes('diabete'));\\n\\n// Get patient name (handle potential missing data)\\nconst patient = (fullEhr.fhir['Patient'] || [])[0];\\nlet patientName = 'Unknown';\\nif (patient && patient.name && patient.name[0]) {\\n  patientName = \`\${patient.name[0].given?.join(' ') || ''} \${patient.name[0].family || ''}\`.trim();\\n}\\n\\nconsole.log(\`Found \${diabeteConditions.length} active diabetes condition(s) for patient \${patientName}.\`);\\n\\n// Find PDF attachments\\nconst pdfAttachments = fullEhr.attachments.filter(a => a.contentType === 'application/pdf');\\nconsole.warn(\`Found \${pdfAttachments.length} PDF attachments.\`);\\n\\n// Example of decoding base64 (if needed, check contentPlaintext first!)\\nconst firstAttachment = fullEhr.attachments[0];\\nif (firstAttachment && firstAttachment.contentBase64) {\\n try {\\n   // Only decode if contentPlaintext wasn't useful\\n   // const decodedText = Buffer.from(firstAttachment.contentBase64, 'base64').toString('utf8');\\n   // console.log('Decoded snippet:', decodedText.substring(0, 50));\\n } catch (e) { console.error('Error decoding base64 for first attachment'); }\\n}\\n\\nreturn { \\n  patient: patientName,\\n  activeDiabetesCount: diabeteConditions.length,\\n  diabetesDetails: diabeteConditions.map(c => ({ id: c.id, code: c.code?.text || JSON.stringify(c.code), onset: c.onsetDateTime || c.onsetAge?.value }))\\n};"
-        }`
+        }
+        Most flexible tool. Best for complex analysis, calculations, combining data from multiple resource types/attachments, or custom output formatting. Use when \`grep\` or \`query\` alone are insufficient.`
     )
 });
 
