@@ -332,7 +332,7 @@ async function main() {
 
         // Context retrieval function for CLI stdio environment
         async function getCliContext(
-            toolName: 'grep_record' | 'query_record' | 'eval_record',
+            _toolName: string,
             extra?: Record<string, any> 
         ): Promise<{ fullEhr?: ClientFullEHR, db?: Database }> {
              // In CLI stdio mode, db and fullEhr are pre-loaded in the outer scope

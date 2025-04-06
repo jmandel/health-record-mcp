@@ -13,6 +13,94 @@ const MAX_GREP_JSON_LENGTH = 2 * 1024 * 1024; // 2 MB limit
 const MAX_QUERY_JSON_LENGTH = 500 * 1024;      // 500 KB limit
 const MAX_EVAL_JSON_LENGTH = 1 * 1024 * 1024;  // 1 MB limit
 const MAX_QUERY_ROWS = 500; // Limit rows for query results before stringification check
+const GREP_CONTEXT_LENGTH = 50; // Characters before/after match
+
+// Map from ResourceType to ordered list of potential date fields (FHIRPath-like)
+const RESOURCE_DATE_PATHS: Record<string, string[]> = {
+    "AllergyIntolerance": [], // No obvious primary date
+    "CarePlan": [], // Complex, relies on activity dates usually
+    "CareTeam": [], // Period might exist, but not primary focus
+    "Condition": [
+        "onsetDateTime",
+        "onsetPeriod.start",
+        "recordedDate",
+        "abatementDateTime", // Less preferred than onset/recorded
+        "abatementPeriod.start",
+        "extension(url='http://hl7.org/fhir/StructureDefinition/condition-assertedDate').valueDateTime",
+        "meta.lastUpdated"
+    ],
+    "Coverage": [
+        "period.start",
+        "period.end" // Less preferred
+    ],
+    "Device": [
+        "manufactureDate",
+        "expirationDate"
+    ],
+    "DiagnosticReport": [
+        "effectiveDateTime",
+        "effectivePeriod.start",
+        "issued",
+        "meta.lastUpdated"
+    ],
+    "DocumentReference": [
+        "date",
+        "context.period.start",
+        "extension(url='http://hl7.org/fhir/us/core/StructureDefinition/us-core-authentication-time').valueDateTime"
+    ],
+    "Encounter": [
+        "period.start",
+        "period.end", // Less preferred
+        "meta.lastUpdated"
+    ],
+    "Goal": [
+        "startDate",
+        "target.dueDate"
+    ],
+    "Immunization": [
+        "occurrenceDateTime"
+    ],
+    "Location": [],
+    "Medication": [], // No date on resource itself
+    "MedicationDispense": [
+        "whenHandedOver"
+    ],
+    "MedicationRequest": [
+        "authoredOn",
+        // Nested extension example - needs specific handling
+        "extension(url='http://hl7.org/fhir/us/core/StructureDefinition/us-core-medication-adherence').extension(url='dateAsserted').valueDateTime"
+    ],
+    "Observation": [
+        "effectiveDateTime",
+        "effectivePeriod.start",
+        "effectiveInstant",
+        "issued",
+        "meta.lastUpdated"
+    ],
+    "Organization": [],
+    "Patient": [
+        "birthDate"
+    ],
+    "Practitioner": [],
+    "PractitionerRole": [],
+    "Procedure": [
+        "performedDateTime",
+        "performedPeriod.start"
+    ],
+    "Provenance": [
+        "recorded"
+    ],
+    "QuestionnaireResponse": [
+        "authored"
+    ],
+    "RelatedPerson": [],
+    "ServiceRequest": [
+        "occurrenceDateTime",
+        "occurrencePeriod.start",
+        "authoredOn"
+    ],
+    "Specimen": [] // Collection has period, but maybe not primary
+};
 
 // --- Tool Schemas ---
 
@@ -28,26 +116,7 @@ export const GrepRecordInputSchema = z.object({
     )
 });
 
-export const GrepMatchedAttachmentSchema = z.object({
-    resourceType: z.string().describe("The FHIR resource type the attachment belongs to."),
-    resourceId: z.string().describe("The ID of the FHIR resource the attachment belongs to."),
-    path: z.string().describe("Path within the original resource where the attachment was found (e.g., 'content.attachment')."),
-    contentType: z.string().optional().describe("The content type of the attachment."),
-    plaintext: z.string().describe("The full extracted plaintext content of the attachment.")
-}).describe("An attachment where the query matched within its extracted plaintext content.");
-
-
-export const GrepRecordOutputSchema = z.object({
-    warning: z.string().optional().describe("Warning message if results were truncated."),
-    matched_resources: z.array(z.record(z.unknown())).describe("Full FHIR resources where the query matched anywhere within their JSON representation."),
-    matched_attachments: z.array(GrepMatchedAttachmentSchema).describe("Attachments where the query matched within their extracted plaintext content."),
-    resources_searched_count: z.number().int().describe("Number of FHIR resources searched."),
-    attachments_searched_count: z.number().int().describe("Number of attachments searched."),
-    resources_matched_count: z.number().int().describe("Number of unique FHIR resources matched."),
-    attachments_matched_count: z.number().int().describe("Number of unique attachments matched."),
-    error: z.string().optional().describe("Error message if truncation failed or result is still too large.")
-}).describe("Results of the text search across the patient's record using a case-insensitive string or JavaScript-style regular expression, returning full matching resources or attachment text. Use for initial exploration or finding mentions in unstructured text. May require follow-up with Query/Eval for structured data.");
-
+// --- Grep Output Schemas ---
 
 export const QueryRecordInputSchema = z.object({
     sql: z.string().min(1).describe("The read-only SQL SELECT statement to execute against the in-memory FHIR data. FHIR resources are stored in the 'fhir_resources' table with columns 'resource_type', 'resource_id', and 'json'. For example, 'SELECT json FROM fhir_resources WHERE resource_type = \"Patient\"' or 'SELECT json FROM fhir_resources WHERE resource_type = \"Observation\" AND json LIKE \"%diabetes%\"'. Best for precisely selecting specific FHIR resources or fields using known structure (e.g., Observations by LOINC). Limited to structured FHIR data.")
@@ -93,7 +162,7 @@ export const EvalRecordInputSchema = z.object({
 
         Example Input (Note: Access .contentBase64 for binary, .contentPlaintext for text):
         {
-          "code": "const conditions = fullEhr.fhir['Condition'] || [];\\nconst activeProblems = conditions.filter(c => c.clinicalStatus?.coding?.[0]?.code === 'active');\\nconst diabeteConditions = activeProblems.filter(c => JSON.stringify(c.code).toLowerCase().includes('diabete'));\\n\\n// Get patient name (handle potential missing data)\\nconst patient = (fullEhr.fhir['Patient'] || [])[0];\\nlet patientName = 'Unknown';\\nif (patient && patient.name && patient.name[0]) {\\n  patientName = \`\${patient.name[0].given?.join(' ') || ''} \${patient.name[0].family || ''}\`.trim();\\n}\\n\\nconsole.log(\`Found \${diabeteConditions.length} active diabetes condition(s) for patient \${patientName}.\`);\\n\\n// Find PDF attachments\\nconst pdfAttachments = fullEhr.attachments.filter(a => a.contentType === 'application/pdf');\\nconsole.warn(\`Found \${pdfAttachments.length} PDF attachments.\`);\\n\\n// Example of decoding base64 (if needed, check contentPlaintext first!)\\nconst firstAttachment = fullEhr.attachments[0];\\nif (firstAttachment && firstAttachment.contentBase64) {\\n try {\\n   // Only decode if contentPlaintext wasn't useful\\n   // const decodedText = Buffer.from(firstAttachment.contentBase64, 'base64').toString('utf8');\\n   // console.log('Decoded snippet:', decodedText.substring(0, 50));\\n } catch (e) { console.error('Error decoding base64 for first attachment'); }\\n}\\n\\nreturn { \\n  patient: patientName,\\n  activeDiabetesCount: diabeteConditions.length,\\n  diabetesDetails: diabeteConditions.map(c => ({ id: c.id, code: c.code?.text || JSON.stringify(c.code), onset: c.onsetDateTime || c.onsetAge?.value }))\\n};"
+          "code": "const conditions = fullEhr.fhir['Condition'] || [];\\nconst activeProblems = conditions.filter(c => c.clinicalStatus?.coding?.[0]?.code === 'active');\\nconst diabeteConditions = activeProblems.filter(c => JSON.stringify(c.code).toLowerCase().includes('diabete'));\\n\\n// Get patient name (handle potential missing data)\\nconst patient = (fullEhr.fhir['Patient'] || [])[0];\\nlet patientName = 'Unknown';\\nif (patient && patient.name && patient.name[0]) {\\n  patientName = \`\${patient.name[0].given?.join(' ') || ''} \${patient.name[0].family || ''}\`.trim();\\n}\\n\\nconsole.log(\`Found \${diabeteConditions.length} active diabetes condition(s) for patient \${patientName}.\`);\\n\\n// Find PDF attachments\\nconst pdfAttachments = fullEhr.attachments.filter(a => a.contentType === 'application/pdf');\\nconsole.warn(\`Found \${pdfAttachments.length} PDF attachments.\`);\\n\\n// Example of decoding base64 (if needed, check contentPlaintext first!)\\nconst firstAttachment = fullEhr.attachments[0];\\nif (firstAttachment && firstAttachment.contentBase64) {\\n try {\\n   // Only decode if contentPlaintext wasn't useful\\n   // const decodedText = Buffer.from(firstAttachment.contentBase4, 'base64').toString('utf8');\\n   // console.log('Decoded snippet:', decodedText.substring(0, 50));\\n } catch (e) { console.error('Error decoding base64 for first attachment'); }\\n}\\n\\nreturn { \\n  patient: patientName,\\n  activeDiabetesCount: diabeteConditions.length,\\n  diabetesDetails: diabeteConditions.map(c => ({ id: c.id, code: c.code?.text || JSON.stringify(c.code), onset: c.onsetDateTime || c.onsetAge?.value }))\\n};"
         }
         Most flexible tool. Best for complex analysis, calculations, combining data from multiple resource types/attachments, or custom output formatting. Use when \`grep\` or \`query\` alone are insufficient.`
     )
@@ -106,125 +175,264 @@ export const EvalRecordOutputSchema = z.object({
     errors: z.array(z.string()).describe("An array of messages logged via console.error during execution, or internal execution errors (like timeouts or syntax errors). Can contain truncation messages.")
 }).describe("The result of executing the provided JavaScript code against the patient record, including the returned value and captured console output/errors.");
 
+// --- Read Resource Schemas ---
+export const ReadResourceInputSchema = z.object({
+    resourceType: z.string().describe("The FHIR resource type (e.g., 'Patient', 'Observation')."),
+    resourceId: z.string().describe("The ID of the FHIR resource.")
+});
+export const ReadResourceOutputSchema = z.object({
+    resource: z.record(z.unknown()).nullable().describe("The full FHIR resource JSON object, or null if not found."),
+    error: z.string().optional().describe("Error message if the resource could not be retrieved.")
+}).describe("The requested FHIR resource.");
+// --- End Read Resource Schemas ---
+
+// --- Read Attachment Schema (Input Only) ---
+export const ReadAttachmentInputSchema = z.object({
+    resourceType: z.string().describe("The FHIR resource type the attachment belongs to."),
+    resourceId: z.string().describe("The ID of the FHIR resource the attachment belongs to."),
+    attachmentPath: z.string().describe("The JSON path within the source resource where the attachment is located (e.g., 'content.attachment', 'photo[0]'). Provided by the grep tool."),
+    includeRawBase64: z.boolean().optional().default(false).describe("Set to true to include the raw base64 content in the response. Defaults to false.")
+});
+// --- End Read Attachment Schema ---
+
 
 // --- Logic Functions ---
 
 /**
- * Truncates a data object (intended for JSON stringification) if its stringified
- * representation exceeds a specified limit. Applies tool-specific truncation logic.
- *
- * @param data The data object to potentially truncate.
- * @param limit The maximum allowed length of the JSON string.
- * @param toolType Identifier for the tool to apply specific logic ('grep', 'query', 'eval').
- * @returns The potentially modified data object, ready for stringification.
+ * Extracts and formats the most relevant date from a FHIR resource based on predefined paths.
+ * @param resource The FHIR resource object.
+ * @returns Formatted date string (YYYY-MM-DD) or null.
  */
-function truncateIfNeeded(data: any, limit: number, toolType: 'grep' | 'query' | 'eval'): any {
-    try {
-        let jsonString = JSON.stringify(data); // Initial stringification (potentially large)
-        if (jsonString.length <= limit) {
-            return data; // No truncation needed
+function extractResourceDate(resource: any): string | null {
+    if (!resource || !resource.resourceType) {
+        return null;
+    }
+    const paths = RESOURCE_DATE_PATHS[resource.resourceType] || [];
+    if (paths.length === 0) {
+        return null;
+    }
+
+    for (const path of paths) {
+        let value: any = null;
+
+        // Handle specific extension cases first
+        if (path.startsWith('extension(url=')) {
+            const urlMatch = path.match(/extension\(url='([^']+)'\)/);
+            if (urlMatch && resource.extension) {
+                const url = urlMatch[1];
+                const extension = _.find(resource.extension, { url: url });
+                if (extension) {
+                    const remainingPath = path.substring(urlMatch[0].length + 1); // +1 for the dot
+                    if (!remainingPath) { // e.g., extension(url='...').valueDateTime
+                       // This case shouldn't happen with current map, expects .valueXXX
+                    } else if (remainingPath.startsWith('value')) {
+                         value = _.get(extension, remainingPath);
+                    } else if (remainingPath.startsWith('extension(url=')) {
+                        // Handle nested extension e.g., extension(url='...').extension(url='...').valueDateTime
+                         const nestedUrlMatch = remainingPath.match(/extension\(url='([^']+)'\)/);
+                         if (nestedUrlMatch && extension.extension) {
+                            const nestedUrl = nestedUrlMatch[1];
+                             const nestedExtension = _.find(extension.extension, { url: nestedUrl });
+                             if (nestedExtension) {
+                                const finalPathPart = remainingPath.substring(nestedUrlMatch[0].length + 1);
+                                 value = _.get(nestedExtension, finalPathPart);
+                             }
+                         }
+                    }
+                }
+            }
+        } else {
+            // Handle simple paths and period starts
+            value = _.get(resource, path);
         }
 
-        console.warn(`[TRUNCATE ${toolType.toUpperCase()}] Result exceeds limit (${(jsonString.length / 1024).toFixed(0)} KB > ${(limit / 1024).toFixed(0)} KB), applying truncation.`);
+        if (value && typeof value === 'string') {
+            // Extract YYYY-MM-DD part from FHIR date/dateTime/instant
+            const dateMatch = value.match(/^(\d{4}(-\d{2}(-\d{2})?)?)/);
+            if (dateMatch && dateMatch[1]) {
+                return dateMatch[1]; // Return YYYY or YYYY-MM or YYYY-MM-DD
+            }
+        }
+    }
+
+    return null; // No suitable date found
+}
+
+/**
+ * Truncates SQL query results if they exceed limits (row count or stringified size).
+ *
+ * @param results The array of result rows from the SQL query.
+ * @param limit The maximum allowed length of the JSON string.
+ * @returns The original results array, or a truncation object { warning, truncated_results, error }.
+ */
+function truncateQueryResults(results: Record<string, unknown>[], limit: number): any {
+    try {
+        // 1. Check row limit first
+        const originalRowCount = results.length;
+        let potentiallyTruncatedResults = results;
+        let rowLimitWarning: string | null = null;
+
+        if (originalRowCount > MAX_QUERY_ROWS) {
+            potentiallyTruncatedResults = results.slice(0, MAX_QUERY_ROWS);
+            rowLimitWarning = `Result limited to first ${potentiallyTruncatedResults.length} of ${originalRowCount} rows.`;
+            console.warn(`[TRUNCATE QUERY] Row limit exceeded (${originalRowCount} > ${MAX_QUERY_ROWS}).`);
+        }
+
+        // 2. Check JSON size limit on (potentially row-limited) results
+        let jsonString = JSON.stringify(potentiallyTruncatedResults);
+
+        if (jsonString.length <= limit) {
+            // If only row limit was applied, return the truncation object structure
+            if (rowLimitWarning) {
+                return { warning: rowLimitWarning, truncated_results: potentiallyTruncatedResults };
+            }
+            return potentiallyTruncatedResults; // Return original array if no limits hit
+        }
+
+        // 3. Apply size limit truncation (which means returning only the warning object)
+        console.warn(`[TRUNCATE QUERY] Size limit exceeded (${(jsonString.length / 1024).toFixed(0)} KB > ${(limit / 1024).toFixed(0)} KB).`);
+
+        const sizeLimitWarning = `Result truncated due to size limit (${(limit / 1024).toFixed(0)} KB).` +
+                                (rowLimitWarning ? ` (Already limited to ${potentiallyTruncatedResults.length} rows)` : ` Original query returned ${originalRowCount} rows.`);
+
+        // For size limit, we cannot return any results, just the warning.
+        // We prioritize the size warning message.
+        const truncatedData = {
+            warning: sizeLimitWarning,
+            // truncated_results: [] // Or potentially a very small subset if needed, but let's omit for now
+        };
+
+        // Final check: Stringify the *warning object itself* and see if it's too large (highly unlikely)
+        let finalJsonString = JSON.stringify(truncatedData);
+        if (finalJsonString.length > limit) {
+            console.error(`[TRUNCATE QUERY] Result STILL too large after size truncation (warning object too big).`);
+            return { error: "Result too large to return, even after truncation." };
+        }
+
+        return truncatedData;
+
+    } catch (stringifyError: any) {
+        console.error(`[TRUNCATE QUERY] Error during stringification/truncation:`, stringifyError);
+        return { error: `Internal error during result processing/truncation: ${stringifyError.message}` };
+    }
+}
+
+/**
+ * Truncates Eval tool output if its stringified representation exceeds a limit.
+ *
+ * @param output The EvalRecordOutputSchema object (result, logs, errors).
+ * @param limit The maximum allowed length of the JSON string.
+ * @returns The potentially modified output object.
+ */
+function truncateEvalResult(output: z.infer<typeof EvalRecordOutputSchema>, limit: number): any {
+    try {
+        let jsonString = JSON.stringify(output);
+        if (jsonString.length <= limit) {
+            return output; // No truncation needed
+        }
+
+        console.warn(`[TRUNCATE EVAL] Result exceeds limit (${(jsonString.length / 1024).toFixed(0)} KB > ${(limit / 1024).toFixed(0)} KB), applying truncation.`);
 
         let truncatedData: any;
         let warningMessage = `Result truncated due to size limit (${(limit / 1024).toFixed(0)} KB).`;
 
-        switch (toolType) {
-            case 'grep':
-                truncatedData = {
-                    ...data, // Copy counts etc.
-                    matched_resources: data.matched_resources.slice(0, 5), // Limit resources
-                    matched_attachments: data.matched_attachments.slice(0, 10)?.map((att: any) => ({ // Limit attachments & plaintext
-                        ...att,
-                        plaintext: att.plaintext.length > 500 ? att.plaintext.substring(0, 500) + "..." : att.plaintext
-                    }))
-                };
-                warningMessage += " Showing subset of matches. Attachment plaintext may be shortened.";
-                break;
-
-            case 'query':
-                // Assumes 'data' is the array of results here
-                const originalRowCount = data.length;
-                const truncatedRows = data.slice(0, MAX_QUERY_ROWS); // Use row limit first
-                truncatedData = { // Return structure with warning
-                    warning: `Result truncated. Showing first ${truncatedRows.length} of ${originalRowCount} rows.`,
-                    truncated_results: truncatedRows
-                };
-                warningMessage = truncatedData.warning; // Use specific row count warning
-                break;
-
-            case 'eval':
-                // Prioritize errors > logs > result
-                 const originalLogs = data.logs || [];
-                 const originalErrors = data.errors || [];
-                truncatedData = {
-                    result: "[Result omitted due to excessive size]",
-                    logs: originalLogs.slice(0, 20),
-                    errors: [...originalErrors] // Copy original errors
-                };
-                 warningMessage += " Result omitted, logs potentially truncated.";
-                 if (truncatedData.logs.length < originalLogs.length) {
-                    truncatedData.logs.push("... [Logs truncated due to size limit]");
-                }
-                 // Add the primary warning to the errors array as well
-                 truncatedData.errors.push(`Execution result (or combined output) was too large to return fully. ${warningMessage}`);
-                break;
-
-            default:
-                console.error(`[TRUNCATE] Unknown toolType: ${toolType}`);
-                return { error: `Internal error: Unknown tool type for truncation.` }; // Should not happen
+        // Prioritize errors > logs > result
+        const originalLogs = output.logs || [];
+        const originalErrors = output.errors || [];
+        truncatedData = {
+            result: "[Result omitted due to excessive size]",
+            logs: originalLogs.slice(0, 20),
+            errors: [...originalErrors] // Copy original errors
+        };
+        warningMessage += " Result omitted, logs potentially truncated.";
+        if (truncatedData.logs.length < originalLogs.length) {
+            truncatedData.logs.push("... [Logs truncated due to size limit]");
         }
+        // Add the primary warning to the errors array as well
+        truncatedData.errors.push(`Execution result (or combined output) was too large to return fully. ${warningMessage}`);
 
-        // Add the warning to the truncated data structure if a field exists
-        if (typeof truncatedData === 'object' && truncatedData !== null) {
-             truncatedData.warning = warningMessage;
-        }
+         // Add the warning to the truncated data structure
+         truncatedData.warning = warningMessage;
+
 
         // Final check: Stringify the *truncated* data and see if it's STILL too large
         let finalJsonString = JSON.stringify(truncatedData);
         if (finalJsonString.length > limit) {
-            console.error(`[TRUNCATE ${toolType.toUpperCase()}] Result STILL too large after truncation.`);
-            // Return a minimal error object for each tool type
-            switch (toolType) {
-                case 'grep': return { error: "Result too large to return, even after truncation.", resources_searched_count: data.resources_searched_count, attachments_searched_count: data.attachments_searched_count, resources_matched_count: data.resources_matched_count, attachments_matched_count: data.attachments_matched_count };
-                case 'query': return { error: "Result too large to return, even after truncation." };
-                case 'eval': return { error: "Result too large to return, even after truncation.", logs: [], result: undefined, errors: ["Output exceeded size limit even after truncation."] };
-                default: return { error: "Result too large to return, even after truncation." };
-            }
+            console.error(`[TRUNCATE EVAL] Result STILL too large after truncation.`);
+            return { error: "Result too large to return, even after truncation.", logs: [], result: undefined, errors: ["Output exceeded size limit even after truncation."] };
         }
 
         return truncatedData; // Return the successfully truncated data object
 
     } catch (stringifyError: any) {
-        console.error(`[TRUNCATE ${toolType.toUpperCase()}] Error during stringification/truncation:`, stringifyError);
+        console.error(`[TRUNCATE EVAL] Error during stringification/truncation:`, stringifyError);
         return { error: `Internal error during result processing/truncation: ${stringifyError.message}` };
     }
 }
 
+/**
+ * Finds all occurrences of a regex in text and returns context snippets.
+ * @param text The text to search within.
+ * @param regex The regular expression (should have 'g' flag).
+ * @param contextLen Number of characters before/after the match to include.
+ * @returns Array of strings, each containing a context snippet.
+ */
+function findContextualMatches(text: string, regex: RegExp, contextLen: number): string[] {
+    const snippets: string[] = [];
+    let match;
+
+    // Ensure regex has global flag for exec loop
+    const globalRegex = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
+
+    while ((match = globalRegex.exec(text)) !== null) {
+        const matchStart = match.index;
+        const matchEnd = matchStart + match[0].length;
+
+        const contextStart = Math.max(0, matchStart - contextLen);
+        const contextEnd = Math.min(text.length, matchEnd + contextLen);
+
+        const prefix = text.substring(contextStart, matchStart);
+        const suffix = text.substring(matchEnd, contextEnd);
+
+        // Simple highlighting for the match itself
+        const highlightedMatch = `>>>${match[0]}<<<`;
+
+        snippets.push(`...${prefix}${highlightedMatch}${suffix}...`);
+
+         // Prevent infinite loops for zero-length matches
+         if (match[0].length === 0) {
+            globalRegex.lastIndex++;
+        }
+    }
+    return snippets;
+}
 
 export async function grepRecordLogic(
     fullEhr: ClientFullEHR,
     query: string,
     inputResourceTypes?: string[]
-): Promise<string> { // Returns JSON string
+): Promise<string> { // Returns Markdown string
     let regex: RegExp;
+    let originalQuery = query; // Keep original for reporting
     try {
+        // Ensure regex is case-insensitive and global for snippet extraction
         if (query.startsWith('/') && query.endsWith('/')) query = query.slice(1, -1);
-        regex = new RegExp(query, 'i');
+        regex = new RegExp(query, 'gi'); // Add 'g' flag
         console.error(`[GREP Logic] Using regex: ${regex}`);
-    } catch (e) {
-        console.error(`[GREP Logic] Invalid regex: "${query}"`, e);
-        const errorResult = { error: `Invalid regular expression provided: ${query}. Ensure special characters are properly escaped if needed.` };
-        return JSON.stringify(errorResult, null, 2);
+    } catch (e: any) {
+        console.error(`[GREP Logic] Invalid regex: "${originalQuery}"`, e);
+        return `**Error:** Invalid regular expression provided: \`${originalQuery}\`. ${e.message}`; // Return Markdown error
     }
 
-    const matchedResourceIds = new Set<string>();
-    const matchedAttachmentKeys = new Set<string>();
-    const matchedResourcesResult: Record<string, unknown>[] = [];
-    const matchedAttachmentsResult: z.infer<typeof GrepMatchedAttachmentSchema>[] = [];
+    // Store hits with extracted date
+    const resourceHits: { resource_ref: string; context_snippets: string[]; date: string | null }[] = [];
+    const attachmentHits: { resource_ref: string; path: string; contentType?: string; context_snippets: string[]; date: string | null }[] = [];
+
     let resourcesSearched = 0;
     let attachmentsSearched = 0;
+    let totalSnippetsFound = 0;
+    const matchedResourceRefs = new Set<string>(); // Track ResourceRefs with hits
+    const matchedAttachmentRefs = new Set<string>(); // Track AttachmentRefs with hits
 
     const searchOnlyAttachments = inputResourceTypes?.length === 1 && inputResourceTypes[0] === "Attachment";
     let typesForResourceSearch: string[] = [];
@@ -245,7 +453,7 @@ export async function grepRecordLogic(
              console.error(`[GREP Logic] Scope: Resources [${typesForResourceSearch.join(', ')}] and ALL Attachments`);
         } else {
             typesForAttachmentFilter = typesForResourceSearch;
-             console.error(`[GREP Logic] Scope: Resources [${typesForResourceSearch.join(', ')}] and their specific Attachments`);
+             console.error(`[GREP Logic] Scope: Resources [${typesForAttachmentFilter.join(', ')}] and their specific Attachments`);
         }
     }
 
@@ -259,64 +467,150 @@ export async function grepRecordLogic(
                      console.warn(`[GREP Logic] Skipping invalid resource structure in type '${resourceType}'.`); continue;
                  }
                 resourcesSearched++;
-                const resourceKey = `${resource.resourceType}/${resource.id}`;
-                if (matchedResourceIds.has(resourceKey)) continue;
+                const resourceRef = `${resource.resourceType}/${resource.id}`;
+                // Don't search again if already found via another scope (unlikely but possible)
+                if (matchedResourceRefs.has(resourceRef)) continue;
+
                 try {
-                    if (regex.test(JSON.stringify(resource))) {
-                        matchedResourceIds.add(resourceKey);
-                        matchedResourcesResult.push(resource);
+                    const resourceString = JSON.stringify(resource);
+                    const snippets = findContextualMatches(resourceString, regex, GREP_CONTEXT_LENGTH);
+                    if (snippets.length > 0) {
+                        matchedResourceRefs.add(resourceRef);
+                        totalSnippetsFound += snippets.length;
+                        const date = extractResourceDate(resource);
+                        resourceHits.push({
+                            resource_ref: resourceRef,
+                            context_snippets: snippets,
+                            date: date
+                        });
                     }
                 } catch (stringifyError) {
-                    console.warn(`[GREP Logic] Error stringifying resource ${resourceKey}:`, stringifyError);
+                    console.warn(`[GREP Logic] Error stringifying resource ${resourceRef}:`, stringifyError);
                  }
              }
          }
-         console.error(`[GREP Logic] Found ${matchedResourcesResult.length} matching resources after searching ${resourcesSearched}.`);
+         console.error(`[GREP Logic] Found matches in ${resourceHits.length} resources after searching ${resourcesSearched}.`);
      } else {
          console.error("[GREP Logic] Skipping resource search based on scope.");
      }
 
-    // 2. Search Attachments
-     console.error(`[GREP Logic] Searching ${fullEhr.attachments.length} attachments (Filter: ${typesForAttachmentFilter ? `Only types [${typesForAttachmentFilter.join(', ')}]` : 'All'})...`);
-     for (const attachment of fullEhr.attachments) {
-        if (!attachment || !attachment.resourceType || !attachment.resourceId || !attachment.path) {
-             console.warn(`[GREP Logic] Skipping invalid attachment structure.`); continue;
-         }
-        attachmentsSearched++;
-        const attachmentKey = `${attachment.resourceType}/${attachment.resourceId}#${attachment.path}`;
-        if (typesForAttachmentFilter && !typesForAttachmentFilter.includes(attachment.resourceType)) continue;
-        if (matchedAttachmentKeys.has(attachmentKey)) continue;
+    // 2. Select and Search Attachments (Prioritize one per source resource)
+    console.error(`[GREP Logic] Grouping and selecting best attachment from ${fullEhr.attachments.length} total attachments...`);
 
-        if (attachment.contentPlaintext && typeof attachment.contentPlaintext === 'string' && attachment.contentPlaintext.length > 0) {
-            if (regex.test(attachment.contentPlaintext)) {
-                matchedAttachmentKeys.add(attachmentKey);
-                matchedAttachmentsResult.push({
-                    resourceType: attachment.resourceType,
-                    resourceId: attachment.resourceId,
-                    path: attachment.path,
-                    contentType: attachment.contentType,
-                    plaintext: attachment.contentPlaintext
-                });
-            }
-        }
-     }
-     console.error(`[GREP Logic] Found ${matchedAttachmentsResult.length} matching attachments after searching ${attachmentsSearched}.`);
-
-
-    // 3. Compile results and truncate if needed
-    const resultData: z.infer<typeof GrepRecordOutputSchema> = {
-        matched_resources: matchedResourcesResult,
-        matched_attachments: matchedAttachmentsResult,
-        resources_searched_count: resourcesSearched,
-        attachments_searched_count: attachmentsSearched,
-        resources_matched_count: matchedResourcesResult.length,
-        attachments_matched_count: matchedAttachmentsResult.length,
+    const contentTypePriority: { [key: string]: number } = {
+        'text/plain': 1,
+        'text/html': 2,
+        'text/rtf': 3,
+        'text/xml': 4
+        // Other types have lower priority (Infinity)
     };
 
-    const finalData = truncateIfNeeded(resultData, MAX_GREP_JSON_LENGTH, 'grep');
-    return JSON.stringify(finalData, null, 2);
-}
+    const bestAttachmentPerSource: { [sourceRef: string]: { attachment: typeof fullEhr.attachments[0], anchorResource: any | null } } = {};
 
+    for (const attachment of fullEhr.attachments) {
+        if (!attachment || !attachment.resourceType || !attachment.resourceId || !attachment.path) {
+            console.warn(`[GREP Logic] Skipping invalid attachment structure during selection.`); continue;
+        }
+        attachmentsSearched++; // Count every attachment encountered
+        const sourceRef = `${attachment.resourceType}/${attachment.resourceId}`;
+        const currentBestData = bestAttachmentPerSource[sourceRef];
+        const currentPriority = attachment.contentType ? (contentTypePriority[attachment.contentType] ?? Infinity) : Infinity;
+        const bestPriority = currentBestData?.attachment.contentType ? (contentTypePriority[currentBestData.attachment.contentType] ?? Infinity) : Infinity;
+
+        if (currentPriority < bestPriority) {
+            // Find the anchor resource to store alongside the attachment
+            const anchorResource = (fullEhr.fhir[attachment.resourceType] || []).find(r => r.id === attachment.resourceId) || null;
+            bestAttachmentPerSource[sourceRef] = { attachment: attachment, anchorResource: anchorResource };
+        }
+    }
+
+    const selectedAttachmentsData = Object.values(bestAttachmentPerSource);
+    console.error(`[GREP Logic] Selected ${selectedAttachmentsData.length} unique source attachments for searching (Filter: ${typesForAttachmentFilter ? `Only types [${typesForAttachmentFilter.join(', ')}]` : 'All'})...`);
+
+    // Now search *only* the selected attachments
+    for (const { attachment, anchorResource } of selectedAttachmentsData) {
+        const attachmentRef = `${attachment.resourceType}/${attachment.resourceId}#${attachment.path}`;
+        const resourceRef = `${attachment.resourceType}/${attachment.resourceId}`;
+
+        if (typesForAttachmentFilter && !typesForAttachmentFilter.includes(attachment.resourceType)) continue;
+        if (matchedAttachmentRefs.has(attachmentRef)) continue;
+
+        if (attachment.contentPlaintext && typeof attachment.contentPlaintext === 'string' && attachment.contentPlaintext.length > 0) {
+             const snippets = findContextualMatches(attachment.contentPlaintext, regex, GREP_CONTEXT_LENGTH);
+             if (snippets.length > 0) {
+                 matchedAttachmentRefs.add(attachmentRef);
+                 totalSnippetsFound += snippets.length;
+                 // Extract date from the stored anchor resource
+                 const date = extractResourceDate(anchorResource);
+                 attachmentHits.push({
+                     resource_ref: resourceRef,
+                     path: attachment.path,
+                     contentType: attachment.contentType,
+                     context_snippets: snippets,
+                     date: date
+                 });
+             }
+        }
+     }
+     console.error(`[GREP Logic] Found matches in ${attachmentHits.length} attachments after searching selected attachments.`);
+
+    // 3. Format results as Markdown
+    let markdownOutput = `## Grep Results for \`${originalQuery.replace(/`/g, '\\`')}\`\n\n`;
+    markdownOutput += `_(Hint: Use \`read_resource\` or \`read_attachment\` for full details on interesting hits)_\n\n`;
+    markdownOutput += `Searched ${resourcesSearched} resources and ${attachmentsSearched} attachments. Found ${totalSnippetsFound} total snippets across ${resourceHits.length} resources and ${attachmentHits.length} attachments.\n\n`;
+
+    if (resourceHits.length === 0 && attachmentHits.length === 0) {
+        markdownOutput += "**No matches found.**\n";
+    } else {
+        if (resourceHits.length > 0) {
+            markdownOutput += "### Resource Hits\n\n";
+            for (const hit of resourceHits) {
+                const dateString = hit.date ? ` (${hit.date})` : '';
+                markdownOutput += `#### ${hit.resource_ref}${dateString}\n`;
+                for (const snippet of hit.context_snippets) {
+                    if (snippet.includes('\n')) {
+                        let escapedSnippet = snippet.replace(/`/g, '\\`');
+                        escapedSnippet = escapedSnippet.replace(/>>>(.+?)<<<</gs, '**>>>$1<<<**');
+                        markdownOutput += `<snippet>\n${escapedSnippet}\n</snippet>\n`;
+                    } else {
+                        let escapedSnippet = snippet.replace(/([*_[\]()``\\])/g, '\\$1');
+                        escapedSnippet = escapedSnippet.replace(/>>>(.+?)<<<</g, '**>>>$1<<<**');
+                        markdownOutput += `* ${escapedSnippet}\n`;
+                    }
+                }
+                markdownOutput += "\n";
+            }
+        }
+
+        if (attachmentHits.length > 0) {
+            markdownOutput += "### Attachment Hits\n\n";
+            for (const hit of attachmentHits) {
+                const dateString = hit.date ? ` (${hit.date})` : '';
+                markdownOutput += `#### Attachment for ${hit.resource_ref}${dateString}\n`;
+                markdownOutput += `*Path*: \`${hit.path.replace(/`/g, '\\`')}\`\n`;
+                if (hit.contentType) {
+                    markdownOutput += `*Content-Type*: \`${hit.contentType.replace(/`/g, '\\`')}\`\n`;
+                }
+                for (const snippet of hit.context_snippets) {
+                    if (snippet.includes('\n')) {
+                        let escapedSnippet = snippet.replace(/`/g, '\\`');
+                        escapedSnippet = escapedSnippet.replace(/>>>(.+?)<<<</gs, '**>>>$1<<<**');
+                        markdownOutput += `<snippet>\n${escapedSnippet}\n</snippet>\n`;
+                    } else {
+                        let escapedSnippet = snippet.replace(/([*_[\]()``\\])/g, '\\$1');
+                        escapedSnippet = escapedSnippet.replace(/>>>(.+?)<<<</g, '**>>>$1<<<**');
+                        markdownOutput += `* ${escapedSnippet}\n`;
+                    }
+                 }
+                markdownOutput += "\n";
+            }
+        }
+    }
+
+    markdownOutput += "---";
+
+    return markdownOutput;
+}
 
 export async function queryRecordLogic(db: Database, sql: string): Promise<string> { // Returns JSON string
     console.error(`[SQL Logic] Executing query: ${sql.substring(0, 100)}${sql.length > 100 ? '...' : ''}`);
@@ -338,11 +632,12 @@ export async function queryRecordLogic(db: Database, sql: string): Promise<strin
      }
 
     try {
+        // The .all() method returns unknown[], cast appropriately
         const results = await db.query(sql).all() as Record<string, unknown>[];
         console.error(`[SQL Logic] Query returned ${results.length} rows.`);
 
         // Truncate if needed
-        const finalData = truncateIfNeeded(results, MAX_QUERY_JSON_LENGTH, 'query');
+        const finalData = truncateQueryResults(results, MAX_QUERY_JSON_LENGTH);
         return JSON.stringify(finalData, null, 2);
 
     } catch (err: any) {
@@ -415,13 +710,130 @@ export async function evalRecordLogic(
          finalOutput.result = undefined; // Set result to undefined as it cannot be sent
      }
 
-    // Truncate the final compiled output if needed
-    const finalData = truncateIfNeeded(finalOutput, MAX_EVAL_JSON_LENGTH, 'eval');
+    // Truncate the final compiled output object if needed
+    const finalData = truncateEvalResult(finalOutput, MAX_EVAL_JSON_LENGTH);
     return JSON.stringify(finalData, null, 2);
 }
 
+export async function readResourceLogic(
+    fullEhr: ClientFullEHR,
+    resourceType: string,
+    resourceId: string
+): Promise<string> { // Returns JSON string
+    console.error(`[READ Resource Logic] Attempting to read ${resourceType}/${resourceId}`);
+    const resources = fullEhr.fhir[resourceType] || [];
+    const resource = resources.find(r => r && r.id === resourceId);
+
+    let result: z.infer<typeof ReadResourceOutputSchema>;
+    if (resource) {
+        console.error(`[READ Resource Logic] Found ${resourceType}/${resourceId}`);
+        result = { resource: resource };
+    } else {
+        console.error(`[READ Resource Logic] Resource ${resourceType}/${resourceId} not found.`);
+        result = { resource: null, error: `Resource ${resourceType}/${resourceId} not found.` };
+    }
+
+    try {
+        // No size limit for reading a single resource, assume it's manageable
+        return JSON.stringify(result, null, 2);
+    } catch (stringifyError: any) {
+        console.error(`[READ Resource Logic] Error stringifying result for ${resourceType}/${resourceId}:`, stringifyError);
+        return JSON.stringify({ resource: null, error: `Internal error stringifying resource: ${stringifyError.message}` }, null, 2);
+    }
+}
+
+export async function readAttachmentLogic(
+    fullEhr: ClientFullEHR,
+    resourceType: string,
+    resourceId: string,
+    attachmentPath: string,
+    includeRawBase64: boolean
+): Promise<string> { // Returns Markdown string
+    console.error(`[READ Attachment Logic] Attempting to read attachment at ${resourceType}/${resourceId}#${attachmentPath} (Include Base64: ${includeRawBase64})`);
+    const attachment = fullEhr.attachments.find(a =>
+        a.resourceType === resourceType &&
+        a.resourceId === resourceId &&
+        a.path === attachmentPath
+    );
+
+    if (attachment) {
+        console.error(`[READ Attachment Logic] Found attachment at ${resourceType}/${resourceId}#${attachmentPath}`);
+
+        // Construct Markdown output
+        let markdown = `## Attachment Content\n\n`;
+        markdown += `**Source:** \`${attachment.resourceType}/${attachment.resourceId}\`\n`;
+        markdown += `**Path:** \`${attachment.path.replace(/`/g, '\\`')}\`\n`;
+        if (attachment.contentType) {
+            markdown += `**Content-Type:** \`${attachment.contentType.replace(/`/g, '\\`')}\`\n`;
+        }
+        markdown += `\n---\n\n`; // Separator
+
+        if (attachment.contentPlaintext) {
+            // Process plaintext: trim whitespace-only lines, limit consecutive blank lines
+            const lines = attachment.contentPlaintext.replace(/\r\n/g, '\n').split('\n');
+            const processedLines: string[] = [];
+            let consecutiveBlankLines = 0;
+            for (const line of lines) {
+                const trimmedLine = line.trim();
+                if (trimmedLine === '') {
+                    consecutiveBlankLines++;
+                    if (consecutiveBlankLines <= 2) {
+                        processedLines.push(''); // Add max 2 blank lines
+                    }
+                } else {
+                    consecutiveBlankLines = 0;
+                    processedLines.push(line); // Add original line with whitespace if it wasn't blank
+                }
+            }
+
+            // Trim leading and trailing blank lines from the processed lines array
+            let firstNonBlank = -1;
+            let lastNonBlank = -1;
+            for (let i = 0; i < processedLines.length; i++) {
+                if (processedLines[i] !== '') {
+                    if (firstNonBlank === -1) {
+                        firstNonBlank = i;
+                    }
+                    lastNonBlank = i;
+                }
+            }
+
+            let finalLines: string[];
+            if (firstNonBlank === -1) {
+                // All lines were blank
+                finalLines = [];
+            } else {
+                finalLines = processedLines.slice(firstNonBlank, lastNonBlank + 1);
+            }
+
+            const processedPlaintext = finalLines.join('\n');
+
+            // Wrap the processed plaintext in <plaintext> tags without escaping
+            markdown += `<plaintext>\n${processedPlaintext}\n</plaintext>\n\n`;
+        } else {
+            markdown += `_(No plaintext content available or extracted)_\n\n`;
+        }
+
+        if (includeRawBase64) {
+            markdown += `\n---\n\n**Raw Base64 Content:**\n`;
+            if (attachment.contentBase64) {
+                markdown += "```\n" + attachment.contentBase64 + "\n```\n";
+            } else {
+                markdown += `_(No base64 content available)_\n`;
+            }
+        }
+
+        return markdown;
+
+    } else {
+        console.error(`[READ Attachment Logic] Attachment at ${resourceType}/${resourceId}#${attachmentPath} not found.`);
+        // Return Markdown error message
+        return `**Error:** Attachment at \`${resourceType}/${resourceId}#${attachmentPath.replace(/`/g, '\\`')}\` not found.`;
+    }
+}
+
 /**
- * Registers the standard EHR interaction tools (grep, query, eval) with an McpServer instance.
+ * Registers the standard EHR interaction tools (grep, query, eval, read_resource, read_attachment) with an McpServer instance.
  * This function abstracts the context retrieval (finding EHR data and DB connection)
  * to allow reuse in different server environments (e.g., SSE, CLI).
  *
@@ -431,7 +843,7 @@ export async function evalRecordLogic(
 export function registerEhrTools(
     mcpServer: McpServer,
     getContext: (
-        toolName: 'grep_record' | 'query_record' | 'eval_record',
+        toolName: 'grep_record' | 'query_record' | 'eval_record' | 'read_resource' | 'read_attachment',
         extra?: Record<string, any>
     ) => Promise<{ fullEhr?: ClientFullEHR, db?: Database }>
 ): void {
@@ -447,13 +859,14 @@ export function registerEhrTools(
                 }
                 console.error(`[TOOL grep_record] Context retrieved. Query: "${args.query}", Types: ${args.resource_types?.join(',') || 'All'}`);
                 const resultString = await grepRecordLogic(fullEhr, args.query, args.resource_types);
-                const isError = resultString.includes('"error":');
-                return { content: [{ type: "text", text: resultString }], isError: isError };
+                // Check if the result starts with the error marker we defined
+                const isError = resultString.startsWith("**Error:**");
+                return { content: [{ type: "text", text: resultString }], isError: isError }; // Return Markdown directly
             } catch (error: any) {
                 console.error(`[TOOL grep_record] Error during context retrieval or execution:`, error);
                 const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
-                const errorResult = JSON.stringify({ error: errorMessage });
-                return { content: [{ type: "text", text: errorResult }], isError: true };
+                const errorMarkdown = `**Error:** ${errorMessage}`;
+                return { content: [{ type: "text", text: errorMarkdown }], isError: true }; // Return Markdown error
             }
         }
     );
@@ -498,6 +911,51 @@ export function registerEhrTools(
                  const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
                 const errorResult = JSON.stringify({ error: errorMessage });
                 return { content: [{ type: "text", text: errorResult }], isError: true };
+            }
+        }
+    );
+
+    mcpServer.tool(
+        "read_resource",
+        ReadResourceInputSchema.shape,
+        async (args, extra) => {
+            try {
+                const { fullEhr } = await getContext("read_resource", extra);
+                if (!fullEhr) {
+                    throw new McpError(ErrorCode.InternalError, "EHR data context not found for this session/request.");
+                }
+                console.error(`[TOOL read_resource] Context retrieved. Reading ${args.resourceType}/${args.resourceId}`);
+                const resultString = await readResourceLogic(fullEhr, args.resourceType, args.resourceId);
+                const isError = resultString.includes('"error":'); // Check if logic function returned an error message
+                return { content: [{ type: "text", text: resultString }], isError: isError };
+            } catch (error: any) {
+                console.error(`[TOOL read_resource] Error during context retrieval or execution:`, error);
+                const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+                const errorResult = JSON.stringify({ resource: null, error: errorMessage });
+                return { content: [{ type: "text", text: errorResult }], isError: true };
+            }
+        }
+    );
+
+    mcpServer.tool(
+        "read_attachment",
+        ReadAttachmentInputSchema.shape,
+        async (args, extra) => {
+            try {
+                const { fullEhr } = await getContext("read_attachment", extra);
+                if (!fullEhr) {
+                    throw new McpError(ErrorCode.InternalError, "EHR data context not found for this session/request.");
+                }
+                console.error(`[TOOL read_attachment] Context retrieved. Reading ${args.resourceType}/${args.resourceId}#${args.attachmentPath}`);
+                const resultString = await readAttachmentLogic(fullEhr, args.resourceType, args.resourceId, args.attachmentPath, args.includeRawBase64);
+                // Check if the result starts with the Markdown error marker
+                const isError = resultString.startsWith('**Error:**');
+                return { content: [{ type: "text", text: resultString }], isError: isError }; // Return Markdown directly
+            } catch (error: any) {
+                console.error(`[TOOL read_attachment] Error during context retrieval or execution:`, error);
+                const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+                const errorMarkdown = `**Error:** ${errorMessage}`;
+                return { content: [{ type: "text", text: errorMarkdown }], isError: true }; // Return Markdown error
             }
         }
     );

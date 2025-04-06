@@ -49,7 +49,7 @@ const mcpServer = new McpServer(SERVER_INFO);
 
 // Context retrieval function for SSE environment
 async function getSseContext(
-    toolName: 'grep_record' | 'query_record' | 'eval_record',
+    _toolName: string,
     extra?: Record<string, any>
 ): Promise<{ fullEhr?: ClientFullEHR, db?: Database }> {
     const transportSessionId = extra?.sessionId as string | undefined;
@@ -69,15 +69,12 @@ async function getSseContext(
     let db: Database | undefined = undefined;
     let fullEhr: ClientFullEHR | undefined = undefined;
 
-    if (toolName === 'query_record') {
-        db = await getSessionDb(session); // Handles DB loading/creation
-    } else {
-        // grep and eval need fullEhr
-        if (!session.fullEhr) {
-            throw new McpError(ErrorCode.InternalError, "Session data (fullEhr) not found for active connection.");
-        }
-        fullEhr = session.fullEhr;
+    db = await getSessionDb(session); // Handles DB loading/creation
+    // grep and eval need fullEhr
+    if (!session.fullEhr) {
+        throw new McpError(ErrorCode.InternalError, "Session data (fullEhr) not found for active connection.");
     }
+    fullEhr = session.fullEhr;
 
     return { fullEhr, db };
 }
