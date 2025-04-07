@@ -39,12 +39,10 @@ jobs:
       - name: List artifact contents (for debugging)
         run: ls -R artifact_content
 
-      - name: Upload artifact for deployment
-        uses: actions/upload-artifact@v4
+      - name: Upload artifact for GitHub Pages
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: github-pages # Standard name for GitHub Pages artifacts
           path: artifact_content/
-          retention-days: 1 # Adjust retention as needed
 
   # Optional: Add a deployment job if you want to deploy to GitHub Pages
   deploy:
