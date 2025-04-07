@@ -1,0 +1,59 @@
+name: Build and Package EHR Retriever
+
+on:
+  push:
+    branches: [ main ] # Or your default branch
+  workflow_dispatch: # Allows manual triggering
+
+permissions:
+  contents: read # Needed for checkout
+  pages: write   # Needed to deploy to GitHub Pages
+  id-token: write # Needed for GitHub Pages authentication
+
+jobs:
+  build:
+    name: Build and Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest # or specify a version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build EHR Retriever bundle
+        run: bun run ./scripts/build-ehretriever.ts -c config.epicprod.json
+
+      - name: Prepare artifact directory
+        run: |
+          mkdir -p artifact_content/dist
+          cp static/ehretriever.html artifact_content/ehretriever.html # Keep original filename
+          cp -r static/dist/* artifact_content/dist/
+
+      - name: List artifact contents (for debugging)
+        run: ls -R artifact_content
+
+      - name: Upload artifact for deployment
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-pages # Standard name for GitHub Pages artifacts
+          path: artifact_content/
+          retention-days: 1 # Adjust retention as needed
+
+  # Optional: Add a deployment job if you want to deploy to GitHub Pages
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4 
