@@ -28,7 +28,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Build EHR Retriever bundle
-        run: bun run ./scripts/build-ehretriever.ts -c config.epicprod.json
+        run: bun run ./scripts/build-ehretriever.ts -c config.epic-gh-pages.json
 
       - name: Prepare artifact directory
         run: |
