@@ -52,6 +52,12 @@ let progressContainer: HTMLElement | null;
 let progressBar: HTMLProgressElement | null;
 let progressText: HTMLElement | null;
 
+// NEW: Inline Confirmation UI Elements
+let confirmationContainer: HTMLElement | null;
+let confirmationMessageElement: HTMLElement | null;
+let confirmSendBtn: HTMLButtonElement | null;
+let cancelSendBtn: HTMLButtonElement | null;
+
 // --- Brand Selector State ---
 let allBrandItems: any[] = [];
 let selectedBrandItem: any | null = null;
@@ -100,6 +106,12 @@ function showProgressContainer(show: boolean) {
     if (progressContainer) progressContainer.style.display = show ? 'block' : 'none';
 }
 
+// NEW: Helper function to show/hide confirmation UI
+function showConfirmationContainer(show: boolean) {
+    const confirmationContainer = document.getElementById('confirmation-container');
+    if (confirmationContainer) confirmationContainer.style.display = show ? 'block' : 'none';
+}
+
 // Helper function to update progress UI
 function updateProgress(completed: number, total: number, message?: string) {
     const progressBar = document.getElementById('fetch-progress') as HTMLProgressElement;
@@ -119,6 +131,13 @@ function updateProgress(completed: number, total: number, message?: string) {
             showProgressContainer(true);
         }
     }
+
+    // --- NEW: Get Confirmation UI References ---
+    confirmationContainer = document.getElementById('confirmation-container');
+    confirmationMessageElement = document.getElementById('confirmation-message');
+    confirmSendBtn = document.getElementById('confirm-send-btn') as HTMLButtonElement | null;
+    cancelSendBtn = document.getElementById('cancel-send-btn') as HTMLButtonElement | null;
+    // -----------------------------------------
 }
 
 // Helper function to resolve potentially relative URLs to absolute ones
@@ -616,6 +635,7 @@ document.addEventListener('DOMContentLoaded', () => {
             // *** HIDE BRAND SELECTOR UI IMMEDIATELY ON REDIRECT ***
             if (brandSelectorContainer) brandSelectorContainer.style.display = 'none';
             showProgressContainer(false); // Ensure progress is hidden initially in this phase too
+            showConfirmationContainer(false); // Ensure confirmation is hidden initially too
 
             const storedStateString = sessionStorage.getItem(AUTH_STORAGE_KEY);
             if (!storedStateString) {
@@ -710,7 +730,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.log("----------------------------");
 
                 // 4. Update Status initially
-                let finalStatus = `Data fetched successfully! ${Object.keys(clientFullEhrObject.fhir).length} resource types, ${clientFullEhrObject.attachments.length} attachments found. Check console for details.`;
+                // --- Calculate total resources ---
+                let totalResources = 0;
+                for (const resourceType in clientFullEhrObject.fhir) {
+                    if (Object.prototype.hasOwnProperty.call(clientFullEhrObject.fhir, resourceType) && Array.isArray(clientFullEhrObject.fhir[resourceType])) {
+                        totalResources += clientFullEhrObject.fhir[resourceType].length;
+                    }
+                }
+                // --- End Calculate total resources ---
+
+                let finalStatus = `Data fetched successfully! ${Object.keys(clientFullEhrObject.fhir).length} resource types, ${totalResources} total resources, and ${clientFullEhrObject.attachments.length} attachments retrieved. Check console for details.`;
                 updateStatus(finalStatus);
 
                 // --- 5. Check for and perform delivery ---
@@ -721,47 +750,99 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.log('[Delivery Check] Value found in sessionStorage (Target Name):', deliveryTargetName);
                 console.log('[Delivery Check] Value found in sessionStorage (Opener Origin):', openerTargetOrigin); // NEW: Log opener origin
 
+                // Ensure confirmation UI is hidden initially before potential delivery
+                showConfirmationContainer(false);
+
                 if (deliveryTargetName) {
                     console.log(`[Delivery Check] Delivery target found: ${deliveryTargetName}. Comparing with OPENER_TARGET_VALUE:`, OPENER_TARGET_VALUE);
 
                     // --- Handle postMessage to opener ---
                     if (deliveryTargetName === OPENER_TARGET_VALUE) {
-                        console.log('[Delivery Check] Target is opener. Attempting window.opener.postMessage delivery...');
+                        console.log('[Delivery Check] Target is opener. Preparing inline confirmation...');
 
                         if (openerTargetOrigin) {
-                            try {
-                                // Directly attempt postMessage. This assumes window.opener exists.
-                                // If window.opener is null, undefined, or closed, this call
-                                // might fail silently or throw an error caught below.
-                                updateStatus(`${finalStatus} Delivering data via postMessage to ${openerTargetOrigin}...`);
+                            // *** SHOW INLINE CONFIRMATION ***
+                            updateStatus('Data fetched. Waiting for confirmation to send...');
+                            console.log(`Preparing confirmation UI to send data to: ${openerTargetOrigin}`);
 
-                                // The actual call. Target origin is crucial.
-                                window.opener.postMessage(clientFullEhrObject, openerTargetOrigin);
-
-                                finalStatus += ` Data successfully SENT via postMessage call to ${openerTargetOrigin}.`;
-                                updateStatus(finalStatus);
-                                console.log(`Successfully CALLED postMessage targeting ${openerTargetOrigin}. If the opener exists and is listening, it should receive it.`);
-                                sessionStorage.removeItem(DELIVERY_TARGET_KEY);
-                                sessionStorage.removeItem(OPENER_TARGET_ORIGIN_KEY); // Clean up origin
-                            } catch (postMessageError: any) {
-                                // This catches errors during the postMessage call itself,
-                                // potentially including SecurityErrors if the browser disallows it
-                                // even for postMessage after the redirect, or errors if opener is null/undefined.
-                                finalStatus += ` Delivery via postMessage CALL FAILED: ${postMessageError.message}`;
-                                updateStatus(finalStatus, true);
-                                console.error(`Failed to CALL postMessage to ${openerTargetOrigin}:`, postMessageError);
-                            } finally {
-                                 // Close the window itself after attempting opener delivery attempt.
-                                console.log('Attempting to close retriever window after opener postMessage attempt.');
-                                window.close();
+                            // Update the confirmation message text
+                            if (confirmationMessageElement) {
+                                confirmationMessageElement.textContent = `You have successfully fetched your EHR data. Do you want to send this data back to the application at origin "${openerTargetOrigin}"?`;
                             }
+
+                            // Hide status/progress, show confirmation
+                            showStatusContainer(false);
+                            showProgressContainer(false);
+                            showConfirmationContainer(true);
+
+                            // Define button handlers (use .onclick for simplicity to avoid duplicate listeners)
+                            if (confirmSendBtn && cancelSendBtn) {
+                                confirmSendBtn.onclick = () => {
+                                    console.log('User confirmed data delivery via inline button.');
+                                    // Disable buttons
+                                    if (confirmSendBtn) confirmSendBtn.disabled = true;
+                                    if (cancelSendBtn) cancelSendBtn.disabled = true;
+                                    // Show status again, hide confirmation
+                                    showConfirmationContainer(false);
+                                    showStatusContainer(true);
+                                    updateStatus('Confirmed. Sending data...');
+
+                                    try {
+                                        // Directly attempt postMessage.
+                                        updateStatus(`${finalStatus} Delivering data via postMessage to ${openerTargetOrigin}...`);
+
+                                        // The actual call. Target origin is crucial.
+                                        window.opener.postMessage(clientFullEhrObject, openerTargetOrigin);
+
+                                        finalStatus += ` Data successfully SENT via postMessage call to ${openerTargetOrigin}.`;
+                                        updateStatus(finalStatus);
+                                        console.log(`Successfully CALLED postMessage targeting ${openerTargetOrigin}.`);
+                                        sessionStorage.removeItem(DELIVERY_TARGET_KEY);
+                                        sessionStorage.removeItem(OPENER_TARGET_ORIGIN_KEY); // Clean up origin
+                                    } catch (postMessageError: any) {
+                                        // This catches errors during the postMessage call itself
+                                        finalStatus += ` Delivery via postMessage CALL FAILED: ${postMessageError.message}`;
+                                        updateStatus(finalStatus, true);
+                                        console.error(`Failed to CALL postMessage to ${openerTargetOrigin}:`, postMessageError);
+                                    } finally {
+                                         // Close the window after attempting send (success or fail)
+                                        console.log('Attempting to close retriever window after confirmed postMessage attempt.');
+                                        setTimeout(() => window.close(), 500); // Small delay to allow status update visibility
+                                    }
+                                };
+
+                                cancelSendBtn.onclick = () => {
+                                    console.log('User cancelled data delivery via inline button.');
+                                     // Disable buttons
+                                     if (confirmSendBtn) confirmSendBtn.disabled = true;
+                                     if (cancelSendBtn) cancelSendBtn.disabled = true;
+                                    // Show status again, hide confirmation
+                                    showConfirmationContainer(false);
+                                    showStatusContainer(true);
+                                    finalStatus = 'Delivery cancelled by user.';
+                                    updateStatus(finalStatus);
+                                    sessionStorage.removeItem(DELIVERY_TARGET_KEY); // Still cleanup keys
+                                    sessionStorage.removeItem(OPENER_TARGET_ORIGIN_KEY);
+                                    console.log('Closing retriever window after cancellation.');
+                                    setTimeout(() => window.close(), 500); // Small delay to allow status update visibility
+                                };
+                            } else {
+                                console.error("Confirmation buttons not found!");
+                                updateStatus("Error: Confirmation UI elements missing. Cannot proceed.", true);
+                                showConfirmationContainer(false);
+                                showStatusContainer(true);
+                                // Attempt close anyway?
+                                console.log('Attempting to close retriever window due to missing UI elements.');
+                                setTimeout(() => window.close(), 500);
+                            }
+
                         } else {
                             // This case remains: we need the origin to target the postMessage
                             finalStatus += ` Delivery via postMessage FAILED: Opener's target origin not found in session storage. Cannot target postMessage.`;
                             updateStatus(finalStatus, true);
                             console.error("Cannot postMessage to opener: Target origin missing from session storage.");
                             console.log('Attempting to close retriever window after failed opener delivery (missing origin).');
-                            window.close(); // Close even if origin is missing
+                            setTimeout(() => window.close(), 500); // Close even if origin is missing
                         }
                     }
                     // --- Handle named endpoint delivery ---
@@ -804,11 +885,18 @@ document.addEventListener('DOMContentLoaded', () => {
                                         return; // Stop further execution after redirect
                                     } else if (jsonData.success === true && !jsonData.redirectTo) {
                                         // Server indicated success but no redirect needed (e.g., CLI mode)
-                                        finalStatus += ` Data POST successful. You may now close this window.`;
+                                        // Recalculate totals for the final message if needed (though finalStatus already has them)
+                                        let finalTotalResources = 0;
+                                        for (const resourceType in clientFullEhrObject.fhir) {
+                                            if (Object.prototype.hasOwnProperty.call(clientFullEhrObject.fhir, resourceType) && Array.isArray(clientFullEhrObject.fhir[resourceType])) {
+                                                finalTotalResources += clientFullEhrObject.fhir[resourceType].length;
+                                            }
+                                        }
+                                        finalStatus = `Data fetched successfully! ${Object.keys(clientFullEhrObject.fhir).length} resource types, ${finalTotalResources} total resources, and ${clientFullEhrObject.attachments.length} attachments retrieved. Data POST successful. You may now close this window.`;
                                         updateStatus(finalStatus);
                                         console.log('Delivery successful, no redirect specified.');
                                         // Optional: Could attempt window.close() here, but it might be blocked
-                                        // window.close(); 
+                                        // window.close();
                                     } else {
                                         // Server indicated failure or response missing redirectTo
                                         const serverError = jsonData.error || 'unknown_server_error';
@@ -861,6 +949,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Fetch brand data and initialize the selector UI
         fetchBrandsAndInitialize();
+
+        // Ensure confirmation UI is hidden on initial load
+        showConfirmationContainer(false);
 
         // Check for delivery target in hash (keep this logic)
         const hash = window.location.hash;

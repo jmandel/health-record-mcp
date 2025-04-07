@@ -7,6 +7,7 @@ import { spawn } from 'bun'; // Needed for running build
 // --- Imports for --create-db mode ---
 import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
+import https from 'https'; // Import https
 import cors from 'cors';
 // --- End imports for --create-db ---
 
@@ -18,6 +19,7 @@ import { Implementation } from "@modelcontextprotocol/sdk/types.js"; // Import c
 // Corrected local module imports (assuming cli.ts is in src/)
 import { ClientFullEHR } from '../clientTypes.js'; // Assumes clientTypes.ts is in project root
 import { sqliteToEhr, ehrToSqlite } from './dbUtils.js'; // Assumes dbUtils.ts is in src/
+import { AppConfig, loadConfig } from './config.ts'; // Import config loading and AppConfig type
 
 // --- Tool Schemas & Logic (Imported) ---
 import {
@@ -34,14 +36,18 @@ const SERVER_INFO: Implementation = { name: "EHR-Search-MCP-CLI", version: "0.1.
 
 async function startEhrFetchServer(
     dbPath: string,
-    port: number
+    serverConfig: AppConfig['server'] // Use the server part of AppConfig
 ): Promise<void> {
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => { // Make the outer function async for cert loading
         const app = express();
         app.use(cors());
         app.use(express.json({ limit: '50mb' })); // For receiving EHR data
 
-        let server: http.Server | null = null;
+        let server: http.Server | https.Server | null = null; // Union type
+        const protocol = serverConfig.https.enabled ? 'https' : 'http';
+        const port = serverConfig.port; // Use port from config
+        const host = serverConfig.host; // Use host from config
+        const baseUrl = `${protocol}://${host}:${port}`; // Construct base URL
 
         const shutdown = (error?: Error) => {
             if (server) {
@@ -70,30 +76,32 @@ async function startEhrFetchServer(
 
         // 1. Serve static files (Retriever HTML/JS)
         // Assuming cli.ts is in src/, static is one level up
-        const staticPath = path.resolve(__dirname, '..', 'static'); 
+        const staticPath = path.resolve(__dirname, '..', 'static');
         console.error(`[Server] Serving static files from: ${staticPath}`);
-        app.use('/static', express.static(staticPath));
+        // Serve static files relative to the base URL
+        app.use(express.static(staticPath));
 
         // 2. Initial endpoint to start the flow
         app.get('/start', (req, res) => {
             console.error('[Server] /start requested. Redirecting to retriever UI...');
-            // This CLI server provides a placeholder for that.
-            const retrieverUrl = `/static/ehretriever.html#deliver-to:cli-callback`;
+            // Construct URL relative to the dynamic base URL
+            const retrieverUrl = `/ehretriever.html#deliver-to:cli-callback`;
             res.redirect(retrieverUrl);
         });
 
         // 3. Placeholder Redirect URI for SMART flow within retriever
-        app.get('/ehr-callback-placeholder', (req, res) => {
-            console.error('[Server] /ehr-callback-placeholder hit (intermediate step). Redirecting back to retriever base.');
-            // This takes the code/state from the EHR redirect and puts them back on the query string
-            // for the main retriever JS running at /static/ehretriever.html
+        app.get('/ehr-callback', (req, res) => {
+            console.error('[Server] /ehr-callback hit (intermediate step). Redirecting back to retriever base.');
+            // Construct URL relative to the dynamic base URL
             const originalUrl = req.originalUrl;
             const queryIndex = originalUrl.indexOf('?');
             const queryString = (queryIndex !== -1) ? originalUrl.substring(queryIndex) : '';
-            res.redirect(`/static/ehretriever.html${queryString}`);
+            // Redirect back to the retriever's root path
+            res.redirect(`/ehretriever.html${queryString}`);
         });
 
         // 4. Endpoint to receive final EHR data FROM the retriever
+        // Ensure this path matches the 'cli-callback' postUrl built into the retriever
         app.post('/ehr-data', async (req: Request, res: Response) => {
             console.error('[Server] /ehr-data received POST request.');
             try {
@@ -152,23 +160,48 @@ async function startEhrFetchServer(
              shutdown(err); // Shut down on unhandled errors
         });
 
-        server = http.createServer(app);
-
-        server.listen(port, () => {
-            console.error(`[Server] Temporary web server listening on http://localhost:${port}`);
-            console.error(`[Action Required] Please open your web browser to: http://localhost:${port}/start`);
-            console.error('[Server] Fill in the EHR details in the browser UI to connect and fetch data.');
-            console.error('[Server] Waiting for data to be received at /ehr-data...');
-        });
-
-        server.on('error', (error: NodeJS.ErrnoException) => {
-            console.error(`[Server] Failed to start server on port ${port}: ${error.message}`);
-            if (error.code === 'EADDRINUSE') {
-                console.error(`[Server] Port ${port} is already in use. Try a different port using --port.`);
+        // --- Create Server (HTTP or HTTPS based on config) ---
+        try {
+            if (serverConfig.https.enabled) {
+                console.log("[Server] HTTPS is enabled. Loading certificates...");
+                 if (!serverConfig.https.keyPath || !serverConfig.https.certPath) {
+                     throw new Error("HTTPS enabled but keyPath or certPath missing in server config.");
+                 }
+                try {
+                    const key = await fs.readFile(serverConfig.https.keyPath);
+                    const cert = await fs.readFile(serverConfig.https.certPath);
+                    const serverOptions: https.ServerOptions = { key: key, cert: cert };
+                    console.log(`[Server] Certificates loaded successfully.`);
+                    server = https.createServer(serverOptions, app);
+                 } catch (certError: any) {
+                    console.error(`[Server] FATAL ERROR loading certificate files:`, certError.message);
+                     // Reject the main promise, triggering shutdown logic if needed
+                     return reject(new Error(`Failed to load certificates: ${certError.message}`));
+                 }
+            } else {
+                console.log("[Server] HTTPS is disabled. Creating HTTP server.");
+                server = http.createServer(app);
             }
-             server = null; // Ensure server is null so shutdown doesn't try to close it
-            shutdown(error); // Reject the promise
-        });
+
+            server.listen(port, host, () => { // Use host from config
+                 console.error(`[Server] Temporary ${protocol.toUpperCase()} server listening on ${baseUrl}`);
+                 console.error(`[Action Required] Please open your web browser to: ${baseUrl}/start`);
+                 console.error('[Server] Fill in the EHR details in the browser UI to connect and fetch data.');
+                 console.error(`[Server] Waiting for data to be received at ${baseUrl}/ehr-data...`);
+            });
+
+            server.on('error', (error: NodeJS.ErrnoException) => {
+                console.error(`[Server] Failed to start server on ${host}:${port}: ${error.message}`);
+                if (error.code === 'EADDRINUSE') {
+                    console.error(`[Server] Address ${host}:${port} is already in use. Check config or processes using the port.`);
+                }
+                server = null; // Ensure server is null so shutdown doesn't try to close it
+                shutdown(error); // Reject the promise
+            });
+        } catch (serverSetupError: any) {
+             console.error(`[Server] Error during server setup:`, serverSetupError.message);
+             reject(serverSetupError); // Reject promise if initial setup (like cert loading check) fails
+        }
     });
 }
 
@@ -183,8 +216,8 @@ async function main() {
         .requiredOption('-d, --db <path>', 'Path to the SQLite database file (read for stdio mode, write for --create-db mode).')
         // Options for --create-db mode
         .option('--create-db', 'Initiate EHR fetch via browser UI and save to the --db path.')
-        .option('-c, --config <path>', 'Optional path to config file (used by retriever build in --create-db mode).')
-        .option('--port <port>', 'Port for the temporary web server (for --create-db).', '8088')
+        .option('-c, --config <path>', 'Optional path to config file (used by retriever build and server settings in --create-db mode).', './config.stdio.json') // Default config path
+        // .option('--port <port>', 'Port for the temporary web server (for --create-db).', '8088') // Port now comes from config
         // Add new mutually exclusive flags for handling existing DB in --create-db mode
         .option('--force-overwrite', 'If --db exists in --create-db mode, delete it before creating a new one.')
         .option('--force-concat', 'If --db exists in --create-db mode, add new data to the existing file.')
@@ -197,11 +230,31 @@ async function main() {
         // --- Create DB Mode ---
         console.error('[CLI] Running in --create-db mode.');
 
-        const port = parseInt(options.port, 10);
-        if (isNaN(port)) {
-             console.error('[CLI] Error: Invalid port number provided.');
+        // --- Load Configuration ---
+        const configPath = path.resolve(options.config);
+        let appConfig: AppConfig;
+        try {
+             console.log(`[CLI] Loading configuration from: ${configPath}`);
+             appConfig = await loadConfig(configPath);
+             // Basic validation of server config needed for this mode
+             if (!appConfig.server || typeof appConfig.server.port !== 'number' || !appConfig.server.host) {
+                 throw new Error("Server 'host' and 'port' must be defined in the config file.");
+             }
+             if (appConfig.server.https.enabled && (!appConfig.server.https.keyPath || !appConfig.server.https.certPath)) {
+                 throw new Error("HTTPS is enabled in config, but 'keyPath' or 'certPath' is missing.");
+             }
+             console.log(`[CLI] Configuration loaded successfully. Server Base URL: ${appConfig.server.baseUrl}`);
+        } catch (configError: any) {
+             console.error(`[CLI] FATAL ERROR loading or validating configuration from "${configPath}": ${configError.message}`);
              process.exit(1);
         }
+        // --- End Load Configuration ---
+
+        // const port = parseInt(options.port, 10); // Port now comes from config
+        // if (isNaN(port)) {
+        //     console.error('[CLI] Error: Invalid port number provided.');
+        //     process.exit(1);
+        // }
 
         // --- Upfront check for existing DB file ---
         try {
@@ -241,9 +294,11 @@ async function main() {
 
         // --- Dynamically build ehretriever.ts for CLI mode ---
 
-        // Define the specific endpoint needed for CLI mode
+        // Define the specific endpoint needed for CLI mode, using the loaded config base URL
+        const cliPostUrl = new URL('/ehr-data', appConfig.server.baseUrl).toString();
+        console.error(`[CLI] Configuring retriever to POST data to: ${cliPostUrl}`);
         const cliDeliveryEndpoint = {
-            "cli-callback": { postUrl: `./ehr-data` }
+            "cli-callback": { postUrl: cliPostUrl } // Use the fully qualified URL
         };
 
         // Prepare arguments for the build script
@@ -252,14 +307,20 @@ async function main() {
             buildScriptPath,
             // Pass the CLI-specific endpoint as a JSON string
             '--extra-endpoints', JSON.stringify(cliDeliveryEndpoint)
+            // Pass the original config file path to the build script as well
+            // so it can read retrieverConfig, vendorConfig etc.
         ];
-
+        // Always pass the config path used by the CLI to the build script
+        console.error(`[CLI] Using config file for retriever build: ${configPath}`);
+        buildScriptArgs.push('--config', configPath);
+        
         // If a base config file is provided via CLI args, pass it to the build script
-        if (options.config) {
-            const configPath = path.resolve(options.config);
-            console.error(`[CLI] Using config file for retriever build: ${configPath}`);
-            buildScriptArgs.push('--config', configPath);
-        }
+        // This logic is now handled by always passing options.config
+        // if (options.config) {
+        //     const configPath = path.resolve(options.config);
+        //     console.error(`[CLI] Using config file for retriever build: ${configPath}`);
+        //     buildScriptArgs.push('--config', configPath);
+        // }
 
         // Execute the build script
         console.error(`[CLI] Running build script: bun ${buildScriptArgs.join(' ')}`);
@@ -285,8 +346,8 @@ async function main() {
         // --- End dynamic build ---
 
         try {
-            // Pass only dbPath and port
-            await startEhrFetchServer(dbPath, port);
+            // Pass dbPath and the loaded server configuration
+            await startEhrFetchServer(dbPath, appConfig.server);
             console.error(`[CLI] Successfully created database: ${dbPath}`);
             process.exit(0);
         } catch (error: any) {
