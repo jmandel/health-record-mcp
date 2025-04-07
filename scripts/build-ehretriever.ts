@@ -37,10 +37,17 @@ async function main() {
         console.log('No base config file specified, starting with empty config.');
     }
 
-    // Ensure deliveryEndpoints object exists in config
-    if (!config.deliveryEndpoints || typeof config.deliveryEndpoints !== 'object') {
-        config.deliveryEndpoints = {};
+    // Ensure retrieverConfig and its sub-objects exist
+    if (!config.retrieverConfig || typeof config.retrieverConfig !== 'object') {
+        config.retrieverConfig = {};
     }
+    if (!config.retrieverConfig.deliveryEndpoints || typeof config.retrieverConfig.deliveryEndpoints !== 'object') {
+        config.retrieverConfig.deliveryEndpoints = {};
+    }
+     if (!config.retrieverConfig.vendorConfig || typeof config.retrieverConfig.vendorConfig !== 'object') {
+         config.retrieverConfig.vendorConfig = {};
+     }
+
 
     // Parse and merge extra endpoints if provided
     if (extraEndpointsJson) {
@@ -49,7 +56,7 @@ async function main() {
             const extraEndpoints = JSON.parse(extraEndpointsJson);
             if (typeof extraEndpoints === 'object' && extraEndpoints !== null) {
                 // Merge extra endpoints into the config
-                config.deliveryEndpoints = { ...config.deliveryEndpoints, ...extraEndpoints };
+                config.retrieverConfig.deliveryEndpoints = { ...config.retrieverConfig.deliveryEndpoints, ...extraEndpoints };
                 console.log('Successfully merged extra endpoints.');
             } else {
                 console.warn('Warning: --extra-endpoints value did not parse to a valid object. Ignoring.');
@@ -59,29 +66,15 @@ async function main() {
         }
     }
 
-    // --- Now extract defines from the final merged config --- 
+    // --- Now extract defines from the final merged config ---
     console.log('Extracting defines from final configuration...');
 
-    if (config.ehr) {
-        if (config.ehr.fhirBaseUrl) {
-            // Ensure strings are quoted for the define value
-            defines['__CONFIG_FHIR_BASE_URL__'] = config.ehr.fhirBaseUrl;
-        }
-        if (config.ehr.clientId) {
-            defines['__CONFIG_CLIENT_ID__'] = config.ehr.clientId;
-        }
-        if (Array.isArray(config.ehr.requiredScopes) && config.ehr.requiredScopes.length > 0) {
-            // Join scopes into a single string, then JSON.stringify to add quotes
-            defines['__CONFIG_SCOPES__'] = config.ehr.requiredScopes.join(' ');
-        }
-    }
-
-    // Inject the final merged delivery endpoints (if any)
+    // --- Inject Delivery Endpoints ---
     // Validate structure before stringifying
     const finalValidEndpoints: Record<string, { postUrl: string }> = {};
-    if (config.deliveryEndpoints && typeof config.deliveryEndpoints === 'object') {
-        for (const key in config.deliveryEndpoints) {
-            const endpointConfig = config.deliveryEndpoints[key];
+    if (config.retrieverConfig.deliveryEndpoints && typeof config.retrieverConfig.deliveryEndpoints === 'object') {
+        for (const key in config.retrieverConfig.deliveryEndpoints) {
+            const endpointConfig = config.retrieverConfig.deliveryEndpoints[key];
             if (endpointConfig && typeof endpointConfig === 'object' && typeof endpointConfig.postUrl === 'string') {
                 finalValidEndpoints[key] = { postUrl: endpointConfig.postUrl };
             } else {
@@ -90,22 +83,48 @@ async function main() {
         }
     }
     if (Object.keys(finalValidEndpoints).length > 0) {
-        // Pass the object stringified ONCE for the define value
         defines['__DELIVERY_ENDPOINTS__'] = JSON.stringify(finalValidEndpoints);
     }
 
-    // Note: Default mcp-callback endpoint is no longer automatically added here;
-    // it should be part of the base config or provided via --extra-endpoints if needed.
+    // --- Inject Vendor Config ---
+    // Validate structure before stringifying
+    const finalValidVendorConfig: Record<string, { clientId: string, scopes: string, redirectUrl?: string }> = {};
+    if (config.retrieverConfig.vendorConfig && typeof config.retrieverConfig.vendorConfig === 'object') {
+         for (const key in config.retrieverConfig.vendorConfig) {
+             const vendorConf = config.retrieverConfig.vendorConfig[key];
+             if (vendorConf && typeof vendorConf === 'object' &&
+                 typeof vendorConf.clientId === 'string' &&
+                 typeof vendorConf.scopes === 'string' &&
+                 (typeof vendorConf.redirectUrl === 'undefined' || typeof vendorConf.redirectUrl === 'string'))
+             {
+                 finalValidVendorConfig[key] = {
+                     clientId: vendorConf.clientId,
+                     scopes: vendorConf.scopes,
+                     ...(vendorConf.redirectUrl && { redirectUrl: vendorConf.redirectUrl }) // Include redirectUrl only if it exists
+                 };
+             } else {
+                 console.warn(`Warning: Invalid structure or missing string properties (clientId, scopes) for vendorConfig '${key}'. Skipping.`);
+             }
+         }
+     }
+     if (Object.keys(finalValidVendorConfig).length > 0) {
+         defines['__VENDOR_CONFIG__'] = JSON.stringify(finalValidVendorConfig);
+     } else {
+        // Still define it as an empty object if nothing valid was found or provided
+        defines['__VENDOR_CONFIG__'] = JSON.stringify({});
+        console.warn('Warning: No valid vendor configurations found in config. Injecting empty __VENDOR_CONFIG__ = {}.');
+     }
+
 
     console.log('Injecting defines for build:', defines);
 
     // --- Define source and output paths ---
     const staticDir = path.resolve(process.cwd(), 'static');
     const outputDir = path.resolve(staticDir, 'dist');
-    const sourceTs = path.resolve(process.cwd(), 'ehretriever.ts'); // Assuming TS source is in static/
-    const sourceHtml = path.resolve(staticDir, 'ehretriever.html'); // Assuming HTML source is in static/
+    const sourceTs = path.resolve(process.cwd(), 'ehretriever.ts'); // Assuming TS source is in project root
+    // const sourceHtml = path.resolve(staticDir, 'ehretriever.html'); // Assuming HTML source is in static/
     const outputJs = path.resolve(outputDir, 'ehretriever.bundle.js');
-    const outputHtml = path.resolve(outputDir, 'ehretriever.html');
+    // const outputHtml = path.resolve(outputDir, 'ehretriever.html');
 
     // --- Ensure output directory exists ---
     console.log(`Ensuring output directory exists: ${outputDir}`);
@@ -121,11 +140,9 @@ async function main() {
 
     // Add defines to the build arguments
     for (const key in defines) {
-        // Pass KEY=VALUE as a single argument element to spawn
-        buildArgs.push('--define', `${key}='${defines[key]}'`);
+        // Pass KEY='VALUE' (note the single quotes around the JSON stringified value)
+        buildArgs.push('--define', `${key}=${defines[key]}`);
     }
-
-    // Add any remaining arguments
 
     console.log(`Running: bun ${buildArgs.join(' ')}`);
 

@@ -54,6 +54,24 @@ document.addEventListener('DOMContentLoaded', async () => {
         console.log("[DB Picker] Received records:", records);
         loadingMessage.style.display = 'none';
 
+        // *** NEW: Check if records array is empty ***
+        if (!Array.isArray(records) || records.length === 0) {
+            console.log("[DB Picker] No existing stored records found or persistence disabled. Redirecting to new EHR flow...");
+            try {
+                 // Redirect immediately to the new backend endpoint
+                 const targetUrl = buildUrl('/initiate-new-ehr-flow', {
+                     authzRequestId // Pass only the picker session ID
+                 });
+                 console.log("[DB Picker] Redirecting to initiate new EHR flow:", targetUrl);
+                 window.location.href = targetUrl;
+                 return; // Stop further execution of this function
+
+            } catch (error) {
+                displayError(`Failed to initiate new EHR connection automatically: ${error.message}`);
+                // If redirect fails, we might fall through, but that's unlikely
+            }
+        }
+
         // 3. Populate tiles
         if (Array.isArray(records) && records.length > 0) {
             records.forEach(record => {

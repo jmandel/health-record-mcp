@@ -5,52 +5,143 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EHR Data Retriever</title>
     <style>
-        body { font-family: sans-serif; padding: 1em; }
+        /* Basic Reset & Defaults */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+            line-height: 1.6; background-color: #f4f7f6; color: #333; padding: 1rem;
+        }
+
+        /* App Layout */
+        .app-container {
+            max-width: 1200px; margin: 2rem auto; padding: 1rem; background-color: #fff;
+            border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+        }
+        h1 { text-align: center; margin-bottom: 1.5rem; color: #2c3e50; }
+
+        /* Brand Selector Search Area */
+        .brand-controls-container { /* Keep wrapper for potential future controls */
+            margin-bottom: 2rem;
+        }
+        .brand-search-container {
+             position: relative; /* For spinner */
+        }
+        .brand-search-container label { /* Optional: Add label */
+             display: block; margin-bottom: 0.4rem; font-weight: bold;
+             font-size: 0.9rem; color: #555;
+        }
+        #brand-search-input {
+            width: 100%; padding: 0.75rem 1rem; font-size: 1rem; border: 1px solid #ccc;
+            border-radius: 6px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.06);
+        }
+        #brand-search-input:focus { outline: none; border-color: #3498db; box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.2); }
+        #brand-search-spinner {
+            position: absolute; right: 10px; top: 50%; transform: translateY(-50%); width: 20px; height: 20px;
+            border: 3px solid rgba(0, 0, 0, 0.1); border-left-color: #3498db; border-radius: 50%;
+            animation: spin 1s linear infinite; display: none;
+         }
+        /* Adjust spinner position if label is added */
+        .brand-search-container label + #brand-search-input + #brand-search-spinner {
+             top: calc(50% + 10px); /* Approx vertical center relative to input */
+        }
+        @keyframes spin { to { transform: translateY(-50%) rotate(360deg); } }
+
+
+        /* Brand Selector Results Grid */
+        #brand-results-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 1.5rem; min-height: 100px; }
+        .brand-tile { background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 1.25rem; cursor: pointer; transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out; box-shadow: 0 1px 3px rgba(0,0,0,0.05); display: flex; flex-direction: column; justify-content: space-between; }
+        .brand-tile:hover { transform: translateY(-3px); box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+        .brand-tile h3 { font-size: 1.1rem; margin-bottom: 0.5rem; color: #3498db; word-break: break-word; }
+        .brand-tile p { font-size: 0.9rem; color: #555; margin-bottom: 0.3rem; word-break: break-word; }
+        .brand-tile .provider-info { font-style: italic; color: #777; font-size: 0.85rem; }
+        .brand-tile .location-info { font-weight: bold; color: #444; font-size: 0.85rem; }
+
+        /* Brand Selector Modal Styles */
+        .brand-modal-backdrop { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.6); display: flex; justify-content: center; align-items: center; z-index: 1000; opacity: 0; visibility: hidden; transition: opacity 0.3s ease, visibility 0s 0.3s linear; }
+        .brand-modal-backdrop.visible { opacity: 1; visibility: visible; transition: opacity 0.3s ease; }
+        .brand-modal { background-color: #fff; padding: 2rem; border-radius: 8px; box-shadow: 0 5px 15px rgba(0,0,0,0.2); max-width: 500px; width: 90%; transform: scale(0.9); transition: transform 0.3s ease; }
+        .brand-modal-backdrop.visible .brand-modal { transform: scale(1.0); }
+        .brand-modal h2 { margin-top: 0; margin-bottom: 1rem; color: #2c3e50; }
+        #brand-modal-details p { margin-bottom: 0.5rem; color: #333; } #brand-modal-details strong { color: #555; }
+        #brand-modal-details ul { list-style: none; padding-left: 0; margin-top: 0.5rem;} #brand-modal-details li { margin-bottom: 0.25rem; font-size: 0.9em; color: #444;}
+        .brand-modal-actions { margin-top: 1.5rem; display: flex; justify-content: flex-end; gap: 0.75rem; }
+        .brand-modal-button { padding: 0.6rem 1.2rem; font-size: 0.95rem; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.2s ease; }
+        .brand-modal-button.connect { background-color: #2ecc71; color: white; } .brand-modal-button.connect:hover { background-color: #27ae60; }
+        .brand-modal-button.cancel { background-color: #e74c3c; color: white; } .brand-modal-button.cancel:hover { background-color: #c0392b; }
+
+        /* Brand Utility */
+        .brand-status-message { grid-column: 1 / -1; text-align: center; color: #777; font-style: italic; padding: 2rem; }
+        #brand-initial-loading-message { text-align: center; padding: 2rem; color: #555; font-size: 1.1em; }
+
+        /* Original EHR Retriever Styles (kept separate) */
+        /* body { font-family: sans-serif; padding: 1em; } */ /* Overlaps with brand styles, adjusted above */
         label { display: block; margin-bottom: 0.5em; }
         input[type="text"], input[type="url"] { width: 90%; max-width: 400px; padding: 0.5em; margin-bottom: 1em; box-sizing: border-box; }
         button { padding: 0.8em 1.5em; cursor: pointer; }
         #form-container, #status-container { margin-top: 1em; }
         #status-container { border: 1px solid #ccc; padding: 1em; background-color: #f9f9f9; }
+
     </style>
 </head>
 <body>
-    <h1>EHR Data Retriever (Client-Side)</h1>
+    <div class="app-container">
+        <h1>Connect to your record</h1>
 
-    <!-- Bundled script will be included here -->
-    <script src="./dist/ehretriever.bundle.js"></script>
-    <div id="form-container">
-        <p>Enter EHR details to initiate SMART authorization:</p>
-        <form id="ehr-form">
-            <div>
-                <label for="ehr_base_url">EHR FHIR Base URL:</label>
-                <input type="url" id="ehr_base_url" name="ehr_base_url" required>
+        <!-- ===== BRAND SELECTOR UI ===== -->
+        <div id="brand-selector-container">
+            <div id="brand-initial-loading-message">Loading organizations data...</div>
+            <div class="brand-controls-container" id="brand-controls-container">
+                <div class="brand-search-container">
+                     <!-- <label for="brand-search-input">Search Organizations</label> -->
+                     <input autofocus type="search" id="brand-search-input" placeholder="Search by name, provider, city, state, zip..." disabled>
+                     <div id="brand-search-spinner"></div>
+                 </div>
+             </div>
+            <div id="brand-results-container" style="display: none;"> <!-- Initially hidden -->
+                <!-- Results populated by JS -->
             </div>
-            <div>
-                <label for="ehr_client_id">EHR Application Client ID:</label>
-                <input type="text" id="ehr_client_id" name="ehr_client_id" required>
+
+            <!-- ===== Pagination Controls ===== -->
+            <div id="brand-pagination-controls" style="display: none; margin-top: 1.5rem; text-align: center;">
+                <button id="brand-prev-btn" disabled>&laquo; Previous</button>
+                <span id="brand-page-info" style="margin: 0 1rem; display: inline-block; min-width: 80px;">Page 1 of 1</span>
+                <button id="brand-next-btn" disabled>Next &raquo;</button>
             </div>
-            <div>
-                <label for="ehr_scopes">Requested Scopes (space-separated):</label>
-                <input type="text" id="ehr_scopes" name="ehr_scopes" value="patient/*.read launch/patient offline_access" required>
+            <!-- =============================== -->
+
+        </div>
+        <!-- ===== END BRAND SELECTOR UI ===== -->
+
+        <!-- Bundled script will be included here -->
+        <script src="./dist/ehretriever.bundle.js"></script>
+
+        <!-- Status/Progress containers remain unchanged -->
+        <div id="status-container" style="display: none;">
+            <h2>Status</h2>
+            <p id="status-message">Loading...</p>
+        </div>
+
+        <div id="progress-container" style="display: none; margin-top: 1em;">
+            <h3>Fetch Progress</h3>
+            <progress id="fetch-progress" max="100" value="0" style="width: 90%; max-width: 400px;"></progress>
+            <span id="progress-text" style="margin-left: 10px;">(0/0)</span>
+        </div>
+
+    </div> <!-- End app-container -->
+
+    <!-- Brand Selector Modal Structure -->
+    <div id="brand-modal-backdrop" class="brand-modal-backdrop">
+        <div id="brand-modal" class="brand-modal">
+            <h2 id="brand-modal-title">Confirm Selection</h2>
+            <div id="brand-modal-details"></div>
+            <div class="brand-modal-actions">
+                <button id="brand-modal-cancel" class="brand-modal-button cancel">Cancel</button>
+                <button id="brand-modal-connect" class="brand-modal-button connect">Connect</button>
             </div>
-            <div>
-                <label for="redirect_uri">Redirect URI (optional, defaults to this page):</label>
-                <input type="url" id="redirect_uri" name="redirect_uri">
-            </div>
-            <button type="submit">Connect & Fetch Data</button>
-        </form>
+        </div>
     </div>
 
-    <div id="status-container" style="display: none;">
-        <h2>Status</h2>
-        <p id="status-message">Loading...</p>
-    </div>
-
-    <div id="progress-container" style="display: none; margin-top: 1em;">
-        <h3>Fetch Progress</h3>
-        <progress id="fetch-progress" max="100" value="0" style="width: 90%; max-width: 400px;"></progress>
-        <span id="progress-text" style="margin-left: 10px;">(0/0)</span>
-    </div>
 
 </body>
 </html> 

@@ -16,17 +16,21 @@ import https from 'https';
 import { execSync } from 'child_process'; // Import for running build command
 import { Command } from 'commander';
 import path from 'path'; // Import path module
+import { v4 as uuidv4 } from 'uuid';
 
 // --- Local Imports ---
 import { ClientFullEHR } from '../clientTypes.js'; // Import ClientFullEHR
-import { AppConfig, loadConfig } from './config.ts'; 
-import { addOauthRoutesAndProvider } from './oauth.ts'; 
-import { getSessionDb, loadSessionFromDb, activeSessions, activeSseTransports } from './sessionUtils.js'; // Import session/DB utils and state
+import { AppConfig, loadConfig } from './config.ts';
+import { addOauthRoutesAndProvider } from './oauth.ts';
+import { UserSession, createOrOpenDbForSession, activeSessions, activeSseTransports } from './sessionUtils.js'; // Import the new DB function and state
 import {
     registerEhrTools // Import the new function
-} from './tools.js'; 
+} from './tools.js';
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import { ehrToSqlite, sqliteToEhr } from './dbUtils.js'; // Import functions from dbUtils
+import type { AuthzRequestState } from './oauth';
+import { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 
 // --- Add Type Declaration for req.auth ---
 declare module "express-serve-static-core" {
@@ -36,7 +40,7 @@ declare module "express-serve-static-core" {
 }
 
 // --- Global Config Variable ---
-// This will be populated by loadConfig() during startup
+// Declared here, loaded in main()
 let config: AppConfig;
 
 // --- Runtime Checks (Using Config) ---
@@ -60,22 +64,48 @@ async function getSseContext(
     if (!transportEntry) {
         throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
     }
-    const mcpAccessToken = transportEntry.mcpAccessToken;
-    const session = activeSessions.get(mcpAccessToken);
+    // Correct way to iterate/search a Map's values
+    const session: UserSession | undefined = Array.from(activeSessions.values()).find(session => session.transportSessionId === transportSessionId);
+    
+    const mcpAccessToken = session?.sessionId; // Still useful for logging
     if (!session) {
+        // This indicates an inconsistency if transportEntry exists but session doesn't
+        // Use mcpAccessToken cautiously here as it might be undefined
+        console.error(`[SSE Context] Inconsistency: Transport ${transportSessionId} exists but no corresponding session found in activeSessions.`);
         throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
+    }
+
+    // Ensure config is loaded before trying to use it
+    if (!config) {
+         console.error(`[SSE Context] CRITICAL: AppConfig not loaded before getSseContext call for session ${mcpAccessToken?.substring(0,8)}.`);
+         throw new McpError(ErrorCode.InternalError, "Server configuration not available.");
     }
 
     let db: Database | undefined = undefined;
     let fullEhr: ClientFullEHR | undefined = undefined;
 
-    db = await getSessionDb(session); // Handles DB loading/creation
-    // grep and eval need fullEhr
+    try {
+        // Use the centralized function to get/open/create the DB handle
+        db = await createOrOpenDbForSession(session, config);
+    } catch (dbError: any) {
+         console.error(`[SSE Context] Error getting/creating DB for session ${mcpAccessToken?.substring(0,8)}:`, dbError);
+         // Propagate a generic internal error to the client
+         throw new McpError(ErrorCode.InternalError, `Failed to access session data store: ${dbError.message}`);
+    }
+
+    // grep and eval need fullEhr - ensure it's loaded (should be by createSession/loadSession)
+    // If DB is in-memory and wasn't populated initially, createOrOpenDb handles population now.
     if (!session.fullEhr) {
+        // This might happen if loading from DB failed but DB handle was obtained?
+        // Or if session somehow got created without fullEhr.
+        console.warn(`[SSE Context] Session ${mcpAccessToken?.substring(0,8)} exists and DB handle obtained, but fullEhr is missing.`);
+        // Depending on tool requirements, might not be critical, but likely indicates an issue.
+        // For now, let's throw as tools expect it.
         throw new McpError(ErrorCode.InternalError, "Session data (fullEhr) not found for active connection.");
     }
     fullEhr = session.fullEhr;
 
+    // Return the db handle obtained/created by createOrOpenDbForSession
     return { fullEhr, db };
 }
 
@@ -128,13 +158,11 @@ async function main() {
             next();
         });
 
-        // --- Serve Static Files from ./static --- 
-        const staticPath = path.resolve(process.cwd(), 'static'); 
-        console.log(`[STATIC] Serving static files from: ${staticPath}`);
-        app.use('/static', express.static(staticPath)); 
+        app.use(express.static( 'static'))
+
 
         // --- Add OAuth Routes and Get Provider ---
-        const oauthProvider = addOauthRoutesAndProvider(app, config, activeSessions, activeSseTransports, loadSessionFromDb);
+        const oauthProvider = addOauthRoutesAndProvider(app, config, activeSessions);
         console.log("[INIT] OAuth routes and provider initialized.");
         
         // --- Custom Bearer Auth Middleware using the returned provider ---
@@ -145,28 +173,29 @@ async function main() {
         // --- API Endpoints (Not OAuth related) ---
 
         app.get('/api/list-stored-records', async (req, res) => { // Renamed endpoint
-            if (!config.persistence.enabled) {
+            if (!config.persistence?.enabled) {
                 console.log("[/api/list-stored-records] Request received but persistence is disabled.");
                 res.json([]); // Return empty array if persistence is off
                 return;
             }
-            if (!config.persistence.directory) {
+            const persistenceDir = config.persistence?.directory; // Use local var for clarity
+            if (!persistenceDir) {
                 console.error("[/api/list-stored-records] Persistence directory not configured.");
                 res.status(500).json({ error: "Server configuration error: persistence directory missing." });
                 return;
             }
         
-            console.log(`[/api/list-stored-records] Scanning directory: ${config.persistence.directory}`);
+            console.log(`[/api/list-stored-records] Scanning directory: ${persistenceDir}`);
             const recordList: any[] = []; // Renamed variable
             let db: Database | undefined = undefined;
         
             try {
                 // Ensure the directory exists
                 try {
-                    await fs.access(config.persistence.directory);
+                    await fs.access(persistenceDir);
                 } catch (dirError: any) {
                     if (dirError.code === 'ENOENT') {
-                        console.log(`[/api/list-stored-records] Persistence directory ${config.persistence.directory} does not exist. Returning empty list.`);
+                        console.log(`[/api/list-stored-records] Persistence directory ${persistenceDir} does not exist. Returning empty list.`);
                         res.json([]); // Directory doesn't exist, so no records
                         return;
                     } else {
@@ -174,11 +203,11 @@ async function main() {
                     }
                 }
         
-                const files = await fs.readdir(config.persistence.directory);
+                const files = await fs.readdir(persistenceDir);
                 for (const file of files) {
                     if (file.endsWith('.sqlite')) {
                         const databaseId = file.replace('.sqlite', '');
-                        const filePath = path.join(config.persistence.directory, file);
+                        const filePath = path.join(persistenceDir, file);
                         console.log(`[/api/list-stored-records] Processing file: ${file} (DB ID: ${databaseId})`);
         
                         try {
@@ -253,9 +282,11 @@ async function main() {
                 res.status(401).json({ error: "invalid_token", error_description: "Session associated with token not found or expired." });
                 return;
             }
+            console.log(`[SSE GET] Session found for token ${mcpAccessToken.substring(0, 8)}... Client: ${authInfo.clientId}`);
+            console.log(session);
         
             // --- Verify Client ID Match (Optional but recommended unless checks disabled) ---
-            if (!config.security.disableClientChecks && session.mcpClientInfo.client_id !== authInfo.clientId) {
+            if (!config.security?.disableClientChecks && session.mcpClientInfo.client_id !== authInfo.clientId) {
                  // Should be rare if token verification worked, but could happen with token theft / session mismatch
                 console.error(`[SSE GET] Forbidden: Client ID mismatch for token ${mcpAccessToken.substring(0, 8)}... Token Client: ${authInfo.clientId}, Session Client: ${session.mcpClientInfo.client_id}`);
                 res.set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Token client ID does not match session client ID."`);
@@ -263,20 +294,6 @@ async function main() {
                 res.status(403).json({ error: "forbidden", error_description: "Token client ID does not match session client ID." });
                 return;
             }
-        
-            // --- Check for existing transport for this session ---
-             if (session.transportSessionId && activeSseTransports.has(session.transportSessionId)) {
-                 console.warn(`[SSE GET] Client ${authInfo.clientId} attempting to reconnect SSE for token ${mcpAccessToken.substring(0, 8)}... while another transport (${session.transportSessionId}) is already active. Closing old transport.`);
-                 const oldTransportEntry = activeSseTransports.get(session.transportSessionId);
-                 try {
-                     oldTransportEntry?.transport.close(); // Attempt to close the old connection
-                 } catch (closeErr) {
-                     console.error(`[SSE GET] Error closing old transport ${session.transportSessionId}:`, closeErr);
-                 }
-                 activeSseTransports.delete(session.transportSessionId);
-                 session.transportSessionId = ""; // Clear the old ID reference
-             }
-        
         
             // --- Establish SSE Connection ---
             let transport: SSEServerTransport | null = null;
@@ -291,32 +308,9 @@ async function main() {
                 // Store the active transport, linking it to the MCP token and auth info
                 activeSseTransports.set(transportSessionId, { 
                     transport: transport,
-                    mcpAccessToken: mcpAccessToken,
-                    authInfo: authInfo // Store auth info for potential use in POST handler
                 });
                 console.log(`[SSE GET] Client connected & authenticated. Transport Session ID: ${transportSessionId}, linked to MCP Token: ${mcpAccessToken.substring(0, 8)}...`);
         
-                // --- Handle Client Disconnection ---
-                res.on('close', () => {
-                    console.log(`[SSE Closed] Client disconnected. Cleaning up transport session: ${transportSessionId}`);
-                    // Remove the transport from the active map
-                    activeSseTransports.delete(transportSessionId); 
-                    // If the session still references this transport ID, clear it
-                    // Check session exists in case it was cleared by token revocation during the connection
-                    const currentSession = activeSessions.get(mcpAccessToken); 
-                    if (currentSession && currentSession.transportSessionId === transportSessionId) { 
-                        currentSession.transportSessionId = ""; // Mark session as disconnected
-                         console.log(`[SSE Closed] Cleared transportSessionId for MCP Token ${mcpAccessToken.substring(0, 8)}...`);
-                    }
-        
-                    // Only if we want to delete sessions when the transport closes
-                    // (Useful debugging with MCP Inspector tppl)
-                    // console.log(`[SSE Closed] Deleting session for MCP Token ${mcpAccessToken.substring(0, 8)}...`);
-                    // activeSessions.delete(mcpAccessToken);
-                });
-        
-                // --- Connect the MCP Server to the Transport ---
-                // This starts the MCP message handling loop for this connection
                 await mcpServer.connect(transport);
                  console.log(`[SSE GET] MCP Server connected to transport ${transportSessionId}. Waiting for messages...`);
         
@@ -350,20 +344,30 @@ async function main() {
         });
         
         // --- MCP Message POST Endpoint ---
-        // Needs express.json() to parse message body
-        app.post("/mcp-messages", (req: Request, res: Response) => { // Added JSON middleware with limit
-            // Get session ID from query param
-            const transportSessionId = req.query.sessionId as string | undefined; // Use transport session ID
-            if (!transportSessionId) {
-                console.warn("[MCP POST] Received POST without transport sessionId query param.");
-                res.status(400).send("Missing sessionId query parameter");
+        app.post("/mcp-messages", bearerAuthMiddleware, (req: Request, res: Response) => { 
+            const authInfo = req.auth; // Provided by bearerAuthMiddleware
+            if (!authInfo) {
+                console.error("[MCP POST] Middleware succeeded but req.auth is missing!");
+                if (!res.headersSent) res.status(500).send("Authentication failed unexpectedly.");
                 return;
             }
-        
+
+            const session = activeSessions.get(authInfo.token);
+            if (!session) {
+                console.warn("[MCP POST] Received POST for unknown/expired sessionId: ${req.query.sessionId}");
+                res.status(404).send("Invalid or expired sessionId"); 
+                return;
+            }
+            if (!session.transportSessionId) {
+                console.warn("[MCP POST] Received POST for session with no transport sessionId.");
+                res.status(404).send("Invalid or expired sessionId"); 
+                return;
+            }
+            
             // Find the active transport entry
-            const transportEntry = activeSseTransports.get(transportSessionId); // Use transport session ID
+            const transportEntry = activeSseTransports.get(session.transportSessionId); // Use transport session ID
             if (!transportEntry) {
-                console.warn(`[MCP POST] Received POST for unknown/expired transport sessionId: ${transportSessionId}`);
+                console.warn(`[MCP POST] Received POST for unknown/expired transport sessionId: ${session.transportSessionId}`);
                 // 404 or 410 Gone might be appropriate if the session *was* active but disconnected
                 res.status(404).send("Invalid or expired sessionId"); 
                 return;
@@ -371,7 +375,7 @@ async function main() {
         
             const transport = transportEntry.transport;
             try {
-                console.log(`[MCP POST] Received POST for transport session ${transportSessionId}, linked to MCP Token: ${transportEntry.mcpAccessToken.substring(0,8)}...`);
+                console.log(`[MCP POST] Received POST for transport session ${session.transportSessionId}, linked to MCP Token: ${session.sessionId.substring(0,8)}...`);
                 // Log headers or body if needed for debugging (careful with sensitive data)
                 // console.log("[MCP POST] Headers:", req.headers);
                 // console.log("[MCP POST] Body (partial):", JSON.stringify(req.body).substring(0, 200)); 
@@ -379,11 +383,11 @@ async function main() {
                 // Pass the request and response to the transport's handler
                 // The SDK's handlePostMessage will parse the MCP message, find the handler, execute it, and send the response.
                 transport.handlePostMessage(req, res);
-                console.log(`[MCP POST] Handled POST for session ${transportSessionId}`);
+                console.log(`[MCP POST] Handled POST for session ${session.transportSessionId}`);
         
             } catch (error) {
                 // Catch errors specifically from handlePostMessage (e.g., invalid message format, handler execution error)
-                console.error(`[MCP POST] Error in handlePostMessage for session ${transportSessionId}:`, error);
+                console.error(`[MCP POST] Error in handlePostMessage for session ${session.transportSessionId}:`, error);
                 if (!res.headersSent) {
                     // Send a generic 500 error if the handler failed internally
                     res.status(500).send("Error processing message");
@@ -409,7 +413,7 @@ async function main() {
             res.status(500).json({ 
                 error: "Internal Server Error", 
                 // Avoid sending detailed error messages in production unless configured
-                message: err.message 
+                message: "An unexpected internal server error occurred." // Generic message
             });
         });
 

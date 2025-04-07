@@ -25,9 +25,9 @@ import { AppConfig } from './config.js'; // Import AppConfig
 import {
     UserSession,
     ActiveTransportEntry,
-    createSessionFromEhrData, // Function to create/save session
-    loadSessionFromDb,         // Function to load session
-    getSqliteFilePath          // Function to get DB path
+    createSessionFromEhrData, // Now synchronous
+    loadSessionFromDb,         // Accepts filename + config now
+    // getSqliteFilePath is still used internally by sessionUtils
 } from './sessionUtils.js';
 import { ClientFullEHR } from '../clientTypes.js'; // Assuming clientTypes is in parent dir
 import {
@@ -44,7 +44,7 @@ const PKCE_METHOD_S256 = 'S256';
 // --- Internal State Management ---
 
 // Temporary store for MCP authorization requests before user picks DB/connects EHR
-export interface AuthzRequestState { 
+export interface AuthzRequestState {
     authzRequestId: string;
     mcpClientId: string;
     mcpRedirectUri: string;
@@ -59,7 +59,7 @@ const AUTHZ_REQUEST_EXPIRY_MS = 5 * 60 * 1000; // Renamed from PICKER_SESSION_EX
 
 // Temporary store for state between initiating new EHR flow and the callback
 interface AuthFlowState {
-    authFlowId: string; // Unique ID for this specific auth flow instance
+    authFlowId: string;
     mcpClientId: string;
     mcpRedirectUri: string;
     mcpCodeChallenge?: string;
@@ -241,7 +241,7 @@ class MyOAuthServerProvider implements OAuthServerProvider {
         const authInfo: AuthInfo = {
             token: token,
             // Client ID associated with the session (verified at token exchange)
-            clientId: session.mcpClientInfo.client_id, 
+            clientId: session.mcpClientInfo.client_id,
             scopes: scopesArray,
         };
         return authInfo;
@@ -319,7 +319,7 @@ class MyOAuthServerProvider implements OAuthServerProvider {
     async exchangeAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string): Promise<OAuthTokens> {
         console.error("[AUTH Provider] exchangeAuthorizationCode() called but not implemented. Logic is currently in POST /token route.");
         // Params like redirect_uri, code_verifier would need to be accessed differently if this signature is correct
-        // console.log("[AUTH Provider] exchangeAuthorizationCode params received:", params); 
+        // console.log("[AUTH Provider] exchangeAuthorizationCode params received:", params);
         throw new ServerError("Authorization code exchange logic not implemented in provider.");
         // TODO: Refactor logic from POST /token route handler (for authorization_code grant) here
     }
@@ -334,10 +334,8 @@ class MyOAuthServerProvider implements OAuthServerProvider {
 
 export function addOauthRoutesAndProvider(
     app: Application,
-    config: AppConfig,
+    config: AppConfig, // Accept AppConfig
     activeSessions: Map<string, UserSession>,
-    activeSseTransports: Map<string, ActiveTransportEntry>,
-    loadSessionFromDb: (sessionId: string, mcpClientInfo: OAuthClientInformationFull, dbPath: string) => Promise<UserSession | null>,
 ): OAuthServerProvider {
 
     const oauthProvider = new MyOAuthServerProvider(activeSessions);
@@ -398,7 +396,7 @@ export function addOauthRoutesAndProvider(
             authzRequests.set(authzRequestId, authzState); // Renamed
 
             console.log(`[/authorize GET] Stored authz request ${authzRequestId} for client ${client_id}. Redirecting to picker UI.`); // Renamed
-            const pickerUrl = `/static/db-picker.html?authzRequestId=${authzRequestId}`; // Renamed
+            const pickerUrl = `/db-picker.html?authzRequestId=${authzRequestId}`; // Renamed
             res.redirect(pickerUrl);
 
         } catch (error) {
@@ -409,76 +407,62 @@ export function addOauthRoutesAndProvider(
 
     app.get('/initiate-session-from-db', async (req, res, next): Promise<void> => {
         console.log("[/initiate-session-from-db GET] Received request query:", req.query);
-        const databaseId = req.query.databaseId as string | undefined;
-        const authzRequestId = req.query.authzRequestId as string | undefined; // Renamed
+        const databaseId = req.query.databaseId as string | undefined; // This is the databaseFilename
+        const authzRequestId = req.query.authzRequestId as string | undefined;
 
-        let authzRequestState: AuthzRequestState | undefined = undefined; // Renamed
-        let loadedSession: UserSession | null = null; // Keep track of loaded session for cleanup
+        let authzRequestState: AuthzRequestState | undefined = undefined;
+        let loadedSession: UserSession | null = null;
+        // let db: Database | undefined = undefined; // No longer need to manage DB handle here
 
         try {
             // --- Parameter Validation (Query Params) ---
             if (!databaseId) throw new InvalidRequestError("Missing required query parameter: databaseId");
-            if (!authzRequestId) throw new InvalidRequestError("Missing required query parameter: authzRequestId"); // Renamed
-            console.log(`[/initiate-session-from-db GET] Params: dbId=${databaseId}, authzId=${authzRequestId}`); // Renamed
+            if (!authzRequestId) throw new InvalidRequestError("Missing required query parameter: authzRequestId");
+            console.log(`[/initiate-session-from-db GET] Params: dbId=${databaseId}, authzId=${authzRequestId}`);
 
-            // --- Retrieve and Validate Authz Request State --- // Renamed
-            authzRequestState = authzRequests.get(authzRequestId); // Renamed
+            // --- Retrieve and Validate Authz Request State ---
+            authzRequestState = authzRequests.get(authzRequestId);
             if (!authzRequestState) {
-                console.warn(`[/initiate-session-from-db GET] Authz request state not found or expired: ${authzRequestId}`); // Renamed
-                // Don't throw immediately, try to redirect with error if possible later
+                console.warn(`[/initiate-session-from-db GET] Authz request state not found or expired: ${authzRequestId}`);
+                throw new InvalidRequestError("Invalid or expired authorization request ID.");
             } else {
-                 authzRequests.delete(authzRequestId); // Consume the state only if found // Renamed
-                 console.log(`[/initiate-session-from-db GET] Retrieved authz state for client ${authzRequestState.mcpClientId}`); // Renamed
-                 // Optional: Add expiry check if AuthzRequestState has expiry property
+                 authzRequests.delete(authzRequestId); // Consume the state
+                 console.log(`[/initiate-session-from-db GET] Retrieved authz state for client ${authzRequestState.mcpClientId}`);
             }
-             // Ensure authzRequestState exists before proceeding
-             if (!authzRequestState) throw new InvalidRequestError("Invalid or expired authorization request ID."); // Renamed
 
-
-             // --- Get/Validate MCP Client Info (using authzRequestState) --- // Renamed
-             // Need client info *before* calling loadSessionFromDb
+             // --- Get/Validate MCP Client Info (using authzRequestState) ---
              const client = await oauthProvider.getClient(authzRequestState.mcpClientId);
              if (!client) {
-                 console.error(`[/initiate-session-from-db GET] Client ${authzRequestState.mcpClientId} not found after retrieving authz state.`); // Renamed
+                 console.error(`[/initiate-session-from-db GET] Client ${authzRequestState.mcpClientId} not found after retrieving authz state.`);
                  throw new InvalidClientError(`MCP Client not found: ${authzRequestState.mcpClientId}`);
              }
              if (!client.redirect_uris.includes(authzRequestState.mcpRedirectUri)) {
-                  console.error(`[/initiate-session-from-db GET] Redirect URI mismatch. Client: ${client.redirect_uris}, Authz: ${authzRequestState.mcpRedirectUri}`); // Renamed
+                  console.error(`[/initiate-session-from-db GET] Redirect URI mismatch. Client: ${client.redirect_uris}, Authz: ${authzRequestState.mcpRedirectUri}`);
                  throw new InvalidRequestError("Redirect URI from authorization request does not match client registration.");
              }
-             // Assign scope from authz state to the client info we'll use
-             // This might be redundant if we rely solely on authzRequestState.scope later
-             // client.scope = authzRequestState.mcpScope;
 
-            // --- Load Session Data --- Requires client info and dbPath
-            if (!config.persistence?.directory) {
-                 console.error("[/initiate-session-from-db GET] Persistence is not enabled or configured.");
-                 throw new ServerError("Persistence not configured on server.");
-            }
-            const dbPath = getSqliteFilePath(config.persistence.directory, databaseId);
-            loadedSession = await loadSessionFromDb(databaseId, client, dbPath);
+            // --- Load Session Data using Filename ---
+            // Persistence check happens inside loadSessionFromDb via config
+            console.log(`[/initiate-session-from-db GET] Calling loadSessionFromDb for file ID: ${databaseId}`);
+            loadedSession = await loadSessionFromDb(client, databaseId, authzRequestState, config);
 
             if (!loadedSession) {
-                console.error(`[/initiate-session-from-db GET] Failed to load session from DB: ${dbPath}`);
-                // Use a specific error or map to OAuth error
-                throw new ServerError("Failed to load specified record."); // Or InvalidRequestError?
+                // loadSessionFromDb handles DB opening/closing and internal errors (like sqliteToEhr errors)
+                console.error(`[/initiate-session-from-db GET] loadSessionFromDb failed for file ID: ${databaseId}`);
+                // Map the generic failure to a server error for the client,
+                // as specific reasons (file not found vs. data corruption) are handled internally.
+                // A more specific error could be thrown from loadSessionFromDb if needed.
+                throw new ServerError("Failed to initialize session from the specified record.");
             }
 
-            // --- Update UserSession Object --- Assign the entire AuthzRequestState
-            loadedSession.authzRequestState = authzRequestState;
-            // Remove individual assignments:
-            // loadedSession.mcpCodeChallenge = authzRequestState.mcpCodeChallenge;
-            // loadedSession.mcpCodeChallengeMethod = authzRequestState.mcpCodeChallengeMethod;
-            // loadedSession.mcpRedirectUri = authzRequestState.mcpRedirectUri;
-            // Ensure client info is still on the session (might be needed elsewhere)
-            // loadedSession.mcpClientInfo = client; // Already done by loadSessionFromDb
+            // SUCCESS CASE: loadSessionFromDb succeeded.
+            // The loadedSession now has the data and potentially an open DB handle managed internally.
 
-            // --- Generate MCP Auth Code & Store Session --- 
+            // --- Generate MCP Auth Code & Store Session ---
             const mcpAuthCode = await oauthProvider.createAuthCode(loadedSession);
+            console.log(`[/initiate-session-from-db GET] Session loaded successfully from DB ${databaseId}. Auth code ${mcpAuthCode.substring(0,8)} generated.`);
 
-            console.log(`[/initiate-session-from-db GET] Session loaded from DB ${databaseId}. Adding to sessionsByMcpAuthCode with code ${mcpAuthCode.substring(0,8)}...`);
-
-            // --- Redirect back to MCP Client --- 
+            // --- Redirect back to MCP Client ---
             const redirectUrl = new URL(authzRequestState.mcpRedirectUri);
             redirectUrl.searchParams.set('code', mcpAuthCode);
             if (authzRequestState.mcpState) redirectUrl.searchParams.set('state', authzRequestState.mcpState);
@@ -488,53 +472,48 @@ export function addOauthRoutesAndProvider(
 
         } catch (error: any) {
             console.error(`[/initiate-session-from-db GET] Error initiating session:`, error);
-            
-            // Try closing DB if it was opened during loadSessionFromDb before error
-            if (loadedSession?.db && typeof loadedSession.db.close === 'function') { 
-               try { 
-                   console.log("[/initiate-session-from-db GET] Attempting to close DB after error...");
-                   loadedSession.db.close(); 
-                   console.log("[/initiate-session-from-db GET] Closed DB connection after error."); 
-                } catch (dbCloseError) {
-                     console.error("[/initiate-session-from-db GET] Error closing DB after primary error:", dbCloseError);
-                 }
-            }
-            
+
+            // --- Error Handling: DB handle is managed internally by loadSessionFromDb now ---
+            // No need to manually close 'db' here.
+
             // Try to redirect back to the MCP client with an error
-            const clientRedirectUriOnError = authzRequestState?.mcpRedirectUri; // Use optional chaining
+            const clientRedirectUriOnError = authzRequestState?.mcpRedirectUri;
             if (clientRedirectUriOnError && !res.headersSent) {
                 try {
                     const redirectUrl = new URL(clientRedirectUriOnError);
                     if (error instanceof BaseOAuthError) {
                         redirectUrl.searchParams.set("error", error.error);
-                        if (error.message) redirectUrl.searchParams.set("error_description", error.message);
+                        redirectUrl.searchParams.set("error_description", error.message || "An OAuth error occurred.");
+                    } else if (error.message?.includes("Failed to open database file") || error.message?.includes("Failed to access database")) {
+                        redirectUrl.searchParams.set("error", "invalid_request"); // Map to OAuth error
+                        redirectUrl.searchParams.set("error_description", `Specified record not found or inaccessible (ID: ${databaseId}).`);
                     } else {
                         redirectUrl.searchParams.set("error", "server_error");
                         redirectUrl.searchParams.set("error_description", "Failed to initialize session from stored record: " + (error?.message || 'Unknown error'));
                     }
+
                     if (authzRequestState?.mcpState) { // Use optional chaining
                         redirectUrl.searchParams.set("state", authzRequestState.mcpState);
                     }
-                    
+
                     console.log(`[/initiate-session-from-db GET] Redirecting to client with error: ${redirectUrl.toString()}`);
                     res.redirect(302, redirectUrl.toString());
                     return; // Explicit return after redirect
-                    
+
                 } catch (urlError) {
                     console.error(`[/initiate-session-from-db GET] Invalid redirect URI for error reporting: ${clientRedirectUriOnError}`, urlError);
                     // Fall through to generic error handler / next()
                 }
             }
-            
+
             // Fallback: Pass error to central OAuth error handler or generic Express handler
              if (!res.headersSent) {
-                 // If it's an OAuth error, let the dedicated middleware handle it
                  if (error instanceof BaseOAuthError) {
                       next(error);
                  } else {
-                     // Otherwise, send a generic 500 or call next() with a generic error
                       console.error("[/initiate-session-from-db GET] Could not redirect error to client. Sending 500.");
-                      res.status(500).send("Internal server error initiating session from stored record.");
+                      // Ensure a generic message if the specific error isn't an OAuth one
+                      next(new ServerError("Internal server error initiating session from stored record."));
                  }
             }
         }
@@ -585,7 +564,7 @@ export function addOauthRoutesAndProvider(
                  sameSite: 'lax'
              }));
 
-             const retrieverUrl = '/static/ehretriever.html#deliver-to:mcp-callback'; 
+             const retrieverUrl = '/ehretriever.html#deliver-to:mcp-callback';
              console.log(`[/initiate-new-ehr-flow GET] Redirecting user agent to EHR retriever: ${retrieverUrl}`);
              res.redirect(302, retrieverUrl); // Use 302 for redirect
 
@@ -649,17 +628,12 @@ export function addOauthRoutesAndProvider(
              client.scope = flowState.mcpScope; // Assign scope(s)
 
              const newSessionId = uuidv4();
-
-             // Handle potentially undefined config properties
-             const persistenceEnabled = config.persistence?.enabled ?? false;
-             const persistenceDir = config.persistence?.directory;
-
+             // Call the updated createSessionFromEhrData (now synchronous)
              const newSession = await createSessionFromEhrData(
                  newSessionId,
                  client,
                  ehrData,
-                 persistenceEnabled, // Pass boolean
-                 persistenceDir // Pass potentially undefined string
+                 config // Pass the full config object
              );
 
              // Construct and store the AuthzRequestState on the session
@@ -674,10 +648,6 @@ export function addOauthRoutesAndProvider(
                  createdAt: flowState.createdAt // Reflects start of auth flow
              };
              newSession.authzRequestState = authzStateForSession;
-             // newSession.mcpCodeChallenge = flowState.mcpCodeChallenge;
-             // newSession.mcpCodeChallengeMethod = flowState.mcpCodeChallengeMethod;
-             // newSession.mcpRedirectUri = flowState.mcpRedirectUri;
-
              const mcpAuthCode = await oauthProvider.createAuthCode(newSession);
 
              const redirectUrl = new URL(flowState.mcpRedirectUri);
@@ -693,7 +663,12 @@ export function addOauthRoutesAndProvider(
              redirectUrl.searchParams.set('error', 'server_error');
              redirectUrl.searchParams.set('error_description', `Internal server error processing EHR data.`);
              if (flowState.mcpState) redirectUrl.searchParams.set('state', flowState.mcpState);
-             res.status(500).json({ success: false, error: "Internal server error processing data.", redirectUrl: redirectUrl.toString() });
+             // Ensure response indicates failure correctly
+             if (!res.headersSent) {
+                 res.status(500).json({ success: false, error: "Internal server error processing data.", redirectUrl: redirectUrl.toString() });
+             } else {
+                  console.error("[/ehr-retriever-callback POST] Headers already sent, cannot send error JSON response.");
+             }
          }
     });
 
@@ -744,7 +719,7 @@ export function addOauthRoutesAndProvider(
                  }
 
                  // --- Conditional Redirect URI Verification ---
-                 const skipRedirectUriCheck = config.security.disableClientChecks;
+                 const skipRedirectUriCheck = config.security?.disableClientChecks;
                  // Access redirect URI from authzRequestState
                  const originalRedirectUri = session.authzRequestState.mcpRedirectUri;
                  if (!skipRedirectUriCheck && originalRedirectUri) {
@@ -887,7 +862,9 @@ export function addOauthRoutesAndProvider(
                      // Or proceed with revocation anyway?
                      // Let's proceed but log a warning.
                       console.warn(`[/revoke POST] Client ${providedClientId} specified but not found.`);
-                     // return next(new InvalidClientError(`Client not registered: ${providedClientId}`));
+                     // Decide: error out or allow anonymous revocation?
+                     // Let's error for now if client auth was provided but invalid.
+                      return next(new InvalidClientError(`Client not registered: ${providedClientId}`));
                  }
                  // Check if token belongs to the client requesting revocation
                  if (client && tokenInfo && tokenInfo.clientId !== client.client_id) {
@@ -912,7 +889,6 @@ export function addOauthRoutesAndProvider(
              } else {
                  // No client authentication provided - this provider might not support anonymous revocation.
                  // However, the revokeToken method signature implies a client is needed.
-                 // Let's assume anonymous revocation isn't intended here.
                   console.warn("[/revoke POST] Client authentication required for revocation.");
                  return next(new InvalidClientError("Client authentication required."));
              }
@@ -935,7 +911,9 @@ export function addOauthRoutesAndProvider(
                 error_description: err.message
             });
         } else {
-            next(err);
+            // Pass non-OAuth errors to the next error handler
+             console.warn(`[AUTH Error] Non-OAuth error passed through: ${err.message}`);
+             next(err);
         }
     });
 
