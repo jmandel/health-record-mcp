@@ -53,7 +53,7 @@ async function main() {
             console.log(`Found ${resources.length} ${resourceType} resource(s) to render...`);
 
             // Limit the number of resources rendered per type for brevity in testing
-            const resourcesToRender = resources.slice(0, 3); 
+            const resourcesToRender = resources.slice(0, 1000); 
             console.log(`(Rendering first ${resourcesToRender.length} of them)`);
 
             for (const resourceObj of resourcesToRender) {
