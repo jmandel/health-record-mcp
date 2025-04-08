@@ -1,8 +1,8 @@
-# Smart EHR MCP Server: Bridging AI and Health Records
+# EHR MCP Server: Tools For LLMs via SMART on FHIR
 
-This project provides a secure bridge allowing AI agents and other tools to interact with Electronic Health Records (EHRs) using the **Model Context Protocol (MCP)** and the **SMART on FHIR** standard.
+This project acts as a specialized server providing tools for Large Language Models (LLMs) and other AI agents to interact with Electronic Health Records (EHRs). It leverages the **SMART on FHIR** standard for secure data access and the **Model Context Protocol (MCP)** to expose the tools.
 
-Think of it as a specialized toolkit enabling AI to safely access and understand patient data.
+Think of it as a secure gateway and toolkit enabling AI to safely access and analyze patient data from diverse EHR systems.
 
 ## The Core Idea
 
