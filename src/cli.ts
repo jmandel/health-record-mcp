@@ -47,7 +47,7 @@ async function startEhrFetchServer(
         const protocol = serverConfig.https.enabled ? 'https' : 'http';
         const port = serverConfig.port; // Use port from config
         const host = serverConfig.host; // Use host from config
-        const baseUrl = `${protocol}://${host}:${port}`; // Construct base URL
+        const baseUrl = serverConfig.baseUrl || `${protocol}://${host}:${port}`; // Construct base URL
 
         const shutdown = (error?: Error) => {
             if (server) {

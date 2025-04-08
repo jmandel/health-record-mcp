@@ -651,22 +651,29 @@ export async function fetchAllEhrDataClientSideParallel(
 
     // --- Initialize Task List ---
     let currentTasks: FetchTask[] = [];
-    const initialResourceTypes = [ // Define types for initial fetch
-        'Observation', 'Condition', 'MedicationRequest', 'Procedure', 
-        'AllergyIntolerance', 'Immunization', 'DiagnosticReport', 'DocumentReference', 
-        'Encounter' 
-    ];
-    
-    // Add initial search tasks
-    initialResourceTypes.forEach(type => {
-        const url = `${fhirBaseUrl}/${type}?patient=${patientId}`; // Add _count=500 if needed/supported
-        const normalizedUrl = url.replace(/\/$/, ''); 
+    // Use the shared query generator
+    const initialQueries = getInitialFhirSearchQueries(patientId);
+
+    // Add initial search tasks from the generated queries
+    initialQueries.forEach(query => {
+        const params = new URLSearchParams(query.params as Record<string, string>);
+        // Consider adding a default _count=500 here or handle pagination later
+        // params.set('_count', '500'); 
+        const url = `${fhirBaseUrl}/${query.resourceType}?${params.toString()}`;
+        const normalizedUrl = url.replace(/\/$/, ''); // Normalize slightly for deduping
         if (!fetchedUrls.has(normalizedUrl)) {
             fetchedUrls.add(normalizedUrl);
-            currentTasks.push({ url: url, description: `Initial ${type}`, depth: 0 });
+            // Create a meaningful description
+            const paramDesc = Object.entries(query.params || {})
+                                .filter(([key]) => key !== 'patient') // Don't repeat patient ID
+                                .map(([key, value]) => `${key}=${value}`)
+                                .join(', ');
+            const description = `Initial ${query.resourceType}${paramDesc ? ` (${paramDesc})` : ''}`;
+            currentTasks.push({ url: url, description: description, depth: 0 });
         }
     });
-    // Add direct patient fetch task
+    
+    // Add direct patient fetch task (still useful to ensure patient resource is fetched)
     const patientUrl = `${fhirBaseUrl}/Patient/${patientId}`;
     const normalizedPatientUrl = patientUrl.replace(/\/$/, '');
     if (!fetchedUrls.has(normalizedPatientUrl)) {

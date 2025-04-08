@@ -14,6 +14,8 @@ const MAX_QUERY_JSON_LENGTH = 500 * 1024;      // 500 KB limit
 const MAX_EVAL_JSON_LENGTH = 1 * 1024 * 1024;  // 1 MB limit
 const MAX_QUERY_ROWS = 500; // Limit rows for query results before stringification check
 const GREP_CONTEXT_LENGTH = 50; // Characters before/after match
+const DEFAULT_PAGE_SIZE = 50; // Default number of hits per page
+const DEFAULT_PAGE = 1; // Default page number
 
 // Map from ResourceType to ordered list of potential date fields (FHIRPath-like)
 const RESOURCE_DATE_PATHS: Record<string, string[]> = {
@@ -113,7 +115,9 @@ export const GrepRecordInputSchema = z.object({
         - **List contains only FHIR types (e.g., ["Condition", "Procedure"]):** Searches ONLY the specified FHIR resource types AND the plaintext of attachments belonging *only* to those specified resource types.
         - **List contains only ["Attachment"]:** Searches ONLY the plaintext content of ALL attachments, regardless of which resource they belong to.
         - **List contains FHIR types AND "Attachment" (e.g., ["DocumentReference", "Attachment"]):** Searches the specified FHIR resource types (e.g., DocumentReference) AND the plaintext of ALL attachments (including those not belonging to the specified FHIR types).`
-    )
+    ),
+    page_size: z.number().int().min(1).max(50).optional().describe("Number of hits to display per page (1-50). Defaults to 50."),
+    page: z.number().int().min(1).optional().describe("Page number to display. Defaults to 1.")
 });
 
 // --- Grep Output Schemas ---
@@ -410,7 +414,9 @@ function findContextualMatches(text: string, regex: RegExp, contextLen: number):
 export async function grepRecordLogic(
     fullEhr: ClientFullEHR,
     query: string,
-    inputResourceTypes?: string[]
+    inputResourceTypes?: string[],
+    pageSize: number = DEFAULT_PAGE_SIZE,
+    page: number = DEFAULT_PAGE
 ): Promise<string> { // Returns Markdown string
     let regex: RegExp;
     let originalQuery = query; // Keep original for reporting
@@ -424,9 +430,9 @@ export async function grepRecordLogic(
         return `**Error:** Invalid regular expression provided: \`${originalQuery}\`. ${e.message}`; // Return Markdown error
     }
 
-    // Store hits with extracted date
-    const resourceHits: { resource_ref: string; context_snippets: string[]; date: string | null }[] = [];
-    const attachmentHits: { resource_ref: string; path: string; contentType?: string; context_snippets: string[]; date: string | null }[] = [];
+    // First, perform the full search to collect all matching resources and attachments
+    const resourceHits: { resource_ref: string; resource_type: string; resource_id: string; context_snippets: string[]; date: string | null }[] = [];
+    const attachmentHits: { resource_ref: string; resource_type: string; resource_id: string; path: string; contentType?: string; context_snippets: string[]; date: string | null }[] = [];
 
     let resourcesSearched = 0;
     let attachmentsSearched = 0;
@@ -480,6 +486,8 @@ export async function grepRecordLogic(
                         const date = extractResourceDate(resource);
                         resourceHits.push({
                             resource_ref: resourceRef,
+                            resource_type: resource.resourceType,
+                            resource_id: resource.id,
                             context_snippets: snippets,
                             date: date
                         });
@@ -544,6 +552,8 @@ export async function grepRecordLogic(
                  const date = extractResourceDate(anchorResource);
                  attachmentHits.push({
                      resource_ref: resourceRef,
+                     resource_type: attachment.resourceType,
+                     resource_id: attachment.resourceId,
                      path: attachment.path,
                      contentType: attachment.contentType,
                      context_snippets: snippets,
@@ -554,19 +564,63 @@ export async function grepRecordLogic(
      }
      console.error(`[GREP Logic] Found matches in ${attachmentHits.length} attachments after searching selected attachments.`);
 
+    // Apply pagination at the resource/attachment level (not by snippet)
+    // Calculate total number of results (count of unique resources + count of unique attachments)
+    const totalResources = resourceHits.length;
+    const totalAttachments = attachmentHits.length;
+    const totalResults = totalResources + totalAttachments;
+    const totalPages = Math.max(1, Math.ceil(totalResults / pageSize));
+    
+    // Normalize page number
+    const normalizedPage = Math.min(Math.max(1, page), totalPages);
+    
+    // Calculate start and end indices for this page
+    const startIndex = (normalizedPage - 1) * pageSize;
+    const endIndex = Math.min(startIndex + pageSize, totalResults);
+    
+    // Sort all hits by date (most recent first) if date is available
+    // This gives a more intuitive ordering of combined results
+    const sortHits = <T extends { date: string | null }>(hits: T[]): T[] => {
+        return [...hits].sort((a, b) => {
+            if (!a.date && !b.date) return 0;
+            if (!a.date) return 1;
+            if (!b.date) return -1;
+            return b.date.localeCompare(a.date); // Most recent first
+        });
+    };
+    
+    const sortedResourceHits = sortHits(resourceHits);
+    const sortedAttachmentHits = sortHits(attachmentHits);
+    
+    // Combine and paginate the sorted hits
+    const allHits = [...sortedResourceHits, ...sortedAttachmentHits];
+    const paginatedHits = allHits.slice(startIndex, endIndex);
+    
+    // Separate paginated hits back into resource and attachment hits
+    const paginatedResourceHits = paginatedHits.filter(hit => !('path' in hit)) as typeof resourceHits;
+    const paginatedAttachmentHits = paginatedHits.filter(hit => 'path' in hit) as typeof attachmentHits;
+
+    console.error(`[GREP Logic] Pagination: Page ${normalizedPage}/${totalPages}, showing ${paginatedHits.length} of ${totalResults} total matching resources/attachments`);
+    
     // 3. Format results as Markdown
     let markdownOutput = `## Grep Results for \`${originalQuery.replace(/`/g, '\\`')}\`\n\n`;
     markdownOutput += `_(Hint: Use \`read_resource\` or \`read_attachment\` for full details on interesting hits)_\n\n`;
-    markdownOutput += `Searched ${resourcesSearched} resources and ${attachmentsSearched} attachments. Found ${totalSnippetsFound} total snippets across ${resourceHits.length} resources and ${attachmentHits.length} attachments.\n\n`;
+    markdownOutput += `Searched ${resourcesSearched} resources and ${attachmentsSearched} attachments. Found ${resourceHits.length} matching resources and ${attachmentHits.length} matching attachments with a total of ${totalSnippetsFound} snippets.\n\n`;
+    
+    // Add pagination information
+    markdownOutput += `**Page ${normalizedPage} of ${totalPages}** (${pageSize} matching resources/attachments per page)\n\n`;
 
-    if (resourceHits.length === 0 && attachmentHits.length === 0) {
+    if (totalResults === 0) {
         markdownOutput += "**No matches found.**\n";
     } else {
-        if (resourceHits.length > 0) {
+        if (paginatedResourceHits.length > 0) {
             markdownOutput += "### Resource Hits\n\n";
-            for (const hit of resourceHits) {
+            for (const hit of paginatedResourceHits) {
                 const dateString = hit.date ? ` (${hit.date})` : '';
+                // Add resource type to header for clarity
                 markdownOutput += `#### ${hit.resource_ref}${dateString}\n`;
+                
+                // Show all snippets - clinically important to see everything
                 for (const snippet of hit.context_snippets) {
                     if (snippet.includes('\n')) {
                         let escapedSnippet = snippet.replace(/`/g, '\\`');
@@ -578,19 +632,22 @@ export async function grepRecordLogic(
                         markdownOutput += `* ${escapedSnippet}\n`;
                     }
                 }
+                
                 markdownOutput += "\n";
             }
         }
 
-        if (attachmentHits.length > 0) {
+        if (paginatedAttachmentHits.length > 0) {
             markdownOutput += "### Attachment Hits\n\n";
-            for (const hit of attachmentHits) {
+            for (const hit of paginatedAttachmentHits) {
                 const dateString = hit.date ? ` (${hit.date})` : '';
                 markdownOutput += `#### Attachment for ${hit.resource_ref}${dateString}\n`;
                 markdownOutput += `*Path*: \`${hit.path.replace(/`/g, '\\`')}\`\n`;
                 if (hit.contentType) {
                     markdownOutput += `*Content-Type*: \`${hit.contentType.replace(/`/g, '\\`')}\`\n`;
                 }
+                
+                // Show all snippets - clinically important to see everything
                 for (const snippet of hit.context_snippets) {
                     if (snippet.includes('\n')) {
                         let escapedSnippet = snippet.replace(/`/g, '\\`');
@@ -601,9 +658,29 @@ export async function grepRecordLogic(
                         escapedSnippet = escapedSnippet.replace(/>>>(.+?)<<<</g, '**>>>$1<<<**');
                         markdownOutput += `* ${escapedSnippet}\n`;
                     }
-                 }
+                }
+                
                 markdownOutput += "\n";
             }
+        }
+        
+        // Add pagination navigation links
+        if (totalPages > 1) {
+            markdownOutput += "### Navigation\n\n";
+            
+            if (normalizedPage > 1) {
+                markdownOutput += `* Previous Page (${normalizedPage - 1}/${totalPages}): Use \`page=${normalizedPage - 1}\`\n`;
+            }
+            
+            if (normalizedPage < totalPages) {
+                markdownOutput += `* Next Page (${normalizedPage + 1}/${totalPages}): Use \`page=${normalizedPage + 1}\`\n`;
+            }
+            
+            if (totalPages > 5) {
+                markdownOutput += `* Jump to specific page (1-${totalPages}): Use \`page=X\` where X is the page number\n`;
+            }
+            
+            markdownOutput += "\n";
         }
     }
 
@@ -857,8 +934,14 @@ export function registerEhrTools(
                 if (!fullEhr) {
                     throw new McpError(ErrorCode.InternalError, "EHR data context not found for this session/request.");
                 }
-                console.error(`[TOOL grep_record] Context retrieved. Query: "${args.query}", Types: ${args.resource_types?.join(',') || 'All'}`);
-                const resultString = await grepRecordLogic(fullEhr, args.query, args.resource_types);
+                console.error(`[TOOL grep_record] Context retrieved. Query: "${args.query}", Types: ${args.resource_types?.join(',') || 'All'}, Page: ${args.page || DEFAULT_PAGE}, PageSize: ${args.page_size || DEFAULT_PAGE_SIZE}`);
+                const resultString = await grepRecordLogic(
+                    fullEhr, 
+                    args.query, 
+                    args.resource_types, 
+                    args.page_size || DEFAULT_PAGE_SIZE, 
+                    args.page || DEFAULT_PAGE
+                );
                 // Check if the result starts with the error marker we defined
                 const isError = resultString.startsWith("**Error:**");
                 return { content: [{ type: "text", text: resultString }], isError: isError }; // Return Markdown directly
