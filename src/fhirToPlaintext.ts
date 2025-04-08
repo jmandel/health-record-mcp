@@ -80,8 +80,13 @@ export function createFhirRenderer(fullEhr: ClientFullEHR) {
               if (referencedResource) {
                   // Attempt to render using the specific reference renderer
                   const summary = renderResourceAsReference(referencedResource);
-                  // Use summary if available, otherwise fall back (but prioritize display from original ref if present)
-                   return summary || ref.display || ref.reference; 
+                  // If summary exists, append the reference string. Otherwise, fallback.
+                  if (summary) {
+                      return `${summary} (Ref: ${referencedResource.resourceType}/${referencedResource.id})`;
+                  } else {
+                      // Fallback if specific renderer returned nothing, prioritize original display
+                      return ref.display || ref.reference || '[Empty Reference Summary]';
+                  }
               } else {
                    // Resource not found in fullEhr
                    // Use display if provided, otherwise the reference string itself
