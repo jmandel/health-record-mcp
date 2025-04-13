@@ -209,8 +209,9 @@ describe("Joke Agent A2A Client Tests", () => {
             id: taskId, // Suggest an ID
             message: {
                 role: "user",
-                parts: [{ type: "text", text: "tell me a joke via polling test" }]
-            }
+                parts: [{ type: "text", text: "tell me a joke via polling test" }],
+            },
+            metadata: { skillId: 'tell-joke' } // Specify skill
         });
 
         // --- Send the task ---
@@ -260,7 +261,8 @@ describe("Joke Agent A2A Client Tests", () => {
         const taskId = `test-cancel-${Date.now()}`;
         const sendPayload = createRpcPayload('tasks/send', {
             id: taskId,
-            message: { role: "user", parts: [{ type: "text", text: "another joke to cancel" }] }
+            message: { role: "user", parts: [{ type: "text", text: "another joke to cancel" }] },
+            metadata: { skillId: 'tell-joke' } // Specify skill
         });
         const sendResponse = await fetch(AGENT_A2A_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: sendPayload });
         expect(sendResponse.status).toBe(200);
@@ -293,7 +295,7 @@ describe("Joke Agent A2A Client Tests", () => {
     test("should send task via sendSubscribe and receive updates via SSE and verify via poll", async () => {
         const taskId = `test-sse-joke-${Date.now()}`;
 
-        // Prepare the SSE request promise
+        // Prepare the SSE request promise (use tell-joke skill)
         const sseFetchPromise = fetch(AGENT_A2A_ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
@@ -301,8 +303,9 @@ describe("Joke Agent A2A Client Tests", () => {
                  id: taskId,
                  message: {
                      role: "user",
-                     parts: [{ type: "text", text: "tell me a joke via SSE test" }]
-                 }
+                     parts: [{ type: "text", text: "tell me a joke via SSE test" }],
+                 },
+                 metadata: { skillId: 'tell-joke' } // Specify skill
              })
         });
 
@@ -368,6 +371,100 @@ describe("Joke Agent A2A Client Tests", () => {
 
         console.log(`[SSE Test ${taskId}] Jokes match between SSE and final poll.`);
         console.log(JSON.stringify(resultFromSse, null, 2))
+    });
+
+    // --- Input Required / Resume Test ---
+    test("should handle input-required for jokeAboutTopic and resume", async () => {
+       const taskId = `test-input-required-joke-${Date.now()}`;
+
+       // --- Send initial request without topic ---
+       console.log(`[InputRequired Test ${taskId}] Sending initial request without topic...`);
+       const initialSendPayload = createRpcPayload('tasks/send', {
+           id: taskId,
+           message: {
+               role: "user",
+               parts: [{ type: "text", text: "tell me a joke" }] // No topic mentioned
+           },
+           metadata: { skillId: 'jokeAboutTopic' } // Specify the topic skill
+       });
+
+       const initialSendResponse = await fetch(AGENT_A2A_ENDPOINT, {
+           method: 'POST',
+           headers: { 'Content-Type': 'application/json' },
+           body: initialSendPayload
+       });
+
+       expect(initialSendResponse.status).toBe(200);
+       const initialSendResult = await initialSendResponse.json() as JsonRpcSuccessResponse<Task>;
+       expect(initialSendResult.result).toBeObject();
+
+       // --- Poll until input-required --- (Agent might respond immediately or take time)
+       console.log(`[InputRequired Test ${taskId}] Polling for input-required state...`);
+       let inputRequiredTask: Task | null = null;
+       for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
+           const getPayload = createRpcPayload('tasks/get', { id: taskId });
+           const getResponse = await fetch(AGENT_A2A_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: getPayload });
+           const getResult = await getResponse.json() as JsonRpcSuccessResponse<Task> | JsonRpcErrorResponse;
+
+           if ('result' in getResult && getResult.result.status.state === 'input-required') {
+               inputRequiredTask = getResult.result;
+               console.log(`[InputRequired Test ${taskId}] Task reached input-required state.`);
+               break;
+           }
+           console.log(`[InputRequired Test ${taskId}] Polling... current state: ${('result' in getResult) ? getResult.result.status.state : ('error' in getResult ? 'error' : 'unknown')}`);
+           await Bun.sleep(POLL_INTERVAL_MS);
+       }
+
+       expect(inputRequiredTask).not.toBeNull();
+       expect(inputRequiredTask?.status.state).toBe('input-required');
+       const promptPart = inputRequiredTask?.status.message?.parts[0];
+       expect(promptPart?.type).toBe('text'); // Ensure prompt is text
+       expect((promptPart as TextPart)?.text).toContain('topic'); // Check the agent's prompt text
+
+       // --- Send resume message with topic ---
+       const topic = "computers";
+       console.log(`[InputRequired Test ${taskId}] Sending resume message with topic: ${topic}`);
+       const resumePayload = createRpcPayload('tasks/send', {
+           id: taskId,
+           message: {
+               role: "user",
+               parts: [{ type: "text", text: topic }]
+           },
+       });
+
+       const resumeResponse = await fetch(AGENT_A2A_ENDPOINT, {
+           method: 'POST',
+           headers: { 'Content-Type': 'application/json' },
+           body: resumePayload
+       });
+
+       expect(resumeResponse.status).toBe(200);
+       const resumeResult = await resumeResponse.json() as JsonRpcSuccessResponse<Task>; // Immediate response might still be working
+       expect(resumeResult.result).toBeObject();
+       expect(resumeResult.result.status.state).toBeOneOf(['working', 'completed']); // Should be working or maybe completed if fast
+
+       // --- Poll until final completion --- 
+       console.log(`[InputRequired Test ${taskId}] Polling for final completion after resume...`);
+       const finalTask = await pollTaskUntilComplete(taskId);
+
+       // --- Assert final state and artifact ---
+       expect(finalTask).toBeObject();
+       expect(finalTask.id).toBe(taskId);
+       expect(finalTask.status.state).toBe('completed'); // Assert completion
+
+       expect(finalTask.artifacts).toBeArray();
+       expect(finalTask.artifacts?.length).toBe(1);
+       const jokeArtifact = finalTask.artifacts?.[0];
+       expect(jokeArtifact?.name).toBe('joke-result');
+       expect(jokeArtifact?.metadata?.topic).toBe(topic); // Check topic in metadata
+
+       const jokePart = jokeArtifact?.parts?.[0];
+       expect(jokePart?.type).toBe('text');
+       const jokeText = (jokePart as TextPart)?.text;
+       expect(jokeText).toBeString();
+       expect(jokeText?.toLowerCase()).toContain(topic); // Joke should contain the topic
+
+       console.log(`Received Topic Joke (after resume): ${jokeText}`);
     });
 
 });

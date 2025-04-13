@@ -96,20 +96,24 @@ export class A2AServerCore {
   // --- Public methods corresponding to A2A RPC methods ---
 
   async handleTaskSend(params: A2ATypes.TaskSendParams, authContext?: any): Promise<A2ATypes.Task> {
-    const processor = await this._findProcessor(params);
-    if (!processor) {
-      throw this._createError(A2ATypes.A2AErrorCodes.MethodNotFound, `No processor found capable of handling the request.`);
-    }
-
     let task: A2ATypes.Task | null = null;
     let isResume = false;
 
     if (params.id) {
         task = await this.taskStore.getTask(params.id);
         if (task && (task.status.state === 'input-required' || task.status.state === 'working' || task.status.state === 'submitted')) {
-             isResume = true;
-             console.log(`[A2ACore] Resuming task ${params.id}`);
-             await this.taskStore.addTaskHistory(params.id, params.message);
+            // Check if the task is actually resumable by its designated processor
+            const taskProcessor = await this._findProcessorForTask(task);
+             if (taskProcessor?.resume) {
+                 isResume = true;
+                 console.log(`[A2ACore] Resuming task ${params.id} with processor ${taskProcessor.constructor.name}`);
+                 await this.taskStore.addTaskHistory(params.id, params.message);
+             } else {
+                  console.warn(`[A2ACore] Task ${params.id} found, but its processor does not support resume or processor not found.`);
+                 // Treat as new or throw error? Let's treat as new if resumable state but no resume method.
+                 task = null;
+                 isResume = false;
+             }
         } else if (task) {
             // Task exists but not in resumable state, treat as new or throw error?
             // For now, let createOrGetTask handle potential ID collision warning
@@ -120,8 +124,21 @@ export class A2AServerCore {
     }
 
     if (!isResume) {
-        // Create task (handles potential ID collision check internally)
-        task = await this.taskStore.createOrGetTask(params);
+        // Find processor *first* to determine the skill ID to store
+        const initialProcessor = await this._findProcessor(params);
+        if (!initialProcessor) {
+            // Throw before creating the task if no processor can handle the initial request
+             throw this._createError(A2ATypes.A2AErrorCodes.MethodNotFound, `No processor found capable of handling the initial request based on provided parameters (skillId?).`);
+        }
+
+        // Store the skillId used to find the processor
+        const taskMetadata = {
+             ...(params.metadata || {}),
+            _processorSkillId: params.metadata?.skillId // Store the skillId that succeeded
+         };
+
+        task = await this.taskStore.createOrGetTask({ ...params, metadata: taskMetadata });
+
         // Initial response is just the created task state
         const initialResponseTask = { ...task };
         // Remove potentially sensitive internal state for response
@@ -130,29 +147,50 @@ export class A2AServerCore {
         initialResponseTask.history = await this.taskStore.getTaskHistory(task.id, params.historyLength ?? 0);
 
 
+        // Find processor for the *new* task (must exist based on check above)
+        const initialProcessorForTask = await this._findProcessorForTask(task);
+        if (!initialProcessorForTask) { // Should ideally not happen due to earlier check
+            throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Processor found during check but not found again for task ${task.id}.`);
+        }
+
         // --- Asynchronously start the processor ---
-        this._executeProcessorStart(processor, task, params, authContext);
+        this._executeProcessorStart(initialProcessorForTask, task, params, authContext);
         // ---
 
         return initialResponseTask;
 
-    } else if (task && processor.resume) { // isResume is true here
+    } else if (isResume && task) { // Task is already set from the isResume check above
+         // --- Find processor based on TASK data --- 
+         // We already confirmed processor.resume exists in the logic that sets isResume = true
+         const taskProcessor = await this._findProcessorForTask(task);
+         if (!taskProcessor?.resume) { // Should not happen based on isResume logic, but safety check
+             throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Inconsistent state: Task ${task.id} marked for resume but processor/resume method not found.`);
+         }
+
          const updater = new TaskUpdaterHandle(task.id, task.status.state, this);
 
-        // --- Asynchronously resume the processor ---
-         this._executeProcessorResume(processor, task, params.message, updater, authContext);
+         // ---> Set status to working BEFORE starting async resume <---
+         // Use internal update to avoid double history entry/notification for this transition
+         const now = new Date().toISOString();
+         const statusUpdate: A2ATypes.TaskStatus = { state: 'working', timestamp: now };
+         task = await this.taskStore.updateTask(task.id, { status: statusUpdate });
+         if (!task) {
+             // Should not happen if task existed moments ago
+             throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task ${params.id} disappeared unexpectedly before resume could start.`);
+         }
+         console.log(`[A2ACore] Task ${task.id} status set to working for resume.`);
+         updater._updateLocalStatus('working'); // Ensure updater handle knows the new status
+
+         // --- Asynchronously resume the processor ---
+         this._executeProcessorResume(taskProcessor, task, params.message, updater, authContext);
         // ---
 
-        // Respond with the current task state immediately after adding history
-        const currentTaskState = await this.taskStore.getTask(task.id);
-        if (!currentTaskState) throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task ${task.id} disappeared unexpectedly during resume.`);
+        // Respond with the task state *after* setting it to working
+         const responseTask = { ...task }; // Use the task object updated to 'working' state
+         delete responseTask.internalState;
+         responseTask.history = await this.taskStore.getTaskHistory(task.id, params.historyLength ?? 0);
+         return responseTask;
 
-        delete currentTaskState.internalState;
-        currentTaskState.history = await this.taskStore.getTaskHistory(task.id, params.historyLength ?? 0);
-        return currentTaskState;
-
-    } else if (task && !processor.resume) {
-         throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, `Processor for task ${task.id} does not support resume.`);
     } else {
         // Should not happen due to logic above
         throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Invalid state reached during task send/resume.`);
@@ -397,23 +435,36 @@ export class A2AServerCore {
 
     // Find processor based on existing task data (e.g., metadata) if needed
    private async _findProcessorForTask(task: A2ATypes.Task): Promise<TaskProcessor | null> {
-       // This might require storing which processor handled the task initially
-       // Or re-running canHandle based on some stored criteria in task.metadata
-       // For now, assume the first processor handles everything if only one exists
-       // Or implement a more robust matching logic if multiple processors are common.
-       if (this.taskProcessors.length > 0) {
-            // Placeholder: Re-evaluate based on initial message if stored, or metadata
-            // This is a simplification. Real systems might need explicit processor mapping.
-           const initialHistory = await this.taskStore.getTaskHistory(task.id, 1);
-           if (initialHistory.length > 0 && initialHistory[0].role === 'user') {
-               const pseudoParams: A2ATypes.TaskSendParams = { message: initialHistory[0], metadata: task.metadata, id: task.id, sessionId: task.sessionId };
-                return this._findProcessor(pseudoParams);
-           } else if (this.taskProcessors.length === 1) {
-                // Fallback if history isn't useful and only one processor
-               return this.taskProcessors[0];
-           }
-       }
-       return null;
+       const storedSkillId = task.metadata?._processorSkillId as string | undefined;
+
+        if (!storedSkillId) {
+            console.warn(`[A2ACore] Task ${task.id} is missing the internal _processorSkillId metadata. Cannot reliably find processor.`);
+            // Fallback: Try using the first processor if only one exists?
+            if (this.taskProcessors.length === 1) {
+                 console.warn(`[A2ACore] Falling back to using the first processor for task ${task.id}.`);
+                return this.taskProcessors[0];
+             }
+             return null; // Cannot determine processor
+         }
+
+         // Create pseudo-params using the stored skillId to find the processor
+         const pseudoParams: A2ATypes.TaskSendParams = {
+             // message is not strictly needed if canHandle only uses skillId
+             message: { role: 'user', parts: [] },
+             metadata: { skillId: storedSkillId },
+             id: task.id,
+             sessionId: task.sessionId
+         };
+
+         // Find the processor that handles the original skillId
+         for (const processor of this.taskProcessors) {
+             if (await processor.canHandle(pseudoParams)) {
+                  return processor;
+             }
+         }
+
+         console.error(`[A2ACore] Could not find any processor that handles the stored skillId '${storedSkillId}' for task ${task.id}.`);
+         return null; // No processor found matching the stored skill
    }
 
 
@@ -454,17 +505,25 @@ export class A2AServerCore {
    }
 
     private _executeProcessorCancel(processor: TaskProcessor, task: A2ATypes.Task, cancelMessage: A2ATypes.Message | undefined, updater: TaskUpdaterHandle, authContext?: any): void {
-     if (!processor.cancel) return;
-     updater._updateLocalStatus(task.status.state); // Sync updater's view
-     Promise.resolve()
-       .then(() => processor.cancel!(task, cancelMessage, updater, authContext))
-        .then(() => {
-            console.log(`[A2ACore] Processor 'cancel' finished for task ${task.id}`);
-        })
-       .catch(error => {
-           console.error(`[A2ACore] Error during processor 'cancel' for task ${task.id}:`, error);
-           // Don't auto-fail here, cancellation already happened at core level
-       });
+     // Check if processor supports cancel *before* calling
+     if (!processor || !processor.cancel) {
+          console.log(`[A2ACore] Processor for task ${task.id} does not support cancel, or processor not found.`);
+          return;
+     }
+
+     // Ensure the updater reflects the status *before* cancellation attempt
+     // Although core sets to 'canceled', the processor might check current state
+     updater._updateLocalStatus(task.status.state);
+
+      Promise.resolve()
+        .then(() => processor.cancel!(task, cancelMessage, updater, authContext))
+         .then(() => {
+             console.log(`[A2ACore] Processor 'cancel' finished for task ${task.id}`);
+         })
+        .catch(error => {
+            console.error(`[A2ACore] Error during processor 'cancel' for task ${task.id}:`, error);
+            // Don't auto-fail here, cancellation already happened at core level
+        });
    }
 
 
@@ -523,14 +582,14 @@ export class A2AServerCore {
          // Client can use tasks/get if they need full history/messages
          delete statusEvent.status.message;
 
-         let artifactEvent: A2ATypes.TaskArtifactUpdateEvent | null = null;
-         if (newArtifact) {
-             artifactEvent = {
-                id: task.id,
-                 artifact: { ...newArtifact }, // Clone artifact
-                 metadata: task.metadata
-            };
-         }
+        let artifactEvent: A2ATypes.TaskArtifactUpdateEvent | null = null;
+        if (newArtifact) {
+            artifactEvent = {
+               id: task.id,
+                artifact: { ...newArtifact }, // Clone artifact
+                metadata: task.metadata
+           };
+        }
 
         // Send events to all active subscribers for this task
          const activeSubs = [...sseSubs]; // Iterate over a copy in case of modifications during send
