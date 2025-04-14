@@ -1,12 +1,14 @@
 // File: test/jokeAgentClient.test.ts
 import { test, expect, describe, beforeAll, afterAll } from "bun:test"; // Added beforeAll, afterAll
 import type { AgentCard, Task, TaskState, JsonRpcErrorResponse, JsonRpcSuccessResponse, TextPart } from "../../../src/types"; // Corrected import path, added TaskState, TextPart
+import type { NotificationService } from "../../../src/interfaces"; // Import NotificationService from interfaces.ts
 import { startA2AExpressServer, InMemoryTaskStore } from "../../../src/index"; // Import server setup
 import { JokeProcessor } from "../JokeProcessor"; // Import agent components
 import { jokeAgentCard } from "../agentCard";
 import type * as http from 'node:http'; // Import http for server type
 import { promisify } from 'node:util'; // Import promisify
 import { A2AServerCore } from "../../../src/core/A2AServerCore"; // Import A2AServerCore
+import { SseConnectionManager } from "../../../src/core/SseConnectionManager"; // Import SseConnectionManager for test setup
 
 // --- Configuration ---
 const TEST_PORT = 3101; // Use a different port for testing
@@ -207,6 +209,7 @@ describe("Joke Agent A2A Client Tests", () => {
     let taskStore: InMemoryTaskStore;
     let processor: JokeProcessor;
     let core: A2AServerCore; // Variable to hold the core instance
+    let sseManager: SseConnectionManager; // Variable for SSE manager
 
     // Use promisify to handle server close asynchronously
     const closeServer = promisify((serverInstance: http.Server, cb: (err?: Error) => void) => serverInstance.close(cb));
@@ -214,12 +217,14 @@ describe("Joke Agent A2A Client Tests", () => {
     beforeAll(async () => { // Make beforeAll async if needed for setup
         taskStore = new InMemoryTaskStore();
         processor = new JokeProcessor();
+        sseManager = new SseConnectionManager(); // Instantiate SSE Manager
 
         // Capture the core instance via configureApp
         server = startA2AExpressServer({
             agentDefinition: jokeAgentCard,
             taskStore: taskStore,
             taskProcessors: [processor],
+            // notificationServices: [sseManager], // <-- Pass the SSE manager here
             port: TEST_PORT,
             baseUrl: BASE_URL,
             // No auth needed for joke agent
@@ -242,41 +247,16 @@ describe("Joke Agent A2A Client Tests", () => {
     afterAll(async () => {
         console.log("[afterAll] Starting shutdown sequence...");
 
-        // 1. Close all SSE connections first
-        if (core) {
-             console.log("[afterAll] Attempting to close all SSE connections via core...");
-            try {
-                 core.closeAllSseConnections(); // Call the new method
-                 console.log("[afterAll] Core finished closing SSE connections.");
-             } catch (sseCloseError) {
-                 console.error("[afterAll] Error closing SSE connections via core:", sseCloseError);
-             }
-        } else {
-             console.warn("[afterAll] Core instance not found, cannot explicitly close SSE connections.");
-         }
-
-        // 2. Close the main HTTP server
-        if (server) {
-            console.log("[afterAll] Server instance found. Attempting close...");
-            try {
-                await closeServer(server);
-                console.log("[afterAll] Server closed successfully (promisify resolved).");
-            } catch (err) {
-                console.error("[afterAll] Error during server close:", err);
-                 // Consider forcing exit even on error, but log it first
-                 // process.exit(1); // Keep commented for now unless needed
-            }
-        } else {
-            console.warn("[afterAll] Server instance not found.");
+        // 1. Trigger the application's graceful shutdown via SIGTERM
+        console.log("[afterAll] Sending SIGTERM to trigger graceful shutdown...");
+        try {
+            process.kill(process.pid, 'SIGTERM');
+            console.log("[afterAll] SIGTERM sent. Application shutdown handler should take over.");
+        } catch (err) {
+            console.error("[afterAll] Error sending SIGTERM:", err);
         }
 
-        // Explicitly exit the process using setTimeout to prevent hanging
-        console.log("[afterAll] Scheduling forced process exit via setTimeout(0).");
-        setTimeout(() => {
-             console.log("[afterAll] setTimeout callback executing. Forcing process exit now...");
-             process.exit(0);
-         }, 0); // Use setTimeout with 0 delay
-        console.log("[afterAll] setTimeout scheduled. End of afterAll logic.");
+        console.log("[afterAll] End of test cleanup logic. Process should exit via application handler.");
     });
 
     // --- Agent Card Test ---

@@ -1,5 +1,6 @@
 import express from 'express'; // Keep as default import
 import * as http from 'node:http'; // Import http
+import * as net from 'node:net'; // <-- Import net
 import {
     type AgentCard,
     type TaskStore,
@@ -7,8 +8,12 @@ import {
     type GetAuthContextFn,
     A2AServerCore,
     createA2AExpressHandlers,
-    type A2AErrorCodes
+    type A2AErrorCodes,
 } from '../index'; // Adjust path based on actual file structure
+// Import NotificationService separately if needed
+import type { NotificationService } from '../interfaces';
+// Import SseConnectionManager directly
+import { SseConnectionManager } from '../core/SseConnectionManager';
 
 export interface StartA2AExpressServerConfig {
     /** Agent-specific definition (Partial AgentCard) */
@@ -17,6 +22,8 @@ export interface StartA2AExpressServerConfig {
     taskProcessors: TaskProcessor[];
     /** TaskStore instance */
     taskStore: TaskStore;
+    /** Optional array of NotificationService instances */
+    notificationServices?: NotificationService[];
     /** Optional port number (defaults to process.env.PORT or 3001) */
     port?: number;
     /** Optional base URL (defaults to http://localhost:PORT) */
@@ -44,6 +51,7 @@ export function startA2AExpressServer(config: StartA2AExpressServerConfig): http
         agentDefinition, 
         taskProcessors, 
         taskStore,
+        notificationServices: configNotificationServices,
         port: configPort,
         baseUrl: configBaseUrl,
         serverCapabilities,
@@ -86,11 +94,22 @@ export function startA2AExpressServer(config: StartA2AExpressServerConfig): http
         throw new Error("Cannot start server: AgentCard is missing required fields (name, version, url) after merging.");
     }
 
+    // --- Determine Notification Services ---
+    let servicesToUse = configNotificationServices; // Start with user-provided list
+
+    // If no services provided AND agent card indicates streaming, add default SSE
+    if ((!servicesToUse || servicesToUse.length === 0) && completeAgentCard.capabilities.streaming) {
+        console.log("[A2A Setup] No notification services provided but streaming enabled; adding default SseConnectionManager.");
+        // Make sure SseConnectionManager is imported correctly
+        servicesToUse = [new SseConnectionManager()]; 
+    }
+
     // --- Configure the A2A Server Core ---
     const a2aCore = new A2AServerCore({
         agentCard: completeAgentCard,
         taskStore: taskStore,
         taskProcessors: taskProcessors,
+        notificationServices: servicesToUse,
         getAuthContext: getAuthContext,
         maxHistoryLength: maxHistoryLength,
         // TODO: Potentially pass TaskStore capabilities to infer stateTransitionHistory?
@@ -139,5 +158,75 @@ export function startA2AExpressServer(config: StartA2AExpressServerConfig): http
         process.exit(1);
     });
 
-    return server; // Return the instance
+    // --- Connection Tracking for Graceful Shutdown ---
+    const connections = new Map<string, net.Socket>();
+    server.on('connection', (conn: net.Socket) => {
+        const key = `${conn.remoteAddress}:${conn.remotePort}`;
+        connections.set(key, conn);
+        // console.log(`[Server] Connection ${key} established.`); // Verbose logging
+        conn.on('close', () => {
+            // console.log(`[Server] Connection ${key} closed.`); // Verbose logging
+            connections.delete(key);
+        });
+    });
+
+    // Handle graceful shutdown
+    let shuttingDown = false; // Flag to prevent double execution
+    const gracefulShutdown = async () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log('[A2A Server] Received shutdown signal. Starting graceful shutdown...');
+
+        // 1. Close Notification Services first
+        if (servicesToUse && servicesToUse.length > 0) { 
+             console.log('[A2A Server] Closing notification services...');
+             const closePromises = servicesToUse
+                 .filter(service => typeof service.closeAll === 'function')
+                 .map(service => service.closeAll!().catch(e => {
+                     console.error(`[A2A Server] Error closing ${service.constructor.name}:`, e);
+                 }));
+             try {
+                 await Promise.all(closePromises);
+                 console.log('[A2A Server] Notification services closed.');
+             } catch (e) {
+                 console.error('[A2A Server] Error awaiting notification service closure:', e);
+             }
+         } else {
+             console.log('[A2A Server] No configured notification services to close.');
+         }
+
+        // 2. Destroy existing connections
+        console.log(`[A2A Server] Destroying ${connections.size} remaining connections...`);
+        connections.forEach((conn, key) => {
+            conn.destroy();
+            connections.delete(key);
+        });
+        console.log('[A2A Server] Remaining connections destroyed.');
+
+        // 3. Stop accepting new connections
+        console.log('[A2A Server] Calling server.close()...');
+        server.close((err?: Error) => {
+            if (err) {
+                console.error('[A2A Server] Error during server.close() callback:', err);
+            }
+            console.log('[A2A Server] server.close() callback executed.');
+            // Don't exit here, rely on the timeout below
+        });
+
+        // 4. Set a failsafe timeout to exit
+        const SHUTDOWN_TIMEOUT = 500; // ms
+        console.log(`[A2A Server] Setting ${SHUTDOWN_TIMEOUT}ms timeout for process exit.`);
+        const failSafeTimer = setTimeout(() => {
+            console.error(`[A2A Server] Shutdown timeout reached. Forcing exit.`);
+            process.exit(1); // Exit with error code if timeout needed
+        }, SHUTDOWN_TIMEOUT);
+        failSafeTimer.unref(); // unref() allows the program to exit if this is the only timer left
+
+        console.log("[A2A Server] Graceful shutdown initiated. Process should exit cleanly.");
+    };
+
+    process.on('SIGINT', gracefulShutdown);
+    process.on('SIGTERM', gracefulShutdown);
+
+    return server;
 } 

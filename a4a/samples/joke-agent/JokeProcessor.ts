@@ -80,7 +80,8 @@ export class JokeProcessor implements TaskProcessor {
         console.error(`[JokeProcessor] Error in task ${updater.taskId}:`, error);
         const failMsg: Message = { role: 'agent', parts: [{ type: 'text', text: `Failed to tell joke: ${error.message}` }] };
         // Check current status before overriding - avoid failing an already completed/canceled task if error happens late
-        if (updater.currentStatus !== 'completed' && updater.currentStatus !== 'canceled') {
+        const currentStatus = await updater.getCurrentStatus();
+        if (currentStatus !== 'completed' && currentStatus !== 'canceled') {
            await updater.signalCompletion('failed', failMsg);
         }
     }
@@ -122,7 +123,8 @@ export class JokeProcessor implements TaskProcessor {
        } catch (error: any) {
            console.error(`[JokeProcessor] Error during resume for task ${task.id}:`, error);
            const failMsg: Message = { role: 'agent', parts: [{ type: 'text', text: `Failed during resume: ${error.message}` }] };
-            if (updater.currentStatus !== 'completed' && updater.currentStatus !== 'canceled') {
+           const currentStatus = await updater.getCurrentStatus();
+            if (currentStatus !== 'completed' && currentStatus !== 'canceled') {
                  await updater.signalCompletion('failed', failMsg);
             }
        }

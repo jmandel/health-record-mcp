@@ -18,6 +18,3 @@ export { A2AServerCore } from './core/A2AServerCore';
 
 // Export the new server setup helper
 export * from './express/serverSetup';
-
-// Export the new TaskUpdaterHandle
-export * from './core/TaskUpdaterHandle'; // Usually not needed externally?
