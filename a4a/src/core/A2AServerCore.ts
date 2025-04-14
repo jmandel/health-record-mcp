@@ -44,16 +44,13 @@ export class A2AServerCore {
               await this._emitTaskEvent(initialEvent);
               return task; // Return only the task object
           }
-          case 'resume':
+          case 'resume': {
               // Call the unified resume helper
               const { updatedTask, workingEvent } = await this._resumeTask(checkResult.task!, checkResult.processor!, params, authContext);
               // Emit the working event to all notification services
               await this._emitTaskEvent(workingEvent);
               return updatedTask; // Return the updated task object
-          case 'error':
-              throw checkResult.error!;
-          default:
-               throw this._createError(A2ATypes.A2AErrorCodes.InternalError, "Internal error: Unexpected outcome from task resumability check.");
+          }
       }
   }
 
@@ -160,10 +157,9 @@ export class A2AServerCore {
 
    // --- NEW Helper to Check Task Status and Resumability ---
    private async _checkResumability(params: A2ATypes.TaskSendParams): Promise<{
-        outcome: 'initiate' | 'resume' | 'error',
+        outcome: 'initiate' | 'resume',
         task?: A2ATypes.Task,
         processor?: TaskProcessor,
-        error?: Error
     }> {
         if (!params.id) {
              console.log("[A2ACore] No task ID provided, initiating new task.");
@@ -178,47 +174,36 @@ export class A2AServerCore {
             return { outcome: 'initiate' };
         }
 
-        // Task exists, check its state
-        const resumableStates: A2ATypes.TaskState[] = ['input-required', 'working', 'submitted'];
-        if (resumableStates.includes(task.status.state)) {
+        // Check if the task is *not* in a final state (thus potentially resumable)
+        const currentState = task.status.state;
+        if (!this._isFinalState(currentState)) {
             // State is potentially resumable, check processor
-            const lookupParams = this._buildLookupParamsForTask(task);
-            if (!lookupParams) {
-                 const error = this._createError(A2ATypes.A2AErrorCodes.InternalError, `Task ${params.id} is missing required skillId metadata for resume.`);
-                 return { outcome: 'error', error };
+            const processor = await this._findProcessorForExistingTask(params.id);
+            if (!processor) {
+                 // _findProcessorForTask already logged the specific reason
+                 throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Cannot find processor for task ${params.id}. Check server logs for details.`);
             }
-            const processor = await this._findProcessor(lookupParams);
             if (processor?.resume) {
                 // All checks pass for resume
                 console.log(`[A2ACore] Task ${params.id} is resumable with processor ${processor.constructor.name}.`);
                 return { outcome: 'resume', task, processor };
             } else {
                 // Processor doesn't support resume
-                 console.warn(`[A2ACore] Task ${params.id} found in resumable state, but processor ${processor?.constructor.name || '(unknown)'} does not support resume.`);
-                 const error = this._createError(A2ATypes.A2AErrorCodes.InvalidRequest, `Task ${params.id} is in state ${task.status.state} but its processor cannot resume.`);
-                return { outcome: 'error', error };
+                 console.warn(`[A2ACore] Task ${params.id} found in resumable state (${currentState}), but processor ${processor?.constructor.name || '(unknown)'} does not support resume.`);
+                 throw this._createError(A2ATypes.A2AErrorCodes.InvalidRequest, `Task ${params.id} is in state ${currentState} but its processor cannot resume.`);
             }
     } else {
             // Task exists but is in a final or non-resumable state
-            console.warn(`[A2ACore] Request for existing task ${params.id} which is in non-resumable state (${task.status.state}).`);
+            console.warn(`[A2ACore] Request for existing task ${params.id} which is in final state (${currentState}).`);
             // Treat this as an error for both send and sendSubscribe - suggest resubscribe if applicable
-             const message = task.status.state === 'completed' || task.status.state === 'failed' || task.status.state === 'canceled'
-                 ? `Task ${params.id} is already in final state ${task.status.state}. Use tasks/resubscribe if supported.`
-                 : `Task ${params.id} exists but is in non-resumable state ${task.status.state}.`;
-            const error = this._createError(A2ATypes.A2AErrorCodes.InvalidRequest, message);
-            return { outcome: 'error', error };
+            const message = `Task ${params.id} is already in final state ${currentState}. Use tasks/resubscribe if supported.`;
+            throw this._createError(A2ATypes.A2AErrorCodes.InvalidRequest, message);
     }
   }
 
   async handleTaskSendSubscribe(params: A2ATypes.TaskSubscribeParams, sseResponse: express.Response, authContext?: any): Promise<void> {
       // Initial checks specific to SSE
-      if (!this.agentCard.capabilities.streaming) {
-           throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, `Agent does not support streaming (SSE).`);
-      }
-      const sseService = this.notificationServices.find(s => s instanceof SseConnectionManager);
-      if (!sseService) {
-          throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, "Server does not support SSE subscriptions.");
-      }
+      const sseService = this._ensureStreamingSupportedOrThrow();
 
       // Perform the common check
       const checkResult = await this._checkResumability(params);
@@ -237,37 +222,17 @@ export class A2AServerCore {
                 sseService.addSubscription(updatedTask.id, sseResponse);
                 await this._emitTaskEvent(workingEvent); // Will send to new subscriber
                 break;
-            case 'error':
-                // If an error occurs during the check, we need to ensure the SSE connection isn't left hanging.
-                // The express handler usually catches errors, but might not close SSE gracefully.
-                // Try to close it here before re-throwing.
-                if (!sseResponse.closed) {
-                     try { sseResponse.status(400).end(); } catch {} // Best effort close
-                 }
-                throw checkResult.error!;
-            default:
-                 if (!sseResponse.closed) {
-                     try { sseResponse.status(500).end(); } catch {} // Best effort close
-                 }
-                throw this._createError(A2ATypes.A2AErrorCodes.InternalError, "Internal error: Unexpected outcome from task resumability check.");
+            // No 'error' or 'default' case needed here, as _checkResumability now throws directly.
+            // Errors will be caught by the main try/catch in the express handler.
         }
 
       // Handler keeps connection open if successful
   }
 
   async handleTaskResubscribe(params: A2ATypes.TaskResubscribeParams, sseResponse: express.Response, authContext?: any): Promise<void> {
-      // ... capability check ...
-      const sseService = this.notificationServices.find(s => s instanceof SseConnectionManager) as SseConnectionManager | undefined;
-      if (!sseService) {
-           throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, "Server does not support SSE subscriptions.");
-       }
+      const sseService = this._ensureStreamingSupportedOrThrow();
 
-       const task = await this.taskStore.getTask(params.id);
-       if (!task) {
-           throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task with id ${params.id} not found.`);
-       }
-
-      sseService.addSubscription(task.id, sseResponse);
+       const task = await this._getTaskOrThrow(params.id);
 
         // Send current status immediately
         const currentStatusEvent: A2ATypes.TaskStatusUpdateEvent = {
@@ -285,10 +250,7 @@ export class A2AServerCore {
    }
 
   async handleTaskGet(params: A2ATypes.TaskGetParams, authContext?: any): Promise<A2ATypes.Task> {
-    const task = await this.taskStore.getTask(params.id);
-    if (!task) {
-      throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task with id ${params.id} not found.`);
-    }
+    const task = await this._getTaskOrThrow(params.id);
     const historyLength = Math.min(params.historyLength ?? 0, this.maxHistoryLength);
     task.history = await this.taskStore.getTaskHistory(params.id, historyLength);
     delete task.internalState;
@@ -296,28 +258,24 @@ export class A2AServerCore {
   }
 
   async handleTaskCancel(params: A2ATypes.TaskCancelParams, authContext?: any): Promise<A2ATypes.Task> {
-    let task = await this.taskStore.getTask(params.id);
-    if (!task) {
-      throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task with id ${params.id} not found.`);
-    }
+    let task = await this._getTaskOrThrow(params.id);
 
-    const finalStates: A2ATypes.TaskState[] = ['completed', 'canceled', 'failed'];
-    if (finalStates.includes(task.status.state)) {
+    // Check state *before* finding processor
+    if (this._isFinalState(task.status.state)) {
         console.log(`[A2ACore] Task ${params.id} already in final state ${task.status.state}. No action taken.`);
         delete task.internalState;
-        task.history = await this.taskStore.getTaskHistory(params.id, 0);
+        task.history = await this.taskStore.getTaskHistory(params.id, 0); // Fetch history for response
         return task;
     }
 
     // Find processor and potentially call its cancel method
-    const lookupParams = this._buildLookupParamsForTask(task);
-    let processor: TaskProcessor | null = null;
-    if (lookupParams) {
-        processor = await this._findProcessor(lookupParams);
-    }
-     if (processor?.cancel) {
+    const processor = await this._findProcessorForExistingTask(params.id);
+    if (processor?.cancel) {
+        console.log(`[A2ACore] Found processor ${processor.constructor.name} for cancel.`);
         this._executeProcessorCancel(processor, task, params.message, authContext);
-     }
+    } else {
+        console.warn(`[A2ACore] No processor found or processor does not support cancel for task ${task.id}.`);
+    }
 
     // Update status immediately (which also emits notification)
     const updatedTask = await this.updateTaskStatus(params.id, 'canceled', params.message);
@@ -338,38 +296,30 @@ export class A2AServerCore {
   }
 
    async handleSetPushNotification(params: A2ATypes.TaskPushNotificationParams, authContext?: any): Promise<A2ATypes.TaskPushNotificationParams> {
-       const task = await this.taskStore.getTask(params.id);
-       if (!task) {
-           throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task with id ${params.id} not found.`);
-       }
-       if (!this.agentCard.capabilities.pushNotifications) {
-            throw this._createError(A2ATypes.A2AErrorCodes.PushNotificationsNotSupported, `Agent does not support push notifications.`);
-       }
+       await this._getTaskOrThrow(params.id); // Ensures task exists
+       this._ensurePushNotificationsSupportedOrThrow();
        await this.taskStore.setPushConfig(params.id, params.pushNotificationConfig ?? null);
        // TODO: Consider emitting an event here? Or is it purely config?
        return { id: params.id, pushNotificationConfig: params.pushNotificationConfig ?? null };
    }
 
    async handleGetPushNotification(params: A2ATypes.TaskPushNotificationGetParams, authContext?: any): Promise<A2ATypes.TaskPushNotificationParams> {
-        const task = await this.taskStore.getTask(params.id);
-        if (!task) {
-           throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task with id ${params.id} not found.`);
-        }
-        if (!this.agentCard.capabilities.pushNotifications) {
-            throw this._createError(A2ATypes.A2AErrorCodes.PushNotificationsNotSupported, `Agent does not support push notifications.`);
-       }
-       const config = await this.taskStore.getPushConfig(params.id);
-       return { id: params.id, pushNotificationConfig: config };
+        await this._getTaskOrThrow(params.id); // Ensures task exists
+        this._ensurePushNotificationsSupportedOrThrow();
+        const config = await this.taskStore.getPushConfig(params.id);
+        return { id: params.id, pushNotificationConfig: config };
    }
 
   // --- Core Methods Called by Updater/Internal Logic ---
   async updateTaskStatus(taskId: string, newState: A2ATypes.TaskState, message?: A2ATypes.Message): Promise<A2ATypes.Task> {
+    await this._getTaskOrThrow(taskId); // Ensure task exists before updating
     const now = new Date().toISOString();
     const statusUpdate: A2ATypes.TaskStatus = { state: newState, timestamp: now, message };
     const updatedTask = await this.taskStore.updateTask(taskId, { status: statusUpdate });
     if (!updatedTask) {
         console.error(`[A2ACore] Failed to update status for task ${taskId} - task not found in store.`);
-        throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task ${taskId} not found during status update.`);
+        // This case should theoretically be less likely now due to the check above, but keep for robustness
+        throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Task ${taskId} disappeared during status update.`);
     }
     console.log(`[A2ACore] Task ${taskId} status updated to ${newState}`);
 
@@ -377,7 +327,7 @@ export class A2AServerCore {
       const statusEvent: A2ATypes.TaskStatusUpdateEvent = {
             id: taskId,
             status: { ...updatedTask.status },
-            final: ['completed', 'failed', 'canceled'].includes(newState),
+            final: this._isFinalState(newState),
             metadata: updatedTask.metadata
         };
       delete statusEvent.status.message;
@@ -392,11 +342,7 @@ export class A2AServerCore {
   }
 
   async addTaskArtifact(taskId: string, artifactData: Omit<A2ATypes.Artifact, 'index' | 'id' | 'timestamp'>): Promise<number> {
-    const task = await this.taskStore.getTask(taskId);
-    if (!task) {
-         console.error(`[A2ACore] Failed to add artifact for task ${taskId} - task not found in store.`);
-         throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task ${taskId} not found when adding artifact.`);
-    }
+    const task = await this._getTaskOrThrow(taskId);
     const currentArtifacts = task.artifacts ?? [];
     const newIndex = currentArtifacts.length;
     const now = new Date().toISOString();
@@ -426,12 +372,19 @@ export class A2AServerCore {
 
   // Helper to get current task status
   async getTaskStatus(taskId: string): Promise<A2ATypes.TaskState> {
-      const task = await this.taskStore.getTask(taskId);
-      if (!task) {
+      try {
+          const task = await this._getTaskOrThrow(taskId);
+          return task.status.state;
+      } catch (error: any) {
+          // If the error is specifically TaskNotFound, return 'unknown', otherwise rethrow
+          if (error.isA2AError && error.code === A2ATypes.A2AErrorCodes.TaskNotFound) {
+              console.warn(`[A2ACore] Task ${taskId} not found when fetching status.`);
+              return 'unknown';
+          }
+          // Rethrow other errors (like internal errors from the store)
           console.error(`[A2ACore] Task ${taskId} not found when fetching status.`);
-          return 'unknown';
+          throw error;
       }
-      return task.status.state;
   }
 
   // --- Internal Helper Methods ---
@@ -449,20 +402,20 @@ export class A2AServerCore {
         return null;
     }
 
-    // Helper to build lookup parameters from task metadata
-    private _buildLookupParamsForTask(task: A2ATypes.Task): A2ATypes.TaskSendParams | null {
-       const storedSkillId = task.metadata?._processorSkillId as string | undefined;
-        if (!storedSkillId) {
-            console.error(`[A2ACore] Task ${task.id} is missing the internal _processorSkillId metadata. Cannot look up processor.`);
-            return null;
-        }
-        const lookupParams: A2ATypes.TaskSendParams = {
-             message: { role: 'user', parts: [] },
-             metadata: { skillId: storedSkillId },
-             id: task.id,
-             sessionId: task.sessionId
-         };
-        return lookupParams;
+    // Throws InternalError if essential metadata is missing.
+    private _buildLookupParamsForTask(task: A2ATypes.Task): A2ATypes.TaskSendParams {
+        const storedSkillId = task.metadata?._processorSkillId as string | undefined;
+         if (!storedSkillId) {
+             console.error(`[A2ACore] Task ${task.id} is missing the internal _processorSkillId metadata. Cannot look up processor.`);
+             throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Task ${task.id} is missing required skillId metadata.`);
+         }
+         const lookupParams: A2ATypes.TaskSendParams = {
+              message: { role: 'user', parts: [] },
+              metadata: { skillId: storedSkillId },
+              id: task.id,
+              sessionId: task.sessionId
+          };
+         return lookupParams;
     }
 
   // Helper to handle common error pattern in processor execution
@@ -518,20 +471,14 @@ export class A2AServerCore {
 
    // Method to handle internal triggers
    async triggerInternalUpdate(taskId: string, payload: any): Promise<void> {
-       const task = await this.taskStore.getTask(taskId);
-        if (!task) {
-           console.error(`[A2ACore] Internal update triggered for non-existent task ${taskId}`);
-           throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task ${taskId} not found for internal update.`);
-       }
-       const lookupParams = this._buildLookupParamsForTask(task);
-       if (!lookupParams) {
-            throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Task ${taskId} is missing required skillId metadata for internal update.`);
-       }
-       const processor = await this._findProcessor(lookupParams);
+       const task = await this._getTaskOrThrow(taskId);
+        // Find processor using only the ID
+        const processor = await this._findProcessorForExistingTask(taskId);
         if (!processor || !processor.handleInternalUpdate) {
-            console.error(`[A2ACore] No processor found (skillId: ${lookupParams.metadata?.skillId}) or processor does not support handleInternalUpdate for task ${taskId}`);
-            throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, `Task ${taskId} (skillId: ${lookupParams.metadata?.skillId}) cannot handle internal updates.`);
-       }
+            const skillId = task.metadata?._processorSkillId || 'unknown';
+            console.error(`[A2ACore] No processor found (skillId: ${skillId}) or processor does not support handleInternalUpdate for task ${taskId}`);
+            throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, `Task ${taskId} (skillId: ${skillId}) cannot handle internal updates.`);
+        }
         const updater = this._createTaskUpdater(taskId);
         try {
             await processor.handleInternalUpdate(taskId, payload, updater);
@@ -570,9 +517,9 @@ export class A2AServerCore {
   // Helper method to create TaskUpdater via closure
   private _createTaskUpdater(taskId: string): TaskUpdater {
     const core = this;
-    const isFinalState = async (): Promise<boolean> => {
+    const checkFinalState = async (): Promise<boolean> => {
         const state = await core.getTaskStatus(taskId);
-        return ['completed', 'failed', 'canceled'].includes(state);
+        return core._isFinalState(state);
     };
     return {
         taskId: taskId,
@@ -580,14 +527,14 @@ export class A2AServerCore {
              return core.getTaskStatus(taskId);
         },
         async updateStatus(newState: A2ATypes.TaskState, message?: A2ATypes.Message): Promise<void> {
-            if (await isFinalState()) {
+            if (await checkFinalState()) {
                  console.warn(`[TaskUpdater] Attempted to update status of task ${taskId} which is in a final state. Ignoring.`);
                 return;
             }
             await core.updateTaskStatus(taskId, newState, message);
         },
         async addArtifact(artifactData: Omit<A2ATypes.Artifact, 'index' | 'id' | 'timestamp'>): Promise<string | number> {
-             if (await isFinalState()) {
+             if (await checkFinalState()) {
                  console.warn(`[TaskUpdater] Attempted to add artifact to task ${taskId} which is in a final state. Ignoring.`);
                 return -1;
             }
@@ -601,14 +548,14 @@ export class A2AServerCore {
             await core.taskStore.addTaskHistory(taskId, message);
         },
         async signalCompletion(finalStatus: 'completed' | 'failed' | 'canceled', message?: A2ATypes.Message): Promise<void> {
-             if (await isFinalState()) {
+             if (await checkFinalState()) {
                  console.warn(`[TaskUpdater] Task ${taskId} already in final state. Ignoring signalCompletion(${finalStatus}).`);
                 return;
              }
             await core.updateTaskStatus(taskId, finalStatus, message);
         },
         async setInternalState(state: any): Promise<void> {
-             if (await isFinalState()) {
+             if (await checkFinalState()) {
                 console.warn(`[TaskUpdater] Attempted to set internal state for task ${taskId} which is in final state. Ignoring.`);
                 return;
              }
@@ -619,4 +566,49 @@ export class A2AServerCore {
         },
     };
   }
+
+  // Helper to get a task or throw TaskNotFound error
+  private async _getTaskOrThrow(taskId: string): Promise<A2ATypes.Task> {
+      const task = await this.taskStore.getTask(taskId);
+      if (!task) {
+          console.warn(`[A2ACore] Task with id ${taskId} not found.`);
+          throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task with id ${taskId} not found.`);
+      }
+      return task;
+  }
+
+  // Helper to find the processor associated with an *existing* task using its stored skillId.
+  // Fetches the task internally. Throws if task not found or essential metadata is missing.
+  private async _findProcessorForExistingTask(taskId: string): Promise<TaskProcessor | null> {
+    const task = await this._getTaskOrThrow(taskId);
+    // Note: _buildLookupParamsForTask will throw if _processorSkillId is missing
+    const lookupParams = this._buildLookupParamsForTask(task);
+    return this._findProcessor(lookupParams);
+  }
+
+  // --- Capability Check Helpers ---
+
+  private _ensureStreamingSupportedOrThrow(): SseConnectionManager {
+      if (!this.agentCard.capabilities.streaming) {
+            throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, `Agent capability check failed: Streaming (SSE) is not supported.`);
+      }
+      const sseService = this.notificationServices.find(s => s instanceof SseConnectionManager);
+      if (!sseService) {
+           throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, "Server configuration error: SSE (streaming) is not enabled.");
+      }
+      return sseService as SseConnectionManager;
+  }
+
+   private _ensurePushNotificationsSupportedOrThrow(): void {
+        if (!this.agentCard.capabilities.pushNotifications) {
+             throw this._createError(A2ATypes.A2AErrorCodes.PushNotificationsNotSupported, `Agent capability check failed: Push notifications are not supported.`);
+        }
+        // Optional: Could add a check here if a specific PushNotificationService implementation is required
+   }
+
+   // --- Task State Helper ---
+
+   private _isFinalState(state: A2ATypes.TaskState): boolean {
+       return ['completed', 'failed', 'canceled'].includes(state);
+   }
 }
