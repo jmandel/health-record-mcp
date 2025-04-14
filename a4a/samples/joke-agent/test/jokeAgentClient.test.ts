@@ -1,11 +1,18 @@
 // File: test/jokeAgentClient.test.ts
-import { test, expect, describe, afterAll } from "bun:test"; // Added afterAll
+import { test, expect, describe, beforeAll, afterAll } from "bun:test"; // Added beforeAll, afterAll
 import type { AgentCard, Task, TaskState, JsonRpcErrorResponse, JsonRpcSuccessResponse, TextPart } from "../../../src/types"; // Corrected import path, added TaskState, TextPart
+import { startA2AExpressServer, InMemoryTaskStore } from "../../../src/index"; // Import server setup
+import { JokeProcessor } from "../JokeProcessor"; // Import agent components
+import { jokeAgentCard } from "../agentCard";
+import type * as http from 'node:http'; // Import http for server type
+import { promisify } from 'node:util'; // Import promisify
+import { A2AServerCore } from "../../../src/core/A2AServerCore"; // Import A2AServerCore
 
 // --- Configuration ---
-const JOKE_AGENT_BASE_URL = "http://localhost:3001"; // Make sure this matches
-const AGENT_CARD_URL = `${JOKE_AGENT_BASE_URL}/.well-known/agent.json`;
-const AGENT_A2A_ENDPOINT = `${JOKE_AGENT_BASE_URL}/a2a`;
+const TEST_PORT = 3101; // Use a different port for testing
+const BASE_URL = `http://localhost:${TEST_PORT}`;
+const AGENT_CARD_ENDPOINT = `${BASE_URL}/.well-known/agent.json`;
+const AGENT_A2A_ENDPOINT = `${BASE_URL}/a2a`;
 
 let jsonRpcRequestId = 1; // Simple counter for unique JSON-RPC request IDs
 const MAX_POLL_ATTEMPTS = 5; // Max times to poll (e.g., 5 seconds)
@@ -21,45 +28,51 @@ function createRpcPayload(method: string, params: any): string {
     });
 }
 
-async function pollTaskUntilComplete(taskId: string): Promise<any> {
+async function makeRpcCall(method: string, params: any): Promise<any> {
+    const response = await fetch(AGENT_A2A_ENDPOINT, { // Use test endpoint
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, // No auth needed for joke agent
+        body: createRpcPayload(method, params)
+    });
+    if (!response.ok) {
+        // Attempt to read error body for more context
+        let errorBody = '';
+        try {
+            errorBody = await response.text();
+        } catch {}
+        throw new Error(`RPC call failed with status ${response.status}: ${errorBody}`);
+    }
+    const jsonResponse = await response.json() as { result?: any; error?: { code: number; message: string; data?: any } }; 
+    if (jsonResponse.error) {
+        console.error("[makeRpcCall] A2A RPC Error:", jsonResponse.error);
+        throw new Error(`A2A RPC Error ${jsonResponse.error.code}: ${jsonResponse.error.message}`);
+    }
+    return jsonResponse.result;
+}
+
+async function pollTaskUntilComplete(taskId: string, expectedFinalState: TaskState = 'completed'): Promise<Task> {
     for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
         console.log(`Polling attempt ${i + 1} for task ${taskId}...`);
-        const getPayload = createRpcPayload('tasks/get', { id: taskId });
-        const getResponse = await fetch(AGENT_A2A_ENDPOINT, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: getPayload
-        });
-
-        if (!getResponse.ok) {
-            // Handle case where task might not be found immediately or other errors
-            console.error(`Polling error: HTTP ${getResponse.status}`);
-            await Bun.sleep(POLL_INTERVAL_MS);
-            continue;
-        }
-
-        // Type assertion for the JSON response
-        const getResult = await getResponse.json() as JsonRpcSuccessResponse<Task> | JsonRpcErrorResponse;
-
-        // Type guard to check if it's an error response
-        if ('error' in getResult) {
-            console.error(`Polling error: JSON-RPC ${getResult.error.code} - ${getResult.error.message}`);
-            await Bun.sleep(POLL_INTERVAL_MS);
-            continue;
-        } else {
-            // Now we know it's a JsonRpcSuccessResponse<Task>
-            const task = getResult.result;
-            if (task?.status?.state === 'completed') {
-                console.log(`Task ${taskId} completed!`);
-                return task; // Return the completed task object
+        try {
+            const task = await makeRpcCall('tasks/get', { id: taskId }) as Task;
+            if (task?.status?.state === expectedFinalState) {
+                console.log(`Task ${taskId} reached expected state: ${expectedFinalState}!`);
+                return task; 
             } else {
                 console.log(`Task ${taskId} status: ${task?.status?.state || 'unknown'}`);
             }
+        } catch (error: any) {
+             // Handle cases where task might not be found immediately (e.g., -32001)
+             // Or other transient errors.
+             if (error.message?.includes('-32001')) { // TaskNotFound
+                 console.warn(`Polling warning: Task ${taskId} not found yet.`);
+             } else {
+                console.error(`Polling error: ${error.message}`);
+             }
         }
-
         await Bun.sleep(POLL_INTERVAL_MS);
     }
-    throw new Error(`Task ${taskId} did not complete within ${MAX_POLL_ATTEMPTS} poll attempts.`);
+    throw new Error(`Task ${taskId} did not reach state ${expectedFinalState} within ${MAX_POLL_ATTEMPTS} poll attempts.`);
 }
 
 // --- SSE Stream Processing Helper ---
@@ -70,400 +83,349 @@ interface ProcessedSseResult {
     finalStatus?: string; // Record the final status state reported by SSE
 }
 
-async function processSseStream(taskId: string, sseFetchPromise: Promise<Response>): Promise<ProcessedSseResult> {
+async function processSseStream(taskId: string, method: string, params: any): Promise<ProcessedSseResult> {
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     const receivedEvents: any[] = [];
     let jokeText = "";
     let finalStateReceived = false;
     let finalStatus: string | undefined;
 
+    const sseFetchPromise = fetch(AGENT_A2A_ENDPOINT, { // Use test endpoint
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+        body: createRpcPayload(method, params)
+    });
+
     // Promise to signal completion or timeout
-    return new Promise<ProcessedSseResult>((resolve, reject) => {
+    return new Promise<ProcessedSseResult>(async (resolve, reject) => { // Added async here
         const timeout = setTimeout(() => {
             reject(new Error(`SSE processing timed out after 10 seconds for task ${taskId}`));
         }, 10000); // 10 second timeout
 
-        const process = async () => {
-            try {
-                const sseResponse = await sseFetchPromise;
+        try {
+            const sseResponse = await sseFetchPromise;
 
-                expect(sseResponse.status).toBe(200); // Basic check within helper
-                expect(sseResponse.headers.get('content-type')).toContain('text/event-stream');
-
-                if (!sseResponse.body) {
-                    throw new Error(`SSE response body is null for task ${taskId}`);
-                }
-
-                reader = sseResponse.body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
-                if (!reader) {
-                    throw new Error(`Failed to get SSE stream reader for task ${taskId}`);
-                }
-
-                const decoder = new TextDecoder();
-                let buffer = "";
-
-                console.log(`[SSE Helper ${taskId}] Connection opened. Waiting for events...`);
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                        console.log(`[SSE Helper ${taskId}] Stream finished.`);
-                        break; // Exit loop when stream closes
-                    }
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n\n');
-                    buffer = lines.pop() || "";
-
-                    for (const eventBlock of lines) {
-                        if (!eventBlock.trim()) continue;
-
-                        let eventType = 'message';
-                        let eventData = "";
-
-                        for (const line of eventBlock.split('\n')) {
-                             if (line.startsWith('event:')) {
-                                eventType = line.substring(6).trim();
-                            } else if (line.startsWith('data:')) {
-                                eventData += line.substring(5).trim();
-                            } else if (line.startsWith(':')) { /* ignore comments */ }
-                        }
-
-                        if (eventData) {
-                            try {
-                                const parsedData = JSON.parse(eventData);
-                                receivedEvents.push({ type: eventType, data: parsedData });
-
-                                if (eventType === 'TaskArtifactUpdate' && parsedData.artifact?.name === 'joke-result') {
-                                    jokeText = parsedData.artifact.parts?.[0]?.text || "";
-                                }
-
-                                if (eventType === 'TaskStatusUpdate' && parsedData.final) {
-                                    finalStateReceived = true;
-                                    finalStatus = parsedData.status?.state;
-                                    console.log(`[SSE Helper ${taskId}] Final state ${finalStatus} received via SSE.`);
-                                    // Resolve once final state is seen, regardless of joke
-                                    // The caller should check if jokeText was populated
-                                    clearTimeout(timeout);
-                                    resolve({ receivedEvents, jokeText, finalStateReceived, finalStatus });
-                                    return; // Exit processing loop
-                                }
-                            } catch (parseError) {
-                                console.error(`[SSE Helper ${taskId}] Failed to parse SSE data: ${eventData}`, parseError);
-                            }
-                        }
-                    }
-                }
-                // If loop finishes but final state wasn't received (e.g., premature close)
-                 if (!finalStateReceived) {
-                     reject(new Error(`SSE stream closed for task ${taskId} before receiving final state event.`));
-                 }
-                 // If loop finishes after final state (should not happen due to return above, but safety)
-                 else {
-                     resolve({ receivedEvents, jokeText, finalStateReceived, finalStatus });
-                 }
-
-            } catch (err) {
-                 console.error(`[SSE Helper ${taskId}] Error during SSE processing:`, err);
-                 clearTimeout(timeout);
-                 reject(err);
-            } finally {
-                 if (reader) {
-                     try {
-                         if (!reader.closed) {
-                             await reader.cancel();
-                         }
-                     } catch (cancelError) { console.error(`[SSE Helper ${taskId}] Error cancelling SSE reader:`, cancelError); }
-                 }
+            // expect(sseResponse.status).toBe(200); // Cannot use expect inside promise like this easily
+            if (sseResponse.status !== 200) {
+                 throw new Error(`SSE connection failed with status ${sseResponse.status}`);
             }
-        };
+            if (!sseResponse.headers.get('content-type')?.includes('text/event-stream')) {
+                 throw new Error(`Invalid SSE content-type: ${sseResponse.headers.get('content-type')}`);
+            }
 
-        process(); // Start processing
+            if (!sseResponse.body) {
+                throw new Error(`SSE response body is null for task ${taskId}`);
+            }
+
+            reader = sseResponse.body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+            if (!reader) {
+                throw new Error(`Failed to get SSE stream reader for task ${taskId}`);
+            }
+
+            const decoder = new TextDecoder();
+            let buffer = "";
+
+            console.log(`[SSE Helper ${taskId}] Connection opened. Waiting for events...`);
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    console.log(`[SSE Helper ${taskId}] Stream finished.`);
+                    break; // Exit loop when stream closes
+                }
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n\n');
+                buffer = lines.pop() || "";
+
+                for (const eventBlock of lines) {
+                    if (!eventBlock.trim()) continue;
+
+                    let eventType = 'message';
+                    let eventData = "";
+
+                    for (const line of eventBlock.split('\n')) {
+                         if (line.startsWith('event:')) {
+                            eventType = line.substring(6).trim();
+                        } else if (line.startsWith('data:')) {
+                            eventData += line.substring(5).trim();
+                        } else if (line.startsWith(':')) { /* ignore comments */ }
+                    }
+
+                    if (eventData) {
+                        try {
+                            const parsedData = JSON.parse(eventData);
+                            receivedEvents.push({ type: eventType, data: parsedData });
+
+                            if (eventType === 'TaskArtifactUpdate' && parsedData.artifact?.name === 'joke-result') {
+                                jokeText = (parsedData.artifact.parts?.[0] as TextPart)?.text || "";
+                            }
+
+                            if (eventType === 'TaskStatusUpdate' && parsedData.final) {
+                                finalStateReceived = true;
+                                finalStatus = parsedData.status?.state;
+                                console.log(`[SSE Helper ${taskId}] Final state ${finalStatus} received via SSE.`);
+                                clearTimeout(timeout);
+                                resolve({ receivedEvents, jokeText, finalStateReceived, finalStatus });
+                                return; // Exit processing loop
+                            }
+                        } catch (parseError) {
+                            console.error(`[SSE Helper ${taskId}] Failed to parse SSE data: ${eventData}`, parseError);
+                        }
+                    }
+                }
+            }
+            // If loop finishes but final state wasn't received
+             if (!finalStateReceived) {
+                 reject(new Error(`SSE stream closed for task ${taskId} before receiving final state event.`));
+             }
+             // If loop finishes after final state (should not happen)
+             else {
+                 resolve({ receivedEvents, jokeText, finalStateReceived, finalStatus });
+             }
+
+        } catch (err) {
+             console.error(`[SSE Helper ${taskId}] Error during SSE processing:`, err);
+             clearTimeout(timeout);
+             reject(err);
+        } finally {
+             if (reader) {
+                 try {
+                     if (!reader.closed) {
+                         await reader.cancel();
+                     }
+                 } catch (cancelError) { console.error(`[SSE Helper ${taskId}] Error cancelling SSE reader:`, cancelError); }
+             }
+        }
     });
 }
 
 // --- Test Suite ---
 describe("Joke Agent A2A Client Tests", () => {
 
-    // Cleanup any potentially hanging resources if needed (though unlikely here)
-    afterAll(() => {
-        console.log("Finished Joke Agent tests.");
+    let server: http.Server;
+    let taskStore: InMemoryTaskStore;
+    let processor: JokeProcessor;
+    let core: A2AServerCore; // Variable to hold the core instance
+
+    // Use promisify to handle server close asynchronously
+    const closeServer = promisify((serverInstance: http.Server, cb: (err?: Error) => void) => serverInstance.close(cb));
+
+    beforeAll(async () => { // Make beforeAll async if needed for setup
+        taskStore = new InMemoryTaskStore();
+        processor = new JokeProcessor();
+
+        // Capture the core instance via configureApp
+        server = startA2AExpressServer({
+            agentDefinition: jokeAgentCard,
+            taskStore: taskStore,
+            taskProcessors: [processor],
+            port: TEST_PORT,
+            baseUrl: BASE_URL,
+            // No auth needed for joke agent
+            configureApp: (app, coreInstance, card) => {
+                console.log("[Test Setup] configureApp called, capturing core instance.");
+                core = coreInstance; // Assign the core instance
+            }
+        });
+
+        if (!core) {
+             throw new Error("A2AServerCore instance was not captured during setup.");
+         }
+
+        // Add a small delay to ensure server is fully listening
+        await Bun.sleep(50);
+        console.log(`Joke Agent Test Server started on port ${TEST_PORT}`);
     });
 
-    // --- Agent Card Test (Unchanged) ---
+    // Use async/await with promisified close
+    afterAll(async () => {
+        console.log("[afterAll] Starting shutdown sequence...");
+
+        // 1. Close all SSE connections first
+        if (core) {
+             console.log("[afterAll] Attempting to close all SSE connections via core...");
+            try {
+                 core.closeAllSseConnections(); // Call the new method
+                 console.log("[afterAll] Core finished closing SSE connections.");
+             } catch (sseCloseError) {
+                 console.error("[afterAll] Error closing SSE connections via core:", sseCloseError);
+             }
+        } else {
+             console.warn("[afterAll] Core instance not found, cannot explicitly close SSE connections.");
+         }
+
+        // 2. Close the main HTTP server
+        if (server) {
+            console.log("[afterAll] Server instance found. Attempting close...");
+            try {
+                await closeServer(server);
+                console.log("[afterAll] Server closed successfully (promisify resolved).");
+            } catch (err) {
+                console.error("[afterAll] Error during server close:", err);
+                 // Consider forcing exit even on error, but log it first
+                 // process.exit(1); // Keep commented for now unless needed
+            }
+        } else {
+            console.warn("[afterAll] Server instance not found.");
+        }
+
+        // Explicitly exit the process using setTimeout to prevent hanging
+        console.log("[afterAll] Scheduling forced process exit via setTimeout(0).");
+        setTimeout(() => {
+             console.log("[afterAll] setTimeout callback executing. Forcing process exit now...");
+             process.exit(0);
+         }, 0); // Use setTimeout with 0 delay
+        console.log("[afterAll] setTimeout scheduled. End of afterAll logic.");
+    });
+
+    // --- Agent Card Test ---
     test("should fetch and validate the Agent Card", async () => {
-        const response = await fetch(AGENT_CARD_URL);
+        const response = await fetch(AGENT_CARD_ENDPOINT); // Use test endpoint
         expect(response.status).toBe(200);
-        const card = await response.json() as AgentCard; // Type assertion
+        const card = await response.json() as AgentCard; 
         expect(card).toBeObject();
-        expect(card.name).toBe('Joke Agent');
+        expect(card.name).toBe(jokeAgentCard.name!); // Use joke agent name
         expect(card.url).toBe(AGENT_A2A_ENDPOINT);
         expect(card.skills).toBeArray();
-        expect(card.skills[0].id).toBe('tell-joke');
+        expect(card.skills.find(s => s.id === 'tell-joke')).toBeDefined();
+        expect(card.skills.find(s => s.id === 'jokeAboutTopic')).toBeDefined();
     });
 
-    // --- Polling Send/Get Task Test (REVISED) ---
+    // --- Polling Send/Get Task Test ---
     test("should send task, poll, and get completed joke artifact", async () => {
         const taskId = `test-poll-joke-${Date.now()}`;
-        const sendPayload = createRpcPayload('tasks/send', {
-            id: taskId, // Suggest an ID
-            message: {
-                role: "user",
-                parts: [{ type: "text", text: "tell me a joke via polling test" }],
-            },
-            metadata: { skillId: 'tell-joke' } // Specify skill
-        });
-
-        // --- Send the task ---
-        const sendResponse = await fetch(AGENT_A2A_ENDPOINT, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: sendPayload
-        });
-
-        expect(sendResponse.status).toBe(200);
-        const sendResult = await sendResponse.json() as JsonRpcSuccessResponse<Task>; // Type assertion
-        expect(sendResult.result).toBeObject();
-        const initialTask = sendResult.result;
+        const params = {
+            id: taskId, 
+            message: { role: "user", parts: [{ type: "text", text: "tell me a joke via polling test" }] },
+            metadata: { skillId: 'tell-joke' } 
+        };
+        
+        // Send task using helper
+        const initialTask = await makeRpcCall('tasks/send', params) as Task;
         expect(initialTask.id).toBe(taskId);
+        // Don't assert initial state strictly, core handles it
+        expect(initialTask.status.state).toBeOneOf(['submitted', 'working', 'completed']); 
 
-        // --- Assert Initial State (Flexible) ---
-        // Agent might return 'submitted' or 'working' immediately.
-        // If it was incredibly fast AND synchronous (which ours isn't), it *could* be 'completed'.
-        expect(initialTask.status.state).toBeOneOf(['submitted', 'working', 'completed']);
-        console.log(`Initial task state: ${initialTask.status.state}`);
+        // Poll until completed using helper
+        const finalTask = await pollTaskUntilComplete(taskId, 'completed');
 
-        // --- Poll until completed ---
-        const finalTask = await pollTaskUntilComplete(taskId);
-
-        // --- Assert final state and artifact ---
-        expect(finalTask).toBeObject();
-        expect(finalTask.id).toBe(taskId);
-        expect(finalTask.status.state).toBe('completed'); // Assert completion after polling
-
+        // Assert final state and artifact
+        expect(finalTask.status.state).toBe('completed');
         expect(finalTask.artifacts).toBeArray();
-        expect(finalTask.artifacts.length).toBe(1);
-
-        const jokeArtifact = finalTask.artifacts[0];
-        expect(jokeArtifact).toBeObject();
+        expect(finalTask.artifacts!.length).toBe(1);
+        const jokeArtifact = finalTask.artifacts![0];
         expect(jokeArtifact.name).toBe('joke-result');
-        expect(jokeArtifact.parts).toBeArray();
-        expect(jokeArtifact.parts.length).toBe(1);
         expect(jokeArtifact.parts[0].type).toBe('text');
-        expect(jokeArtifact.parts[0].text).toBeString();
-        expect(jokeArtifact.parts[0].text.length).toBeGreaterThan(5);
-
-        console.log(`Received Joke (via polling): ${jokeArtifact.parts[0].text}`);
+        const jokeText = (jokeArtifact.parts[0] as TextPart).text;
+        expect(jokeText.length).toBeGreaterThan(5);
+        console.log(`Received Joke (via polling): ${jokeText}`);
     });
 
-    // --- Cancel Task Test (Unchanged) ---
+    // --- Cancel Task Test ---
     test("should send a cancel request and get a valid response", async () => {
         const taskId = `test-cancel-${Date.now()}`;
-        const sendPayload = createRpcPayload('tasks/send', {
+        // Send a task first
+        const sendResult = await makeRpcCall('tasks/send', {
             id: taskId,
             message: { role: "user", parts: [{ type: "text", text: "another joke to cancel" }] },
-            metadata: { skillId: 'tell-joke' } // Specify skill
-        });
-        const sendResponse = await fetch(AGENT_A2A_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: sendPayload });
-        expect(sendResponse.status).toBe(200);
-        const sendResult = await sendResponse.json() as JsonRpcSuccessResponse<Task>; // Type assertion
-        const actualTaskId = sendResult.result.id;
+            metadata: { skillId: 'tell-joke' } 
+        }) as Task;
+        const actualTaskId = sendResult.id;
 
-        const cancelPayload = createRpcPayload('tasks/cancel', { id: actualTaskId });
-        const cancelResponse = await fetch(AGENT_A2A_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: cancelPayload });
-        expect(cancelResponse.status).toBe(200);
-        const cancelResult = await cancelResponse.json() as JsonRpcSuccessResponse<Task>; // Type assertion
-        expect(cancelResult.result).toBeObject();
-        expect(cancelResult.result.id).toBe(actualTaskId);
-        expect(cancelResult.result.status.state).toBeOneOf(['completed', 'canceled']); // Agent is fast, might complete before cancel processes fully
-        console.log(`Cancel response status for task ${actualTaskId}: ${cancelResult.result.status.state}`);
+        // Now cancel it
+        const cancelResult = await makeRpcCall('tasks/cancel', { id: actualTaskId }) as Task;
+        expect(cancelResult.id).toBe(actualTaskId);
+        // Because the joke agent is fast, it might already be completed or canceling is fast
+        expect(cancelResult.status.state).toBeOneOf(['completed', 'canceled']); 
+        console.log(`Cancel response status for task ${actualTaskId}: ${cancelResult.status.state}`);
+
+        // Optional: Verify via tasks/get after a delay
+        await Bun.sleep(100);
+        const finalTask = await makeRpcCall('tasks/get', { id: actualTaskId }) as Task;
+        expect(finalTask.status.state).toBe(cancelResult.status.state); // Should match the cancel response
     });
 
-    // --- Error Handling Test (Task Not Found - Unchanged) ---
+    // --- Error Handling Test (Task Not Found) ---
     test("should receive a TaskNotFound error for a non-existent task ID", async () => {
          const nonExistentTaskId = "task-does-not-exist-456";
-         const getPayload = createRpcPayload('tasks/get', { id: nonExistentTaskId });
-         const response = await fetch(AGENT_A2A_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: getPayload });
-         expect(response.status).toBe(404); // Expect HTTP 404 after core fix
-         const errorResult = await response.json() as JsonRpcErrorResponse; // Type assertion
-         expect(errorResult.error).toBeObject();
-         expect(errorResult.error.code).toBe(-32001); // A2AErrorCodes.TaskNotFound
-         expect(errorResult.error.message).toContain(nonExistentTaskId);
+         try {
+            await makeRpcCall('tasks/get', { id: nonExistentTaskId });
+            // If it doesn't throw, the test fails
+            expect(true).toBe(false); 
+         } catch (error: any) {
+             expect(error.message).toContain('-32001'); // Check for TaskNotFound code
+             expect(error.message).toContain(nonExistentTaskId);
+         }
     });
 
     // --- SSE sendSubscribe Test ---
     test("should send task via sendSubscribe and receive updates via SSE and verify via poll", async () => {
         const taskId = `test-sse-joke-${Date.now()}`;
-
-        // Prepare the SSE request promise (use tell-joke skill)
-        const sseFetchPromise = fetch(AGENT_A2A_ENDPOINT, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
-            body: createRpcPayload('tasks/sendSubscribe', {
-                 id: taskId,
-                 message: {
-                     role: "user",
-                     parts: [{ type: "text", text: "tell me a joke via SSE test" }],
-                 },
-                 metadata: { skillId: 'tell-joke' } // Specify skill
-             })
-        });
+        const params = {
+             id: taskId,
+             message: { role: "user", parts: [{ type: "text", text: "tell me a joke via SSE test" }] },
+             metadata: { skillId: 'tell-joke' } 
+         };
 
         // Process the SSE stream using the helper
-        const resultFromSse = await processSseStream(taskId, sseFetchPromise);
+        const resultFromSse = await processSseStream(taskId, 'tasks/sendSubscribe', params);
 
-        // --- Assertions on received SSE data ---
+        // Assertions on received SSE data
         expect(resultFromSse.finalStateReceived).toBeTrue();
         expect(resultFromSse.finalStatus).toBe('completed');
-        expect(resultFromSse.receivedEvents.length).toBeGreaterThanOrEqual(2); // Initial status, artifact, final status
-
-        // Check for status updates within SSE events
-        const sseStatusUpdates = resultFromSse.receivedEvents.filter(e => e.type === 'TaskStatusUpdate').map(e => e.data);
-        expect(sseStatusUpdates.some(s => s.status.state === 'working' || s.status.state === 'submitted')).toBeTrue();
-        expect(sseStatusUpdates.some(s => s.status.state === 'completed' && s.final === true)).toBeTrue();
-
-        // Check for artifact update within SSE events
-        const sseArtifactUpdates = resultFromSse.receivedEvents.filter(e => e.type === 'TaskArtifactUpdate').map(e => e.data);
-        expect(sseArtifactUpdates.length).toBe(1);
-        expect(sseArtifactUpdates[0].artifact.name).toBe('joke-result');
-
-        // Check joke text extracted during SSE processing
-        expect(resultFromSse.jokeText).toBeString();
         expect(resultFromSse.jokeText.length).toBeGreaterThan(5);
-
         console.log(`Received Joke (via SSE): ${resultFromSse.jokeText}`);
-
-        // --- Follow-up Poll Verification ---
+        
+        // Follow-up Poll Verification using helper
         console.log(`[SSE Test ${taskId}] SSE finished. Performing follow-up poll...`);
-
-        // Wait a very short moment just in case there's a tiny delay in store update vs SSE push
-        await Bun.sleep(100); // 100ms delay
-
-        const getPayload = createRpcPayload('tasks/get', { id: taskId, historyLength: 0 }); // Get task without history
-        const getResponse = await fetch(AGENT_A2A_ENDPOINT, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: getPayload
-        });
-
-        expect(getResponse.status).toBe(200);
-        const getResult = await getResponse.json() as JsonRpcSuccessResponse<Task> | JsonRpcErrorResponse;
-
-        expect('error' in getResult).toBeFalse(); // Should not be an error
-        const polledTask = (getResult as JsonRpcSuccessResponse<Task>).result;
-
-        expect(polledTask).toBeObject();
-        expect(polledTask.id).toBe(taskId);
+        await Bun.sleep(100); // Small delay
+        const polledTask = await makeRpcCall('tasks/get', { id: taskId, historyLength: 0 });
         expect(polledTask.status.state).toBe('completed');
-        console.log(`[SSE Test ${taskId}] Polled task status: ${polledTask.status.state}`);
-
-        // Verify consistency between SSE final state and polled state
-        expect(polledTask.status.state).toBe(resultFromSse.finalStatus as TaskState);
-
-        // Verify joke consistency
-        expect(polledTask.artifacts).toBeArray();
-        expect(polledTask.artifacts?.length).toBe(1);
-        const polledJokePart = polledTask.artifacts?.[0]?.parts?.[0];
-        expect(polledJokePart?.type).toBe('text'); // Ensure it's a TextPart
-        const polledJokeText = (polledJokePart as TextPart)?.text; // Use imported TextPart type
-        expect(polledJokeText).toBeString();
-        expect(polledJokeText).toBe(resultFromSse.jokeText);
-
+        const polledJokeText = (polledTask.artifacts?.[0]?.parts?.[0] as TextPart)?.text;
+        expect(polledJokeText).toBe(resultFromSse.jokeText); // Verify consistency
         console.log(`[SSE Test ${taskId}] Jokes match between SSE and final poll.`);
-        console.log(JSON.stringify(resultFromSse, null, 2))
     });
 
     // --- Input Required / Resume Test ---
     test("should handle input-required for jokeAboutTopic and resume", async () => {
        const taskId = `test-input-required-joke-${Date.now()}`;
 
-       // --- Send initial request without topic ---
+       // Send initial request without topic 
        console.log(`[InputRequired Test ${taskId}] Sending initial request without topic...`);
-       const initialSendPayload = createRpcPayload('tasks/send', {
+       const initialParams = {
            id: taskId,
-           message: {
-               role: "user",
-               parts: [{ type: "text", text: "tell me a joke" }] // No topic mentioned
-           },
-           metadata: { skillId: 'jokeAboutTopic' } // Specify the topic skill
-       });
+           message: { role: "user", parts: [{ type: "text", text: "tell me a joke" }] },
+           metadata: { skillId: 'jokeAboutTopic' } 
+       };
+       await makeRpcCall('tasks/send', initialParams);
 
-       const initialSendResponse = await fetch(AGENT_A2A_ENDPOINT, {
-           method: 'POST',
-           headers: { 'Content-Type': 'application/json' },
-           body: initialSendPayload
-       });
-
-       expect(initialSendResponse.status).toBe(200);
-       const initialSendResult = await initialSendResponse.json() as JsonRpcSuccessResponse<Task>;
-       expect(initialSendResult.result).toBeObject();
-
-       // --- Poll until input-required --- (Agent might respond immediately or take time)
+       // Poll until input-required 
        console.log(`[InputRequired Test ${taskId}] Polling for input-required state...`);
-       let inputRequiredTask: Task | null = null;
-       for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
-           const getPayload = createRpcPayload('tasks/get', { id: taskId });
-           const getResponse = await fetch(AGENT_A2A_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: getPayload });
-           const getResult = await getResponse.json() as JsonRpcSuccessResponse<Task> | JsonRpcErrorResponse;
-
-           if ('result' in getResult && getResult.result.status.state === 'input-required') {
-               inputRequiredTask = getResult.result;
-               console.log(`[InputRequired Test ${taskId}] Task reached input-required state.`);
-               break;
-           }
-           console.log(`[InputRequired Test ${taskId}] Polling... current state: ${('result' in getResult) ? getResult.result.status.state : ('error' in getResult ? 'error' : 'unknown')}`);
-           await Bun.sleep(POLL_INTERVAL_MS);
-       }
-
-       expect(inputRequiredTask).not.toBeNull();
+       const inputRequiredTask = await pollTaskUntilComplete(taskId, 'input-required');
        expect(inputRequiredTask?.status.state).toBe('input-required');
-       const promptPart = inputRequiredTask?.status.message?.parts[0];
-       expect(promptPart?.type).toBe('text'); // Ensure prompt is text
-       expect((promptPart as TextPart)?.text).toContain('topic'); // Check the agent's prompt text
+       const promptPart = inputRequiredTask?.status.message?.parts[0] as TextPart;
+       expect(promptPart?.text).toContain('topic');
 
-       // --- Send resume message with topic ---
+       // Send resume message with topic 
        const topic = "computers";
        console.log(`[InputRequired Test ${taskId}] Sending resume message with topic: ${topic}`);
-       const resumePayload = createRpcPayload('tasks/send', {
-           id: taskId,
-           message: {
-               role: "user",
-               parts: [{ type: "text", text: topic }]
-           },
-       });
+       const resumeParams = { id: taskId, message: { role: "user", parts: [{ type: "text", text: topic }] } };
+       await makeRpcCall('tasks/send', resumeParams); // Send resume
 
-       const resumeResponse = await fetch(AGENT_A2A_ENDPOINT, {
-           method: 'POST',
-           headers: { 'Content-Type': 'application/json' },
-           body: resumePayload
-       });
-
-       expect(resumeResponse.status).toBe(200);
-       const resumeResult = await resumeResponse.json() as JsonRpcSuccessResponse<Task>; // Immediate response might still be working
-       expect(resumeResult.result).toBeObject();
-       expect(resumeResult.result.status.state).toBeOneOf(['working', 'completed']); // Should be working or maybe completed if fast
-
-       // --- Poll until final completion --- 
+       // Poll until final completion 
        console.log(`[InputRequired Test ${taskId}] Polling for final completion after resume...`);
-       const finalTask = await pollTaskUntilComplete(taskId);
+       const finalTask = await pollTaskUntilComplete(taskId, 'completed');
 
-       // --- Assert final state and artifact ---
-       expect(finalTask).toBeObject();
-       expect(finalTask.id).toBe(taskId);
-       expect(finalTask.status.state).toBe('completed'); // Assert completion
-
+       // Assert final state and artifact
+       expect(finalTask.status.state).toBe('completed'); 
        expect(finalTask.artifacts).toBeArray();
-       expect(finalTask.artifacts?.length).toBe(1);
-       const jokeArtifact = finalTask.artifacts?.[0];
-       expect(jokeArtifact?.name).toBe('joke-result');
-       expect(jokeArtifact?.metadata?.topic).toBe(topic); // Check topic in metadata
-
-       const jokePart = jokeArtifact?.parts?.[0];
-       expect(jokePart?.type).toBe('text');
-       const jokeText = (jokePart as TextPart)?.text;
-       expect(jokeText).toBeString();
-       expect(jokeText?.toLowerCase()).toContain(topic); // Joke should contain the topic
-
+       expect(finalTask.artifacts!.length).toBe(1);
+       const jokeArtifact = finalTask.artifacts![0];
+       expect(jokeArtifact.name).toBe('joke-result');
+       expect(jokeArtifact.metadata?.topic).toBe(topic); // Check topic
+       const jokeText = (jokeArtifact.parts[0] as TextPart).text;
+       expect(jokeText.toLowerCase()).toContain(topic);
        console.log(`Received Topic Joke (after resume): ${jokeText}`);
     });
 

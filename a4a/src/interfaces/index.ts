@@ -26,6 +26,21 @@ export interface TaskStore {
   /** Retrieves the push notification config for a task */
   getPushConfig(id: string): Promise<A2ATypes.PushNotificationConfig | null>;
 
+  /**
+   * Sets or updates the internal, non-client-visible state associated with a task.
+   * This state is managed entirely by the server/processor.
+   * @param taskId The ID of the task.
+   * @param state The internal state object (can be any serializable type).
+   */
+  setInternalState(taskId: string, state: any): Promise<void>;
+
+  /**
+   * Retrieves the internal state associated with a task.
+   * @param taskId The ID of the task.
+   * @returns The internal state object, or null if not set or not found.
+   */
+  getInternalState(taskId: string): Promise<any | null>;
+
   // Optional: delete task (e.g., for cleanup)
   // deleteTask?(id: string): Promise<void>;
 }
@@ -49,6 +64,18 @@ export interface TaskUpdater {
 
   /** Signal that the task processing has reached a final state (completed, failed, canceled) */
   signalCompletion(finalStatus: 'completed' | 'failed' | 'canceled', message?: A2ATypes.Message): Promise<void>;
+
+  /**
+   * Sets or updates the internal, non-client-visible state associated with this task.
+   * @param state The internal state object (must be serializable).
+   */
+  setInternalState(state: any): Promise<void>;
+
+  /**
+   * Retrieves the internal state associated with this task.
+   * @returns The internal state object, or null if not set.
+   */
+  getInternalState(): Promise<any | null>;
 
   // --- Streaming related (Placeholders - requires SSE implementation) ---
   // appendArtifactPart(artifactIdOrIndex: string | number, part: A2ATypes.Part, lastChunk?: boolean): Promise<void>;

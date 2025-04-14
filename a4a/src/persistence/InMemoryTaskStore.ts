@@ -5,6 +5,8 @@ import { randomUUID } from 'node:crypto'; // Use Bun's native crypto
 export class InMemoryTaskStore implements TaskStore {
   private tasks = new Map<string, A2ATypes.Task>();
   private history = new Map<string, A2ATypes.Message[]>();
+  private pushConfigs = new Map<string, A2ATypes.PushNotificationConfig | null>();
+  private internalStates = new Map<string, any>();
   // Note: Real history should likely be capped or stored more efficiently
 
   async createOrGetTask(params: A2ATypes.TaskSendParams): Promise<A2ATypes.Task> {
@@ -38,6 +40,7 @@ export class InMemoryTaskStore implements TaskStore {
 
     this.tasks.set(taskId, newTask);
     this.history.set(taskId, []); // Initialize history storage
+    this.internalStates.set(taskId, null); // Initialize internal state
 
     // Add the initial user message to history
     await this.addTaskHistory(taskId, params.message);
@@ -130,5 +133,27 @@ export class InMemoryTaskStore implements TaskStore {
    async getPushConfig(id: string): Promise<A2ATypes.PushNotificationConfig | null> {
      const task = this.tasks.get(id);
      return task?.pushNotificationConfig ?? null;
+   }
+
+   async setInternalState(taskId: string, state: any): Promise<void> {
+       if (!this.tasks.has(taskId)) {
+            console.warn(`[TaskStore] Attempted to set internal state for non-existent task: ${taskId}`);
+           throw new Error(`Task ${taskId} not found`); // Or handle gracefully
+       }
+       this.internalStates.set(taskId, state);
+        console.log(`[TaskStore] Internal state set for task ${taskId}`);
+   }
+
+   async getInternalState(taskId: string): Promise<any | null> {
+       if (!this.tasks.has(taskId)) {
+           console.warn(`[TaskStore] Attempted to get internal state for non-existent task: ${taskId}`);
+           return null;
+       }
+       // Return a copy if the state is an object/array to prevent mutation
+       const state = this.internalStates.get(taskId);
+       if (state && typeof state === 'object') {
+           return JSON.parse(JSON.stringify(state)); 
+       }
+       return state ?? null;
    }
 }

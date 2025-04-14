@@ -35,7 +35,6 @@ export class JokeProcessor implements TaskProcessor {
         const topic = topicMatch?.[1];
 
         if (topic) {
-          await updater.updateStatus('working', { role: 'agent', parts: [{type: 'text', text: `Thinking of a joke about ${topic}...`}]});
           await Bun.sleep(1000);
           const jokeText = `Why was the ${topic} so good at networking? Because it had great connections!`; // Placeholder topic joke
           await updater.addArtifact({
@@ -87,9 +86,6 @@ export class JokeProcessor implements TaskProcessor {
     }
   }
 
-  // No resume, cancel or internal update logic needed for this simple agent
-
-  // --- Add resume method --- 
   async resume(task: Task, resumeMessage: Message, updater: TaskUpdater): Promise<void> {
        console.log(`[JokeProcessor] Resuming task ${task.id}`);
 

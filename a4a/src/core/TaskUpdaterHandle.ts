@@ -27,29 +27,65 @@ export class TaskUpdaterHandle implements TaskUpdater {
   }
 
   async updateStatus(newState: A2ATypes.TaskState, message?: A2ATypes.Message): Promise<void> {
-    this._currentStatus = newState; // Update local view immediately
-    await this.core.updateTaskStatus(this.taskId, newState, message);
-    // Core handles TaskStore update and notifications
+    if (this.isFinalState(this._currentStatus)) {
+        console.warn(`[TaskUpdater] Attempted to update status of task ${this.taskId} from final state ${this._currentStatus} to ${newState}. Ignoring.`);
+        return; 
+    }
+    const updatedTask = await this.core.updateTaskStatus(this.taskId, newState, message);
+    this._currentStatus = updatedTask.status.state;
   }
 
   async addArtifact(artifactData: Omit<A2ATypes.Artifact, 'index' | 'id' | 'timestamp'>): Promise<string | number> {
+    if (this.isFinalState(this._currentStatus)) {
+        console.warn(`[TaskUpdater] Attempted to add artifact to task ${this.taskId} which is in final state ${this._currentStatus}. Ignoring.`);
+        return -1; // Or throw error?
+    }
     const newIndex = await this.core.addTaskArtifact(this.taskId, artifactData);
     // Core handles TaskStore update and notifications
     return newIndex;
   }
 
   async addHistoryMessage(message: A2ATypes.Message): Promise<void> {
-    // Add role: 'agent' if not provided? Or enforce it? For now, pass through.
+    if (!message.role) {
+         console.error(`[TaskUpdater] History message for task ${this.taskId} must include a role.`);
+         return;
+    }
+    // Consider adding validation or rate limiting if needed
     await this.core.addTaskHistory(this.taskId, message);
     // Core handles TaskStore update
   }
 
-  async signalCompletion(finalStatus: 'completed' | 'failed' | 'canceled', message?: A2ATypes.Message): Promise<void> {
-      if (finalStatus !== 'completed' && finalStatus !== 'failed' && finalStatus !== 'canceled') {
-          throw new Error("signalCompletion requires a final status: completed, failed, or canceled.");
-      }
-      this._currentStatus = finalStatus; // Update local view
-      await this.core.updateTaskStatus(this.taskId, finalStatus, message);
-      // Core handles TaskStore update and notifications
+  async signalCompletion(finalState: 'completed' | 'failed' | 'canceled', message?: A2ATypes.Message): Promise<void> {
+    if (this.isFinalState(this._currentStatus)) {
+        console.warn(`[TaskUpdater] Task ${this.taskId} already in final state ${this._currentStatus}. Ignoring signalCompletion(${finalState}).`);
+        return; 
+    }
+    await this.updateStatus(finalState, message); 
+  }
+
+  // --- Methods for Internal State --- 
+
+  /**
+   * Sets or updates the internal, non-client-visible state associated with this task.
+   * @param state The internal state object (must be serializable).
+   */
+  async setInternalState(state: any): Promise<void> {
+       if (this.isFinalState(this._currentStatus)) {
+          console.warn(`[TaskUpdater] Attempted to set internal state for task ${this.taskId} which is in final state ${this._currentStatus}. Ignoring.`);
+          return; 
+       }
+       await this.core.setTaskInternalState(this.taskId, state);
+  }
+
+  /**
+   * Retrieves the internal state associated with this task.
+   * @returns The internal state object, or null if not set.
+   */
+  async getInternalState(): Promise<any | null> {
+      return this.core.getTaskInternalState(this.taskId);
+  }
+
+  private isFinalState(state: A2ATypes.TaskState): boolean {
+      return ['completed', 'failed', 'canceled'].includes(state);
   }
 }

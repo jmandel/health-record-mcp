@@ -4,6 +4,11 @@ import { TaskUpdaterHandle } from './TaskUpdaterHandle';
 import { randomUUID } from 'node:crypto';
 import type * as express from 'express'; // Import express types for SSE Response
 
+// Define the structure for storing SSE subscription info
+interface SseSubscriptionInfo {
+    res: express.Response;
+    intervalId: NodeJS.Timeout;
+}
 
 export class A2AServerCore {
   private readonly agentCard: A2ATypes.AgentCard;
@@ -11,7 +16,8 @@ export class A2AServerCore {
   private readonly taskProcessors: TaskProcessor[];
   private readonly getAuthContext?: GetAuthContextFn;
   private readonly maxHistoryLength: number;
-  private readonly sseSubscriptions: Map<string, express.Response[]> = new Map(); // Store active SSE connections
+  // Updated map structure to store interval IDs
+  private readonly sseSubscriptions: Map<string, SseSubscriptionInfo[]> = new Map();
 
 
   constructor(config: A2AServerConfig) {
@@ -35,30 +41,45 @@ export class A2AServerCore {
   /** @internal Manages adding an SSE subscription */
   _addSseSubscription(taskId: string, res: express.Response): void {
     const subscriptions = this.sseSubscriptions.get(taskId) || [];
-    if (!subscriptions.includes(res)) {
-        subscriptions.push(res);
+    // Avoid adding the same response object multiple times
+    if (!subscriptions.some(sub => sub.res === res)) {
+         // Keep connection alive with periodic comments
+         const keepAliveInterval = setInterval(() => {
+            // Check if connection is still open before sending
+            if (!res.closed) {
+                 this._sendSseEvent(res, ':keep-alive', null);
+            } else {
+                // If closed, clear interval and attempt removal (though 'close' event should handle it)
+                console.warn(`[A2ACore] SSE keep-alive detected closed connection for task ${taskId}. Clearing interval.`);
+                clearInterval(keepAliveInterval);
+                this._removeSseSubscription(taskId, res); // Attempt cleanup just in case
+            }
+        }, 30000); // Send comment every 30s
+
+        const newSubscription: SseSubscriptionInfo = { res, intervalId: keepAliveInterval };
+        subscriptions.push(newSubscription);
         this.sseSubscriptions.set(taskId, subscriptions);
         console.log(`[A2ACore] Added SSE subscription for task ${taskId}. Total: ${subscriptions.length}`);
 
-        // Keep connection alive with periodic comments (optional but good practice)
-        const keepAliveInterval = setInterval(() => {
-            this._sendSseEvent(res, ':keep-alive', null);
-        }, 30000); // Send comment every 30s
-
-        res.on('close', () => {
-            clearInterval(keepAliveInterval);
+        res.once('close', () => { // Use 'once' instead of 'on'
+            console.log(`[A2ACore] SSE connection closed by client for task ${taskId}.`);
+            clearInterval(keepAliveInterval); // Clear interval on close
             this._removeSseSubscription(taskId, res);
         });
+    } else {
+        console.warn(`[A2ACore] Attempted to add duplicate SSE subscription for task ${taskId}.`);
     }
   }
 
   /** @internal Manages removing an SSE subscription */
-   _removeSseSubscription(taskId: string, res: express.Response): void {
+   _removeSseSubscription(taskId: string, resToRemove: express.Response): void {
     const subscriptions = this.sseSubscriptions.get(taskId);
     if (subscriptions) {
-      const index = subscriptions.indexOf(res);
+      const index = subscriptions.findIndex(sub => sub.res === resToRemove);
       if (index !== -1) {
-        subscriptions.splice(index, 1);
+        const removedSubscription = subscriptions.splice(index, 1)[0];
+        // Ensure interval is cleared (should be cleared by 'close' handler, but belt-and-suspenders)
+        clearInterval(removedSubscription.intervalId);
         console.log(`[A2ACore] Removed SSE subscription for task ${taskId}. Remaining: ${subscriptions.length}`);
         if (subscriptions.length === 0) {
           this.sseSubscriptions.delete(taskId);
@@ -78,10 +99,15 @@ export class A2AServerCore {
       }
       try {
           if (event.startsWith(':')) { // Handle comments like :keep-alive
-              res.write(`${event}\n\n`);
+              res.write(`${event}
+
+`);
           } else {
-              res.write(`event: ${event}\n`);
-              res.write(`data: ${JSON.stringify(data)}\n\n`);
+              res.write(`event: ${event}
+`);
+              res.write(`data: ${JSON.stringify(data)}
+
+`);
           }
           return true; // Indicate success
       } catch (error) {
@@ -167,6 +193,9 @@ export class A2AServerCore {
              throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Inconsistent state: Task ${task.id} marked for resume but processor/resume method not found.`);
          }
 
+         // Capture the task state *before* updating it to working
+         const originalTaskState = { ...task }; 
+
          const updater = new TaskUpdaterHandle(task.id, task.status.state, this);
 
          // ---> Set status to working BEFORE starting async resume <---
@@ -182,7 +211,7 @@ export class A2AServerCore {
          updater._updateLocalStatus('working'); // Ensure updater handle knows the new status
 
          // --- Asynchronously resume the processor ---
-         this._executeProcessorResume(taskProcessor, task, params.message, updater, authContext);
+         this._executeProcessorResume(taskProcessor, originalTaskState, params.message, updater, authContext);
         // ---
 
         // Respond with the task state *after* setting it to working
@@ -422,6 +451,19 @@ export class A2AServerCore {
     await this.taskStore.addTaskHistory(taskId, message);
   }
 
+  // --- Internal State Accessors for Updater ---
+  /** @internal Used by TaskUpdaterHandle */
+  async setTaskInternalState(taskId: string, state: any): Promise<void> {
+      // Add validation? Check if task exists?
+      await this.taskStore.setInternalState(taskId, state);
+  }
+  
+  /** @internal Used by TaskUpdaterHandle */
+  async getTaskInternalState(taskId: string): Promise<any | null> {
+      // Add validation?
+      return this.taskStore.getInternalState(taskId);
+  }
+
   // --- Internal Helper Methods ---
 
    private async _findProcessor(params: A2ATypes.TaskSendParams): Promise<TaskProcessor | null> {
@@ -482,8 +524,13 @@ export class A2AServerCore {
            // Attempt to mark task as failed if processor crashes
            const errorMsg = error instanceof Error ? error.message : String(error);
            const failMsg: A2ATypes.Message = { role: 'agent', parts: [{ type: 'text', text: `Processor failed during start: ${errorMsg}` }] };
-           return this.updateTaskStatus(task.id, 'failed', failMsg)
-                       .catch(err => console.error(`[A2ACore] CRITICAL: Failed to mark task ${task.id} as failed after processor crash:`, err));
+           // Check current status before overriding - avoid failing an already completed/canceled task if error happens late
+           // Need to fetch the *current* task status within this catch block
+           this.taskStore.getTask(task.id).then(currentTaskState => {
+                if (currentTaskState && currentTaskState.status.state !== 'completed' && currentTaskState.status.state !== 'canceled' && currentTaskState.status.state !== 'failed') {
+                    return this.updateTaskStatus(task.id, 'failed', failMsg);
+                }
+           }).catch(err => console.error(`[A2ACore] CRITICAL: Failed to mark task ${task.id} as failed after processor crash:`, err));
        });
    }
 
@@ -499,8 +546,12 @@ export class A2AServerCore {
            console.error(`[A2ACore] Error during processor 'resume' for task ${task.id}:`, error);
            const errorMsg = error instanceof Error ? error.message : String(error);
            const failMsg: A2ATypes.Message = { role: 'agent', parts: [{ type: 'text', text: `Processor failed during resume: ${errorMsg}` }] };
-           return this.updateTaskStatus(task.id, 'failed', failMsg)
-                 .catch(err => console.error(`[A2ACore] CRITICAL: Failed to mark task ${task.id} as failed after processor crash:`, err));
+           // Check current status before overriding
+            this.taskStore.getTask(task.id).then(currentTaskState => {
+                 if (currentTaskState && currentTaskState.status.state !== 'completed' && currentTaskState.status.state !== 'canceled' && currentTaskState.status.state !== 'failed') {
+                    return this.updateTaskStatus(task.id, 'failed', failMsg);
+                 }
+            }).catch(err => console.error(`[A2ACore] CRITICAL: Failed to mark task ${task.id} as failed after processor crash:`, err));
        });
    }
 
@@ -549,7 +600,12 @@ export class A2AServerCore {
              console.error(`[A2ACore] Error during processor 'handleInternalUpdate' for task ${task.id}:`, error);
              const errorMsg = error instanceof Error ? error.message : String(error);
              const failMsg: A2ATypes.Message = { role: 'agent', parts: [{ type: 'text', text: `Processor failed during internal update: ${errorMsg}` }] };
-             await this.updateTaskStatus(task.id, 'failed', failMsg);
+            // Check current status before overriding
+            this.taskStore.getTask(task.id).then(currentTaskState => {
+                if (currentTaskState && currentTaskState.status.state !== 'completed' && currentTaskState.status.state !== 'canceled' && currentTaskState.status.state !== 'failed') {
+                    return this.updateTaskStatus(task.id, 'failed', failMsg);
+                }
+             }).catch(err => console.error(`[A2ACore] CRITICAL: Failed to mark task ${task.id} as failed after processor crash:`, err));
              // Re-throw or handle as needed
              throw this._createError(A2ATypes.A2AErrorCodes.ProcessorError, `Processor failed during internal update: ${errorMsg}`, error instanceof Error ? error : undefined);
         }
@@ -593,13 +649,13 @@ export class A2AServerCore {
 
         // Send events to all active subscribers for this task
          const activeSubs = [...sseSubs]; // Iterate over a copy in case of modifications during send
-         activeSubs.forEach(sub => {
+         activeSubs.forEach(subInfo => { // Iterate over SseSubscriptionInfo
              // Always send status update
-             const statusSent = this._sendSseEvent(sub, 'TaskStatusUpdate', statusEvent);
+             const statusSent = this._sendSseEvent(subInfo.res, 'TaskStatusUpdate', statusEvent);
 
             // Send artifact update if one was generated in this trigger
             if (artifactEvent && statusSent) { // Only send artifact if status send didn't fail immediately
-                this._sendSseEvent(sub, 'TaskArtifactUpdate', artifactEvent);
+                this._sendSseEvent(subInfo.res, 'TaskArtifactUpdate', artifactEvent);
              }
 
              // If the task reached a final state, we can optionally close the connection from the server side
@@ -607,11 +663,14 @@ export class A2AServerCore {
              // Let's stick to the spec and just mark final: true.
              // if (isFinalState && statusSent) {
              //     console.log(`[A2ACore] Task ${task.id} reached final state. Closing SSE connection.`);
-             //     sub.end(); // This automatically triggers the 'close' event handler to remove the subscription
+             //     subInfo.res.end(); // This automatically triggers the 'close' event handler to remove the subscription
              // }
          });
     } else {
-         console.log(`[A2ACore] No active SSE subscriptions for task ${task.id} to notify.`);
+         // Only log if we weren't trying to notify about an artifact (to reduce noise)
+         if (!newArtifact) {
+            console.log(`[A2ACore] No active SSE subscriptions for task ${task.id} to notify.`);
+         }
      }
   }
 
@@ -621,5 +680,31 @@ export class A2AServerCore {
     error.code = code;
     error.data = data;
     return error;
+  }
+
+  // --- New public method for explicit SSE cleanup ---
+  /**
+   * Forcefully closes all active SSE connections managed by this core instance.
+   * Clears keep-alive intervals and ends the response streams.
+   */
+  public closeAllSseConnections(): void {
+      console.log(`[A2ACore] Closing all active SSE connections (${this.sseSubscriptions.size} tasks)...`);
+      let closedCount = 0;
+      this.sseSubscriptions.forEach((subscriptions, taskId) => {
+          console.log(`[A2ACore] Closing ${subscriptions.length} SSE connection(s) for task ${taskId}`);
+          subscriptions.forEach(subInfo => {
+               try {
+                    clearInterval(subInfo.intervalId); // Clear keep-alive timer
+                    if (!subInfo.res.closed) {
+                         subInfo.res.end(); // End the response stream
+                         closedCount++;
+                    }
+               } catch (err) {
+                    console.error(`[A2ACore] Error closing SSE connection for task ${taskId}:`, err);
+               }
+          });
+      });
+      this.sseSubscriptions.clear(); // Clear the tracking map
+      console.log(`[A2ACore] Finished closing SSE connections. ${closedCount} streams ended.`);
   }
 }

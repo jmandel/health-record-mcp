@@ -1,29 +1,28 @@
 import type { AgentCard } from '@a2a/bun-express';
 
-export const priorAuthAgentCard: AgentCard = {
+// Define only the agent-specific parts. Server config will be layered on.
+export const priorAuthAgentCard: Partial<AgentCard> = {
   name: 'Prior Authorization Agent (Sample)',
-  description: 'Handles medication prior authorization requests via A2A.',
-  url: 'http://localhost:3002/a2a', // Adjust port if needed
-  version: '0.2.0',
-   provider: {
-      organization: "Payer Sample Systems",
-      url: "http://example-payer.com"
+  description: 'Handles simulated medication prior authorization requests.',
+  version: '0.1.0',
+  provider: {
+      organization: "A2A Samples Inc.",
+      url: "http://example.com"
   },
-  authentication: { schemes: ["Bearer"] }, // Requires Bearer token (mocked in sample)
-  defaultInputModes: ['application/json', 'text/plain'],
-  defaultOutputModes: ['application/json', 'text/plain', 'application/pdf'],
-  capabilities: {
-    streaming: false, // TODO
-    pushNotifications: true, // Store supports it, Core needs implementation
-    stateTransitionHistory: false
-  },
+  defaultInputModes: ['application/json', 'text/plain'], // Example: accepts structured data and text
+  defaultOutputModes: ['application/json', 'text/plain'],
   skills: [{
     id: 'prior-auth-medication',
-    name: 'Medication Prior Authorization',
-    description: 'Submit and manage PA requests for medications.',
-    tags: ['prior-authorization', 'pa', 'medication', 'clinical', 'payer'],
-    examples: ['Request PA for Patient X, Med Y', 'Submit LMN for PA Task 123'],
-    inputModes: ['application/json', 'text/plain', 'application/pdf'], // Accepts structured data, text, and potentially PDFs via URI/bytes
-    outputModes: ['application/json', 'text/plain', 'application/pdf'] // Can return structured status, text messages, and determination PDFs
+    name: 'Request Medication Prior Authorization',
+    description: 'Submit clinical information and necessary documents to request prior authorization for a medication.',
+    tags: ['prior-authorization', 'medication', 'healthcare', 'payer'],
+    examples: [
+        'Request PA for Ozempic, patient has T2DM, A1C > 7. See attached chart notes.',
+        'Prior auth needed for medication X, see attached LMN.'
+    ],
+    // Expecting structured data (e.g., FHIR Task?) and potentially text/files
+    inputModes: ['application/json', 'text/plain', 'application/pdf'], 
+    // Outputting structured status and potentially PDF determination
+    outputModes: ['application/json', 'text/plain', 'application/pdf']
   }],
 };

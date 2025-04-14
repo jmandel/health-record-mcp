@@ -1,15 +1,12 @@
 import express from 'express';
 import {
-    A2AServerCore,
     InMemoryTaskStore,
-    createA2AExpressHandlers,
+    startA2AExpressServer,
     GetAuthContextFn
 } from '@a2a/bun-express';
 
 import { priorAuthAgentCard } from './agentCard';
 import { PriorAuthProcessor } from './PriorAuthProcessor';
-
-const PORT = process.env.PORT || 3002;
 
 // 1. Create Task Store instance
 const taskStore = new InMemoryTaskStore();
@@ -32,59 +29,44 @@ const getAuthContext: GetAuthContextFn = (req) => {
     return null; // No valid authentication found
 };
 
-// 4. Configure the A2A Server Core
-const a2aCore = new A2AServerCore({
-    agentCard: priorAuthAgentCard,
+// 4. Start the server using the reusable helper function
+startA2AExpressServer({
+    agentDefinition: priorAuthAgentCard,
     taskStore: taskStore,
     taskProcessors: [paProcessor],
-    getAuthContext: getAuthContext // Pass our auth context function
-});
+    getAuthContext: getAuthContext, // Pass the auth context function
+    port: parseInt(process.env.PORT || '3002', 10),
+    // Define server-level auth requirements (consistent with getAuthContext)
+    serverAuthentication: { schemes: ['Bearer'] }, 
+    // Configure server capabilities (can differ from agent definition if needed)
+    serverCapabilities: {
+        streaming: false, // This specific server setup doesn't support streaming yet
+        pushNotifications: false // This server setup doesn't support push yet
+        // stateTransitionHistory is likely false for InMemoryStore
+    },
+    // Add agent-specific routes like the internal callback
+    configureApp: (app, core, completeAgentCard) => {
+        console.log(`Applying custom configuration for ${completeAgentCard.name}`);
+        // Internal Callback Endpoint (for simulation/backend interaction)
+        app.post('/internal-callback/:taskId', async (req: express.Request, res: express.Response) => {
+            const taskId = req.params.taskId;
+            const payload = req.body;
+            console.log(`[Server] Received internal callback for task ${taskId}`);
+            try {
+                await core.triggerInternalUpdate(taskId, payload); // Use the passed core instance
+                res.status(200).send({ message: "Internal update processed successfully." });
+            } catch (error: any) {
+                console.error(`[Server] Error processing internal callback for task ${taskId}:`, error);
+                // Use A2AErrorCodes if available and error has .code
+                const statusCode = error.code === -32001 /* TaskNotFound */ ? 404 : 500;
+                res.status(statusCode).send({ error: `Failed to process internal update: ${error.message}` });
+            }
+        });
 
-// 5. Create Express handlers using the library helper
-const { agentCardHandler, a2aRpcHandler } = createA2AExpressHandlers(a2aCore);
-
-// 6. Set up Express app
-const app = express();
-
-// Middleware for JSON body parsing
-app.use(express.json());
-
-// Route for Agent Card
-app.get('/.well-known/agent.json', agentCardHandler);
-
-// Route for A2A JSON-RPC endpoint
-app.post('/a2a', a2aRpcHandler);
-
-// --- Add Internal Callback Endpoint (for simulation) ---
-app.post('/internal-callback/:taskId', async (req, res) => {
-    const taskId = req.params.taskId;
-    const payload = req.body;
-    console.log(`[Server] Received internal callback for task ${taskId}`);
-    try {
-        // Use the core instance to trigger the internal update flow
-        await a2aCore.triggerInternalUpdate(taskId, payload);
-        res.status(200).send({ message: "Internal update processed successfully." });
-    } catch (error: any) {
-        console.error(`[Server] Error processing internal callback for task ${taskId}:`, error);
-        const statusCode = error.code === -32001 ? 404 : 500; // TaskNotFound vs other errors
-        res.status(statusCode).send({ error: `Failed to process internal update: ${error.message}` });
+        // Log the callback endpoint URL after server starts
+        // Note: We can't access the final server port *here*, but we log it in startA2AExpressServer
+        // We can log the relative path though.
+        console.log(`   -> Internal Callback Endpoint (POST): /internal-callback/:taskId`);
     }
 });
-
-
-// Basic root endpoint
-app.get('/', (req, res) => {
-    res.send(`Prior Auth Agent running! Visit /.well-known/agent.json for capabilities. POST to /a2a for A2A communication.`);
-});
-
-// Start the server using Bun's native HTTP server with express adapter
-const server = Bun.serve({
-    port: PORT,
-    fetch: app // Use Express app as the fetch handler
-});
-
-console.log(`Prior Auth Agent server running on port ${server.port}`);
-console.log(`Agent Card: http://localhost:${server.port}/.well-known/agent.json`);
-console.log(`A2A Endpoint: http://localhost:${server.port}/a2a`);
-console.log(`Internal Callback Endpoint (POST): http://localhost:${server.port}/internal-callback/:taskId`);
 
