@@ -42,9 +42,6 @@ export class InMemoryTaskStore implements TaskStore {
     this.history.set(taskId, []); // Initialize history storage
     this.internalStates.set(taskId, null); // Initialize internal state
 
-    // Add the initial user message to history
-    await this.addTaskHistory(taskId, params.message);
-
     console.log(`[TaskStore] Created Task: ${taskId}`);
     return { ...newTask }; // Return a copy
   }

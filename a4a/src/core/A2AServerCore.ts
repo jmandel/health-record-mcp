@@ -330,7 +330,6 @@ export class A2AServerCore {
             final: this._isFinalState(newState),
             metadata: updatedTask.metadata
         };
-      delete statusEvent.status.message;
       await this._emitTaskEvent(statusEvent);
 
       // Add agent message to history if provided

@@ -1,4 +1,5 @@
 import express from 'express'; // Keep as default import
+import cors from 'cors'; // Import cors middleware
 import * as http from 'node:http'; // Import http
 import * as net from 'node:net'; // <-- Import net
 import {
@@ -117,6 +118,12 @@ export function startA2AExpressServer(config: StartA2AExpressServerConfig): http
 
     // --- Set up Express app ---
     const app = express();
+
+    // *** Enable CORS for all origins ***
+    // Apply this BEFORE defining your routes
+    app.use(cors()); 
+    // For production, you might want more specific origins:
+    // app.use(cors({ origin: 'https://your-frontend-domain.com' }));
 
     // Standard Middleware
     app.use(express.json()); // Use built-in Express JSON parser

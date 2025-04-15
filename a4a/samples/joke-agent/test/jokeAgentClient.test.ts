@@ -303,27 +303,38 @@ describe("Joke Agent A2A Client Tests", () => {
     });
 
     // --- Cancel Task Test ---
-    test("should send a cancel request and get a valid response", async () => {
+    test("should cancel a task that is waiting for input", async () => {
         const taskId = `test-cancel-${Date.now()}`;
-        // Send a task first
-        const sendResult = await makeRpcCall('tasks/send', {
+        // Send a task that requires input
+        console.log(`[Cancel Test ${taskId}] Sending initial request...`);
+        await makeRpcCall('tasks/send', {
             id: taskId,
-            message: { role: "user", parts: [{ type: "text", text: "another joke to cancel" }] },
-            metadata: { skillId: 'tell-joke' } 
-        }) as Task;
-        const actualTaskId = sendResult.id;
+            message: { role: "user", parts: [{ type: "text", text: "tell me a joke" }] }, // No topic provided
+            metadata: { skillId: 'jokeAboutTopic' }
+        });
 
-        // Now cancel it
-        const cancelResult = await makeRpcCall('tasks/cancel', { id: actualTaskId }) as Task;
-        expect(cancelResult.id).toBe(actualTaskId);
-        // Because the joke agent is fast, it might already be completed or canceling is fast
-        expect(cancelResult.status.state).toBeOneOf(['completed', 'canceled']); 
-        console.log(`Cancel response status for task ${actualTaskId}: ${cancelResult.status.state}`);
+        // Poll briefly to allow it to potentially reach input-required
+        console.log(`[Cancel Test ${taskId}] Polling briefly...`);
+        try {
+            await pollTaskUntilComplete(taskId, 'input-required');
+        } catch (e) {
+            // It might complete or fail quickly depending on timing, which is okay for cancel test setup
+            console.log(`[Cancel Test ${taskId}] Task might not have reached input-required before cancel attempt.`);
+        }
 
-        // Optional: Verify via tasks/get after a delay
-        await Bun.sleep(100);
-        const finalTask = await makeRpcCall('tasks/get', { id: actualTaskId }) as Task;
-        expect(finalTask.status.state).toBe(cancelResult.status.state); // Should match the cancel response
+        // Send the cancel request
+        console.log(`[Cancel Test ${taskId}] Sending cancel request...`);
+        const cancelResult = await makeRpcCall('tasks/cancel', { id: taskId }) as Task;
+        expect(cancelResult.id).toBe(taskId);
+        // We expect the task to eventually reach the canceled state
+        expect(cancelResult.status.state).toBeOneOf(['input-required', 'working', 'canceled']); // Initial response might be immediate
+        console.log(`[Cancel Test ${taskId}] Immediate cancel response status: ${cancelResult.status.state}`);
+
+        // Poll until it reaches the canceled state
+        console.log(`[Cancel Test ${taskId}] Polling for canceled state...`);
+        const finalTask = await pollTaskUntilComplete(taskId, 'canceled');
+        expect(finalTask.status.state).toBe('canceled');
+        console.log(`[Cancel Test ${taskId}] Final task status confirmed: canceled.`);
     });
 
     // --- Error Handling Test (Task Not Found) ---
@@ -407,6 +418,71 @@ describe("Joke Agent A2A Client Tests", () => {
        const jokeText = (jokeArtifact.parts[0] as TextPart).text;
        expect(jokeText.toLowerCase()).toContain(topic);
        console.log(`Received Topic Joke (after resume): ${jokeText}`);
+    });
+
+    // --- Task History Tests ---
+    test("tasks/get with no historyLength should return no history", async () => {
+        const taskId = `test-get-no-history-${Date.now()}`;
+        // Send simple task
+        await makeRpcCall('tasks/send', {
+            id: taskId,
+            message: { role: "user", parts: [{ type: "text", text: "joke for no history test" }] },
+            metadata: { skillId: 'tell-joke' }
+        });
+
+        // Wait for completion
+        await pollTaskUntilComplete(taskId, 'completed');
+
+        // Get task without historyLength
+        const task = await makeRpcCall('tasks/get', { id: taskId });
+
+        // Check for undefined or empty array
+        expect(task.history?.length ?? 0).toBe(0);
+    });
+
+    test("tasks/get with historyLength should return history after multi-turn", async () => {
+        const taskId = `test-get-full-history-${Date.now()}`;
+
+        // --- Perform the multi-turn interaction (similar to input-required test) ---
+        // 1. Send initial request without topic
+        await makeRpcCall('tasks/send', {
+            id: taskId,
+            message: { role: "user", parts: [{ type: "text", text: "tell me a joke" }] },
+            metadata: { skillId: 'jokeAboutTopic' }
+        });
+
+        // 2. Poll until input-required
+        await pollTaskUntilComplete(taskId, 'input-required');
+
+        // 3. Send resume message with topic
+        const topic = "history";
+        await makeRpcCall('tasks/send', {
+            id: taskId,
+            message: { role: "user", parts: [{ type: "text", text: topic }] }
+        });
+
+        // 4. Poll until final completion
+        await pollTaskUntilComplete(taskId, 'completed');
+        // --- End multi-turn interaction ---
+
+        // Get task WITH historyLength
+        const task = await makeRpcCall('tasks/get', { id: taskId, historyLength: 10 });
+
+        // Print the received history for debugging
+        console.log("Received History:", JSON.stringify(task.history, null, 2));
+
+        expect(task.history).toBeArray();
+        expect(task.history).toHaveLength(4); // Correct expected length
+        // [user initial, agent prompt, user resume, agent working ack]
+        expect(task.history[0].role).toBe('user');
+        expect((task.history[0].parts[0] as TextPart).text).toBe('tell me a joke');
+        expect(task.history[1].role).toBe('agent');
+        expect((task.history[1].parts[0] as TextPart).text).toContain('topic should it be about?');
+        expect(task.history[2].role).toBe('user');
+        expect((task.history[2].parts[0] as TextPart).text).toBe(topic);
+        expect(task.history[3].role).toBe('agent');
+        expect((task.history[3].parts[0] as TextPart).text).toContain('thinking of a joke about');
+        console.log(`[History Test ${taskId}] Verified 4 history messages.`);
     });
 
 });

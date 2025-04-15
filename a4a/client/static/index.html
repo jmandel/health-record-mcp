@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>A4A Joke Liaison Demo V2</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        #status-area { margin-top: 10px; font-style: italic; color: #555; }
+        #summary-view-area {
+            margin-top: 15px;
+            padding: 15px;
+            border: 1px solid #ccc;
+            background-color: #f0f0f0;
+            white-space: pre-wrap; /* Keep JSON formatting */
+            min-height: 80px;
+        }
+        #task-details-area {
+             margin-top: 15px;
+             padding: 15px;
+             border: 1px solid #eee;
+             background-color: #fdfdfd;
+             white-space: pre-wrap;
+             min-height: 100px;
+        }
+        #error-area {
+            margin-top: 15px;
+            padding: 10px;
+            border: 1px solid #ffaaaa;
+            background-color: #ffeeee;
+            color: #c00;
+            white-space: pre-wrap;
+        }
+        button { padding: 10px 15px; font-size: 1em; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Joke Agent Interaction V2</h1>
+    <button id="start-joke-button">Tell me a joke (about a topic)</button>
+
+    <div id="status-area">Liaison State: Idle</div>
+
+    <h2>Summary View:</h2>
+    <div id="summary-view-area">(Waiting for task...)</div>
+
+    <h2>Task Details & Artifacts:</h2>
+    <div id="task-details-area">(Waiting for task...)</div>
+
+    <div id="error-area" style="display: none;"></div>
+
+    <!-- Ensure this points to your bundled JS file -->
+    <script type="module" src="./dist/main.js"></script>
+</body>
+</html>
