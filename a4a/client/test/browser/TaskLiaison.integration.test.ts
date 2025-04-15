@@ -95,7 +95,7 @@ describe('TaskLiaison (Integration with Joke Agent)', () => {
     test('should instantiate TaskLiaison with defaults', () => {
         // Liaison takes no config or empty config
         // const config: TaskLiaisonConfig<CurrentSummaryView, CurrentPromptView> = {};
-        const liaison = new TaskLiaison();
+        const liaison = new TaskLiaison({ agentEndpointUrl: JOKE_AGENT_URL });
         expect(liaison).toBeDefined();
         const initialSnap = liaison.getCurrentSnapshot();
         expect(initialSnap.liaisonState).toBe('idle');
@@ -116,7 +116,7 @@ describe('TaskLiaison (Integration with Joke Agent)', () => {
         // const config: TaskLiaisonConfig<CurrentSummaryView, CurrentPromptView> = {
         //      initialSummaryView: createDefaultSummaryView("Tell Joke Test") as CurrentSummaryView
         // };
-        const liaison = new TaskLiaison();
+        const liaison = new TaskLiaison({ agentEndpointUrl: JOKE_AGENT_URL });
 
         // Use onTransition
         liaison.onTransition((prevSnapshot, currentSnapshot) => {
@@ -187,7 +187,7 @@ describe('TaskLiaison (Integration with Joke Agent)', () => {
         //      // Relying on default strategies
         //      initialSummaryView: { label: 'Input Test' }
         // };
-        const liaison = new TaskLiaison();
+        const liaison = new TaskLiaison({ agentEndpointUrl: JOKE_AGENT_URL });
         let finalSnapshotFromEvent: TaskLiaisonSnapshot | null = null; // Variable to store the snapshot from the event
 
         // Use onTransition

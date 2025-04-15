@@ -9,6 +9,7 @@
     "build:ehretriever": "bun run ./scripts/build-ehretriever.ts"
   },
   "dependencies": {
+    "@google/genai": "^0.8.0",
     "@modelcontextprotocol/sdk": "^1.0.1",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.1",

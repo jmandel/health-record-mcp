@@ -31,6 +31,8 @@ export interface TaskLiaisonSnapshot {
 
 // --- Configuration Interface (Simplified) --- 
 export interface TaskLiaisonConfig {
+    // REQUIRED: The base URL of the A2A agent server to connect to.
+    agentEndpointUrl: string;
     // No view-related config needed anymore
 }
 
@@ -61,6 +63,8 @@ export class TaskLiaison { // Removed <TSummaryView, TPromptView>
     private _previousSnapshot: TaskLiaisonSnapshot | null = null; 
     // Store listeners for onTransition
     private _transitionListeners: Map<TransitionListener, ListenerRecord> = new Map();
+    // Store agent endpoint URL
+    private readonly agentEndpointUrl: string;
 
 
     // --- Removed Strategies ---
@@ -74,9 +78,10 @@ export class TaskLiaison { // Removed <TSummaryView, TPromptView>
      * Creates a TaskLiaison instance.
      * @param config Configuration object for the liaison (currently empty).
      */
-    constructor(config?: TaskLiaisonConfig) { // Config is now optional and empty
+    constructor(config: TaskLiaisonConfig) { // Config is now required
         // No view strategies or initial view to process
         // this.on("change", () => this._callSummaryViewUpdateStrategy()); // Removed strategy call
+        this.agentEndpointUrl = config.agentEndpointUrl; // Store agent endpoint URL
 
         // Bind handlers
         this._boundHandleTaskUpdate = this._handleTaskUpdate.bind(this);
@@ -99,7 +104,7 @@ export class TaskLiaison { // Removed <TSummaryView, TPromptView>
      */
     public async startTask(
         initialParams: A2ATypes.TaskSendParams,
-        config: A2AClientConfig
+        config: Omit<A2AClientConfig, 'agentEndpointUrl'> // Exclude agentEndpointUrl as it's provided by liaison
     ): Promise<void> {
         console.log('TaskLiaison.startTask called');
         if (this.client || this._liaisonState !== 'idle') {
@@ -111,12 +116,14 @@ export class TaskLiaison { // Removed <TSummaryView, TPromptView>
         this._updateLiaisonStateAndEmit('starting');
 
         try {
-            const mergedConfig = { 
-                 pollIntervalMs: 5000, 
-                 ...config 
+            const mergedConfig = {
+                 pollIntervalMs: 5000,
+                 ...config, // User provided config (like getAuthHeaders)
+                 agentEndpointUrl: this.agentEndpointUrl // Add endpoint URL from liaison config
              };
 
-            this.client = await A2AClient.create(initialParams, mergedConfig);
+            // Pass agentEndpointUrl first, then initialParams, then the config object
+            this.client = await A2AClient.create(this.agentEndpointUrl, initialParams, mergedConfig);
             this.taskId = this.client.taskId;
             console.log(`TaskLiaison.startTask: A2AClient created with taskId: ${this.taskId}`);
 

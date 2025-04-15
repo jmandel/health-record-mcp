@@ -59,9 +59,9 @@ export function createA2AExpressHandlers(core: A2AServerCore) {
             // Call the appropriate core method, which will handle sending SSE events
             // These methods now return void and manage the SSE stream via the passed 'res' object
             if (body.method === 'tasks/sendSubscribe') {
-                 await core.handleTaskSendSubscribe(body.params as TaskSubscribeParams, res, authContext);
+                 await core.handleTaskSendSubscribe(requestId, body.params as TaskSubscribeParams, res, authContext);
             } else { // tasks/resubscribe
-                 await core.handleTaskResubscribe(body.params as TaskResubscribeParams, res, authContext);
+                 await core.handleTaskResubscribe(requestId, body.params as TaskResubscribeParams, res, authContext);
             }
 
             // For SSE requests, we don't send a final JSON response here.

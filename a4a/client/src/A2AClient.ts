@@ -1,41 +1,16 @@
 import * as A2ATypes from './types';
-import { Task, TaskSendParams, TaskGetParams, TaskCancelParams, TaskStatus, TaskState, Artifact, Message, JsonRpcError, TaskSubscribeParams, TaskResubscribeParams, TaskStatusUpdateEvent, TaskArtifactUpdateEvent } from './types';
+import type { Task, TaskSendParams, TaskGetParams, TaskCancelParams, TaskStatus, TaskState, Artifact, Message, JsonRpcError, TaskSubscribeParams, TaskResubscribeParams, TaskStatusUpdateEvent, TaskArtifactUpdateEvent } from './types';
 import { deepEqual } from './utils'; // Import the utility
 
 // Simple EventEmitter - replace with a library like 'mitt' or 'eventemitter3' in a real implementation
 type Listener = (...args: any[]) => void;
-export class SimpleEventEmitter {
-    private events: Record<string, Listener[]> = {};
-
-    on(event: string, listener: Listener): void {
-        if (!this.events[event]) {
-            this.events[event] = [];
-        }
-        this.events[event].push(listener);
-    }
-
-    off(event: string, listener: Listener): void {
-        if (!this.events[event]) return;
-        this.events[event] = this.events[event].filter(l => l !== listener);
-    }
-
-    emit(event: string, ...args: any[]): void {
-        if (!this.events[event]) return;
-        this.events[event].forEach(listener => listener(...args));
-    }
-
-    removeAllListeners(event?: string): void {
-        if (event) {
-            delete this.events[event];
-        } else {
-            this.events = {};
-        }
-    }
-}
 
 
 // --- Configuration ---
 export interface A2AClientConfig {
+    // REQUIRED: The base URL of the A2A agent server.
+    // This is passed separately to the constructor/factory methods, but included here
+    // for completeness and potential internal use within config merging.
     agentEndpointUrl: string;
     getAuthHeaders: () => Record<string, string> | Promise<Record<string, string>>;
     agentCardUrl?: string; // Optional: Defaults to endpoint + /.well-known/agent.json
@@ -45,6 +20,7 @@ export interface A2AClientConfig {
     sseInitialReconnectDelayMs?: number; // Default: 1000
     sseMaxReconnectDelayMs?: number; // Default: 30000
     pollMaxErrorAttempts?: number; // Default: 3
+    pollHistoryLength?: number; // How much history to request in tasks/get calls
 }
 
 // --- Client State Machine ---
@@ -74,27 +50,30 @@ export type ClientEventType =
     | 'error'
     | 'close';
 
-export interface TaskUpdatePayload { task: A2ATypes.Task; }
-export interface ErrorPayload {
-    error: Error | A2ATypes.JsonRpcError; 
-    context: ClientErrorContext;
-}
+export interface StatusUpdatePayload { status: TaskStatus; task: Task; }
+export interface ArtifactUpdatePayload { artifact: Artifact; task: Task; }
+export interface TaskUpdatePayload { task: Task; }
+export interface ErrorPayload { error: Error | JsonRpcError; context: ClientErrorContext; }
 export interface ClosePayload { reason: ClientCloseReason; }
 
 export type ClientErrorContext =
     | 'config-validation'
     | 'agent-card-fetch'
     | 'agent-card-parse'
-    | 'initial-send' // Error on initial tasks/send or tasks/sendSubscribe
+    | 'authentication' // Added for getAuthHeaders failure
+    | 'initial-send' // Error on first send/sendSubscribe
+    | 'initial-get' // Error on first get (for resume poll)
     | 'sse-connect'
     | 'sse-stream'
     | 'sse-parse'
     | 'sse-reconnect-failed'
+    | 'sse-task-sync' // Error synthesizing task state from SSE
     | 'poll-get'
     | 'poll-retry-failed'
+    | 'poll-task-diff' // Error diffing task state from Poll
     | 'send' // Error on subsequent tasks/send
     | 'cancel'
-    | 'internal'; // Unexpected client error
+    | 'internal';
 
 export type ClientCloseReason =
     | 'closed-by-caller'
@@ -102,45 +81,50 @@ export type ClientCloseReason =
     | 'task-canceled-by-agent'
     | 'task-canceled-by-client'
     | 'task-failed'
-    | 'error-fatal'
+    | 'error-fatal' // Generic fatal client error
     | 'sse-reconnect-failed'
     | 'poll-retry-failed'
-    | 'sending-new-message'
-    | 'canceling'
-    | 'error-on-cancel'
-    | 'closed-by-restart'; // Added for TaskLiaison restart scenario
+    | 'sending-new-message' // Intermediate reason during send()
+    | 'canceling' // Intermediate reason during cancel()
+    | 'error-on-cancel' // If cancel request itself fails
+    | 'closed-by-server' // SSE stream ended cleanly with final=true
+    | 'closed-by-restart'; // Closed because a new task start was requested
 
 
 // --- Main Client Class ---
 
 export class A2AClient {
+    public readonly agentEndpointUrl: string;
     public readonly taskId: string;
-    private readonly config: A2AClientConfig;
+    private readonly config: Required<A2AClientConfig>;
 
     // Internal State
     private _emitter = new SimpleEventEmitter();
     private _agentCard: A2ATypes.AgentCard | null = null;
-    private _strategy: 'sse' | 'poll' | 'unknown' = 'unknown';
+    private _strategy: 'sse' | 'poll' = 'poll';
     private _currentState: ClientManagedState = 'idle';
-    private _lastKnownTask: A2ATypes.Task | null = null;
+    private _lastKnownTask: Task | null = null;
     private _abortController: AbortController | null = null;
     private _pollTimerId: ReturnType<typeof setTimeout> | null = null;
     private _reconnectTimerId: ReturnType<typeof setTimeout> | null = null;
     private _sseReconnectAttempts: number = 0;
     private _pollErrorAttempts: number = 0;
 
-    // --- Static Factory ---
+    // --- Static Factory Methods ---
 
     /**
-     * Creates a new A2AClient instance and initiates communication for a new task.
-     * Handles async initialization steps internally.
+     * Creates a new A2AClient instance and initiates communication for a NEW task.
+     * @param agentEndpointUrl The base URL of the A2A agent server.
+     * @param initialParams Parameters for the first tasks/send or tasks/sendSubscribe call.
+     * @param config Optional configuration overrides.
      */
     public static async create(
-        initialParams: A2ATypes.TaskSendParams,
-        config: A2AClientConfig
+        agentEndpointUrl: string,
+        initialParams: TaskSendParams,
+        config: Omit<Partial<A2AClientConfig>, 'agentEndpointUrl'> = {} // Make config optional, exclude endpointUrl
     ): Promise<A2AClient> {
-        // 1. Validate config (basic checks)
-        if (!config.agentEndpointUrl || typeof config.getAuthHeaders !== 'function') {
+        // 1. Validate config (basic checks) - agentEndpointUrl checked here
+        if (!agentEndpointUrl || typeof config.getAuthHeaders !== 'function') {
             throw new Error("Invalid A2AClientConfig: agentEndpointUrl and getAuthHeaders are required.");
         }
 
@@ -148,101 +132,312 @@ export class A2AClient {
         const taskId = initialParams.id ?? crypto.randomUUID();
         const paramsWithId = { ...initialParams, id: taskId };
 
-        // 3. Instantiate client
-        const client = new A2AClient(taskId, config);
+        // 3. Instantiate client (using private constructor)
+        const client = new A2AClient(agentEndpointUrl, taskId, config);
         client._currentState = 'initializing';
 
-        // 4. Start async initialization (don't await here)
+        // 4. Start async initialization
+        // Pass initial params to know it's a 'create' flow for comms start
         client._initialize(paramsWithId).catch(error => {
-            // Handle potential synchronous errors during early init steps if _initialize throws immediately
-             client._handleFatalError(error, 'internal'); // Or a more specific context if possible
+            client._handleFatalError(error, 'internal');
         });
 
-        // 5. Return client instance immediately
         return client;
     }
 
-    // Private constructor - use A2AClient.create()
-    private constructor(taskId: string, config: A2AClientConfig) {
+    /**
+     * Creates a new A2AClient instance and initiates communication for an EXISTING task.
+     * @param agentEndpointUrl The base URL of the A2A agent server.
+     * @param taskId The ID of the existing task to resume.
+     * @param config Optional configuration overrides.
+     */
+    public static async resume(
+        agentEndpointUrl: string,
+        taskId: string,
+        config: Omit<Partial<A2AClientConfig>, 'agentEndpointUrl'> = {}
+    ): Promise<A2AClient> {
+        // 1. Validate config
+        if (!agentEndpointUrl || !taskId || typeof config.getAuthHeaders !== 'function') {
+            throw new Error("Invalid A2AClientConfig: agentEndpointUrl, taskId, and getAuthHeaders are required for resume.");
+        }
+
+        // 3. Instantiate client
+        const client = new A2AClient(agentEndpointUrl, taskId, config);
+        client._currentState = 'initializing';
+
+        // 4. Start async initialization
+        // Pass null for initial params to signal a 'resume' flow
+        client._initialize(null).catch(error => {
+            client._handleFatalError(error, 'internal');
+        });
+
+        return client;
+    }
+
+    // Private constructor - use static factories
+    private constructor(
+        agentEndpointUrl: string,
+        taskId: string,
+        config: Omit<Partial<A2AClientConfig>, 'agentEndpointUrl'>
+    ) {
+        this.agentEndpointUrl = agentEndpointUrl;
         this.taskId = taskId;
-        // Set defaults for config
+        // Set defaults and merge config
         this.config = {
-            pollIntervalMs: 2000,
+            agentEndpointUrl: agentEndpointUrl, // Store it in the Required config
+            getAuthHeaders: () => ({}), // Provided by caller
+            agentCardUrl: "", // Default determined in _initialize
+            forcePoll: false,
+            pollIntervalMs: 5000,
             sseMaxReconnectAttempts: 5,
             sseInitialReconnectDelayMs: 1000,
             sseMaxReconnectDelayMs: 30000,
             pollMaxErrorAttempts: 3,
-            ...config, // User config overrides defaults
+            pollHistoryLength: 0,
+            ...config,
         };
-        this._currentState = 'idle'; // Will be updated by create()
+        this._currentState = 'idle'; // Initial state before factories run
     }
 
-    // --- Public API ---
+    // --- State Management ---
+    private _setState(newState: ClientManagedState, context?: string) {
+        if (this._currentState !== newState) {
+            console.log(`A2AClient STATE: ${this._currentState} -> ${newState}${context ? ` (Context: ${context})` : ''}`);
+            this._currentState = newState;
+        } else {
+            // Optional: Log if state is being set to the same value
+            // console.log(`A2AClient STATE: ${this._currentState} (already set)${context ? ` (Context: ${context})` : ''}`);
+        }
+    }
+
+    // --- Internal Initialization ---
+    private async _initialize(initialParams: TaskSendParams | null): Promise<void> {
+        this._setState('initializing'); // Use helper
+        try {
+            // 1. Fetch Agent Card
+            // NOTE: Auth headers are fetched *inside* _getAgentCard if needed,
+            // but initial auth errors for the *first* request happen later.
+            const agentCardUrl = this.config.agentCardUrl || new URL('/.well-known/agent.json', this.agentEndpointUrl).toString();
+            this._setState('fetching-card'); // Set state BEFORE awaiting the fetch
+            this._agentCard = await this._getAgentCard(agentCardUrl);
+
+            // 2. Determine Strategy
+            this._strategy = this._determineStrategy();
+            // this._setState('determining-strategy'); // Use helper
+
+            // 3. Initiate Communication (different start based on create/resume and strategy)
+            this._abortController = new AbortController(); // Create initial controller
+
+            if (initialParams) { // === CREATE Flow ===
+                if (this._strategy === 'sse') {
+                    this._setState('connecting-sse');
+                    await this._startSse('tasks/sendSubscribe', initialParams as TaskSubscribeParams);
+                } else { // Polling strategy for create
+                    this._setState('starting-poll');
+                    await this._startPolling(initialParams); // Pass params
+                }
+            } else { // === RESUME Flow ===
+                // --- Fetch current state first! ---
+                console.log("A2AClient._initialize (Resume): Fetching initial task state via tasks/get...");
+                try {
+                    const getParams: TaskGetParams = { id: this.taskId, historyLength: this.config.pollHistoryLength };
+                    // Use _request directly, requires new abort controller if main one not set yet?
+                    // Let's assume _request uses the main _abortController which *was* just created.
+                    const initialTask = await this._request<TaskGetParams, Task>('tasks/get', getParams);
+                    console.log("A2AClient._initialize (Resume): Got initial task state:", initialTask.status.state);
+
+                    // Store initial state & emit events
+                    this._lastKnownTask = initialTask;
+                    this._emitSyntheticEventsFromTask(initialTask); // Update UI/listeners
+
+                    // --- Check state BEFORE starting comms ---
+                    const currentState = initialTask.status.state;
+                    if (this._isFinalTaskState(currentState)) {
+                        const reason = this._getCloseReasonFromState(currentState);
+                        console.log(`A2AClient._initialize (Resume): Task already in final state (${currentState}). Closing.`);
+                        this._stopCommunication(reason, true); // Close immediately, emit event
+                        return; // Initialization complete (closed)
+                    } else if (currentState === 'input-required') {
+                        console.log("A2AClient._initialize (Resume): Task requires input.");
+                        this._setState('input-required', 'resume initial get');
+                        return; // Initialization complete (waiting for input)
+                    } else {
+                        // Task is active, proceed with chosen strategy
+                        console.log(`A2AClient._initialize (Resume): Task is active (${currentState}). Starting communication strategy: ${this._strategy}`);
+                        if (this._strategy === 'sse') {
+                             this._setState('connecting-sse');
+                             await this._startSse('tasks/resubscribe', { id: this.taskId });
+                        } else { // Polling strategy for resume
+                             this._setState('polling', 'resume initial get OK'); // Directly to polling state
+                             this._pollTaskLoop(); // Start polling loop (don't need _startPolling which does another get)
+                        }
+                    }
+                } catch (getError: any) {
+                    console.error("A2AClient._initialize (Resume): Error fetching initial task state:", getError);
+                    // If the initial get fails, we can't resume
+                    this._handleFatalError(getError, 'initial-get');
+                    return;
+                }
+            }
+
+        } catch (error: any) {
+            // Determine context based on current state during the error
+            let context: ClientErrorContext = 'internal';
+
+            console.log(`A2AClient _initialize CATCH block. State: ${this._currentState}, Error:`, error); // DEBUG
+
+            // Check if the error is specifically an authentication error bubbled up
+            if (error instanceof AuthenticationError) {
+                context = 'authentication'; // Context if getAuthHeaders fails
+            } else if (this._currentState === 'fetching-card') {
+                // Error during card fetch/parse (assuming auth was okay *for the card fetch itself* if it needed it)
+                // Note: 'initializing' state errors are now caught by the AuthenticationError check above if auth fails first.
+                context = error.message.includes('JSON') ? 'agent-card-parse' : 'agent-card-fetch';
+            } else if (this._currentState === 'starting-sse' || this._currentState === 'starting-poll') { // Removed connecting-sse from here
+                // Error during the *first* communication attempt (send/subscribe/resubscribe/get)
+                // This will be overridden by _startSse or _startPolling if auth fails there.
+                context = initialParams ? 'initial-send' : 'initial-get';
+            }
+            // Add more specific context checks if needed
+
+            this._handleFatalError(error, context);
+        }
+    }
+
+    // --- Agent Card Fetching & Strategy ---
+    private async _getAgentCard(url: string): Promise<A2ATypes.AgentCard> {
+        console.log(`A2AClient._getAgentCard: Fetching from ${url}`);
+        // Use a temporary abort controller for card fetch? Or rely on main? Rely on main for now.
+        const signal = this._abortController?.signal;
+        let response: Response;
+        try {
+            response = await fetch(url, {
+                method: 'GET',
+                headers: { 'Accept': 'application/json' },
+                signal // Use the main controller's signal
+            });
+        } catch (error: any) {
+             console.error('Agent Card fetch network error:', error);
+              if (signal?.aborted) throw new Error(`Agent card fetch aborted.`); // Check if aborted
+             throw new Error(`Agent card fetch failed: ${error.message}`);
+        }
+
+         if (signal?.aborted) throw new Error(`Agent card fetch aborted.`); // Check after fetch call returns
+
+        if (!response.ok) {
+            const errorText = await response.text().catch(() => `Status ${response.status}`);
+            console.error(`Agent Card fetch failed: ${response.status} ${response.statusText}. Body: ${errorText}`);
+            throw new Error(`Agent card fetch failed: ${response.status} ${response.statusText}`);
+        }
+
+        try {
+            const card: any = await response.json(); // Cast to any first
+            // TODO: Add more robust validation using a schema validator
+            if (!card || typeof card !== 'object' || !card.name || !card.url || !card.capabilities || !card.authentication) {
+                console.error('Invalid Agent Card structure received:', card);
+                throw new Error('Invalid Agent Card structure received.');
+            }
+            console.log('A2AClient._getAgentCard: Successfully fetched and parsed card.');
+            return card as A2ATypes.AgentCard; // Cast to specific type before returning
+        } catch (error: any) {
+            console.error('Agent Card JSON parse error:', error);
+            throw new Error(`Agent card JSON parse failed: ${error.message}`);
+        }
+    }
+
+    private _determineStrategy(): 'sse' | 'poll' {
+        const canUseSse = this._agentCard?.capabilities?.streaming === true && !this.config.forcePoll;
+        const strategy = canUseSse ? 'sse' : 'poll';
+        console.log(`A2AClient._determineStrategy: Selected strategy: ${strategy}`);
+        return strategy;
+    }
+
+    // --- Public API Methods ---
 
     /**
      * Sends a subsequent message to the agent for the managed task.
-     * Stops existing communication (SSE/polling) and restarts the flow.
+     * Stops existing communication (SSE/polling) and restarts the flow using tasks/send.
      */
     public async send(message: A2ATypes.Message): Promise<void> {
-        console.log('A2AClient.send called - Implementation Pending');
-        if (this._currentState === 'closed' || this._currentState === 'error' || this._currentState === 'canceling' || this._currentState === 'sending') {
-            throw new Error(`Cannot send message in state: ${this._currentState}`);
-        }
+         console.log('A2AClient.send called');
+         if (this._isTerminalState(this._currentState) || this._currentState === 'canceling' || this._currentState === 'sending') {
+             console.warn(`A2AClient.send: Cannot send message in state: ${this._currentState}`); // Added log
+             throw new Error(`Cannot send message in state: ${this._currentState}`);
+         }
 
-        const reason: ClientCloseReason = 'sending-new-message';
-        this._stopCommunication(reason); // Stop existing SSE/polling
+         // Stop existing communication gracefully
+         const reason: ClientCloseReason = 'sending-new-message';
+         this._stopCommunication(reason, false); // false = Don't emit close event yet
 
-        this._currentState = 'sending';
-        this._pollErrorAttempts = 0; // Reset counters
-        this._sseReconnectAttempts = 0;
+         this._setState('sending', 'send called'); // Intermediate state
+         this._resetCounters();
 
-        const params: A2ATypes.TaskSendParams = {
-            id: this.taskId,
-            sessionId: this._lastKnownTask?.sessionId, // Resend session ID if available
-            message: message
-        };
+         const params: TaskSendParams = {
+             id: this.taskId,
+             sessionId: this._lastKnownTask?.sessionId, // Include session ID if known
+             message: message,
+             // Include pushNotification config if needed/supported?
+             // Include historyLength if needed?
+         };
 
-        try {
-            // Re-determine strategy? Or assume it doesn't change mid-task?
-            // Assuming strategy remains the same for simplicity.
-            // If we need to re-fetch card/re-determine, do it here.
-            if (!this._strategy || this._strategy === 'unknown') {
-                // This shouldn't happen if initialized correctly, but handle defensively
-                this._agentCard = await this._getAgentCard(this.config.agentCardUrl || new URL('/.well-known/agent.json', this.config.agentEndpointUrl).toString());
-                this._strategy = this._determineStrategy();
-            }
-            await this._initiateCommunication(params);
-        } catch (error: any) {
-            this._handleFatalError(error, 'send');
-        }
-    }
+         try {
+             // Re-initialize communication using the *original* strategy
+            console.log(`A2AClient.send: Restarting communication (original strategy: ${this._strategy})...`);
+             this._abortController = new AbortController(); // New controller for this attempt
+
+             if (this._strategy === 'sse') {
+                 // Send message and immediately try to resubscribe for updates
+                 this._setState('connecting-sse', 'send restarting comms');
+                 await this._startSse('tasks/sendSubscribe', params as TaskSubscribeParams);
+             } else {
+                 // Use polling strategy (starts with tasks/send)
+                 this._setState('starting-poll', 'send restarting comms');
+                 await this._startPolling(params);
+             }
+
+             // Note: _startSse or _startPolling will handle subsequent state transitions
+             console.log("A2AClient.send: Communication restart initiated.");
+
+         } catch (error: any) {
+              console.error("A2AClient.send: Error during communication restart:", error);
+              // Handle fatal error, which will emit 'error' and 'close'
+              this._handleFatalError(error, 'send');
+         }
+     }
+
 
     /**
      * Requests the agent to cancel the task and stops client communication.
      */
     public async cancel(): Promise<void> {
         console.log('A2AClient.cancel called');
-        if (this._currentState === 'closed' || this._currentState === 'error' || this._currentState === 'canceling') {
+        if (this._isTerminalState(this._currentState) || this._currentState === 'canceling') {
             console.warn(`Cannot cancel task in state: ${this._currentState}`);
             return; // Or throw?
         }
 
         const reason: ClientCloseReason = 'canceling';
-        this._stopCommunication(reason); // Stop existing SSE/polling immediately
+        this._stopCommunication(reason, false); // Stop comms, don't emit close yet
 
-        this._currentState = 'canceling';
+        this._setState('canceling'); // Intermediate state
 
         try {
+            // Perform the cancel request using the current abort controller
             const result = await this._request<TaskCancelParams, Task>('tasks/cancel', { id: this.taskId });
-            // Update task state based on cancel response
-            this._updateTaskState(result);
-             this._emitter.emit('task-update', { task: this.getCurrentTask()! } satisfies TaskUpdatePayload);
-            this._updateStateAndEmitClose('task-canceled-by-client');
+            console.log('A2AClient.cancel: tasks/cancel successful.');
+
+            // Update local task state based on cancel response
+            // Use the new _updateAndEmit method for consistency
+            this._updateTaskStateAndEmit(result, 'task-canceled-by-client'); // Force update with final state
+
+            // Explicitly close with the final reason
+             this._stopCommunication('task-canceled-by-client', true); // true = emit close event
+
         } catch (error: any) {
             console.error('Error during tasks/cancel request:', error);
-            // Emit error, but still transition to closed state
             this._emitter.emit('error', { error, context: 'cancel' } satisfies ErrorPayload);
-            this._updateStateAndEmitClose('error-on-cancel' as ClientCloseReason); // Use a specific reason if needed
+             // Close with an error reason
+             this._stopCommunication('error-on-cancel', true); // true = emit close event
         }
     }
 
@@ -252,21 +447,18 @@ export class A2AClient {
      */
     public close(reason: ClientCloseReason = 'closed-by-caller'): void {
         console.log(`A2AClient.close called with reason: ${reason}`);
-        if (this._currentState === 'closed') {
+        if (this._isTerminalState(this._currentState)) {
             return;
         }
-        // The actual stopping logic is now centralized in _stopCommunication
-        this._stopCommunication(reason);
-         // _stopCommunication now calls _updateStateAndEmitClose internally
+        this._stopCommunication(reason, true); // true = emit close event
     }
 
     /**
-     * Gets the latest known state of the task based on received events or polls.
+     * Gets the latest known state of the task.
      * Returns a deep copy.
      */
-    public getCurrentTask(): A2ATypes.Task | null {
-        // Simple deep copy for now, consider structuredClone or a library for robustness
-        return this._lastKnownTask ? JSON.parse(JSON.stringify(this._lastKnownTask)) : null;
+    public getCurrentTask(): Task | null {
+        return this._lastKnownTask ? structuredClone(this._lastKnownTask) : null;
     }
 
     /** Gets the current internal management state of the client. */
@@ -284,586 +476,450 @@ export class A2AClient {
         this._emitter.off(event, listener);
     }
 
-    // --- Internal Logic ---
-
-    private async _initialize(initialParams: A2ATypes.TaskSendParams): Promise<void> {
-        try {
-            this._currentState = 'fetching-card';
-            const agentCardUrl = this.config.agentCardUrl || new URL('/.well-known/agent.json', this.config.agentEndpointUrl).toString();
-            this._agentCard = await this._getAgentCard(agentCardUrl);
-
-            this._currentState = 'determining-strategy';
-            this._strategy = this._determineStrategy();
-
-            await this._initiateCommunication(initialParams);
-
-        } catch (error: any) {
-            // Determine context based on current state during the error
-            let context: ClientErrorContext = 'internal';
-            if (this._currentState === 'fetching-card') {
-                context = error.message.includes('JSON') ? 'agent-card-parse' : 'agent-card-fetch';
-            } else if (this._currentState === 'determining-strategy') {
-                context = 'internal'; // Error likely happened after card fetch but before comms start
-            } else if (this._currentState === 'starting-sse' || this._currentState === 'starting-poll') {
-                context = 'initial-send'; // Error during the first send/subscribe call
-            }
-            // Add more specific context checks if needed based on where _initiateCommunication might fail
-
-            this._handleFatalError(error, context);
-        }
-    }
-
-    private async _getAgentCard(url: string): Promise<A2ATypes.AgentCard> {
-        console.log(`A2AClient._getAgentCard: Fetching from ${url}`);
-        let response: Response;
-        try {
-            // Use a separate AbortController for card fetch? Maybe not necessary unless we want to cancel it specifically.
-            // Let's assume the main abort controller handles it if closed during fetch.
-             this._abortController = new AbortController();
-            response = await fetch(url, {
-                method: 'GET',
-                headers: {
-                    'Accept': 'application/json',
-                },
-                signal: this._abortController.signal
-            });
-        } catch (error: any) {
-             console.error('Agent Card fetch network error:', error);
-             throw new Error(`Agent card fetch failed: ${error.message}`);
-        }
-
-        if (!response.ok) {
-            console.error(`Agent Card fetch failed: ${response.status} ${response.statusText}`);
-            throw new Error(`Agent card fetch failed: ${response.status} ${response.statusText}`);
-        }
-
-        try {
-            const card = await response.json();
-            // TODO: Add more robust validation of the AgentCard structure?
-            if (!card || typeof card !== 'object' || !card.name || !card.url || !card.capabilities || !card.authentication) {
-                console.error('Invalid Agent Card structure received:', card);
-                throw new Error('Invalid Agent Card structure received.');
-            }
-            console.log('A2AClient._getAgentCard: Successfully fetched and parsed card.');
-            return card as A2ATypes.AgentCard;
-        } catch (error: any) {
-            console.error('Agent Card JSON parse error:', error);
-            throw new Error(`Agent card JSON parse failed: ${error.message}`);
-        }
-    }
-
-    private _determineStrategy(): 'sse' | 'poll' {
-        const canUseSse = this._agentCard?.capabilities?.streaming === true && !this.config.forcePoll;
-        const strategy = canUseSse ? 'sse' : 'poll';
-        console.log(`A2AClient._determineStrategy: Selected strategy: ${strategy} (SSE capable: ${this._agentCard?.capabilities?.streaming}, forcePoll: ${this.config.forcePoll})`);
-        return strategy;
-    }
-
-    private async _initiateCommunication(params: A2ATypes.TaskSendParams): Promise<void> {
-        console.log(`A2AClient._initiateCommunication (strategy: ${this._strategy})`);
-        this._abortController = new AbortController();
-        this._pollErrorAttempts = 0; // Reset counters
-        this._sseReconnectAttempts = 0;
-
-        try {
-            if (this._strategy === 'sse') {
-                this._currentState = 'starting-sse';
-                console.log('A2AClient._initiateCommunication: Starting SSE with tasks/sendSubscribe...');
-                // Cast params for sendSubscribe (same structure as send)
-                await this._startSse('tasks/sendSubscribe', params as TaskSubscribeParams);
-            } else {
-                this._currentState = 'starting-poll';
-                console.log('A2AClient._initiateCommunication: Starting Polling...');
-                await this._startPolling(params);
-            }
-        } catch (error) {
-            // Catch synchronous errors from _startSse or _startPolling
-            console.error("A2AClient._initiateCommunication: Error during start:", error);
-            this._handleFatalError(error as Error, 'initial-send');
-        }
-    }
-
-    // --- SSE Handling ---
+    // --- SSE Implementation ---
 
     private async _startSse(method: 'tasks/sendSubscribe' | 'tasks/resubscribe', params: TaskSubscribeParams | TaskResubscribeParams): Promise<void> {
-        const isReconnect = method === 'tasks/resubscribe';
-        console.log(`A2AClient._startSse: Starting SSE connection (Method: ${method}, Reconnect attempt: ${this._sseReconnectAttempts})`);
+        console.log(`A2AClient._startSse: START. Method: ${method}, Reconnect attempt: ${this._sseReconnectAttempts}, State: ${this._currentState}`);
+        // State should be 'connecting-sse' or 'reconnecting-sse'
 
-        // State is already 'starting-sse' or 'reconnecting-sse' before this is called
+        this._abortController = new AbortController(); // Ensure a fresh controller for this attempt
+        const signal = this._abortController.signal;
 
-        const requestId = crypto.randomUUID();
-        const requestBody: A2ATypes.JsonRpcRequest<any> = {
-            jsonrpc: "2.0",
-            id: requestId, // Include ID for SSE request for potential correlation? Spec is unclear here.
-            method: method,
-            params: params
-        };
-
-        let headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-            'Accept': 'text/event-stream', // Critical for SSE
-        };
-
+        let headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
         try {
             const authHeaders = await this.config.getAuthHeaders();
             headers = { ...headers, ...authHeaders };
-        } catch (error: any) {
-            console.error(`A2AClient._startSse (${method}): Failed to get auth headers:`, error);
-            // Treat auth failure as fatal before even attempting connection
-             this._handleFatalError(new Error(`Failed to get authentication headers: ${error.message}`), 'internal');
-            return;
+        } catch (authError: any) {
+             this._handleFatalError(new AuthenticationError(`Authentication failed: ${authError.message}`), 'authentication');
+             return; // Stop further execution
         }
 
-        let response: Response;
         try {
-            // Use the current abort controller
-            const signal = this._abortController?.signal;
-            response = await fetch(this.config.agentEndpointUrl, {
-                method: 'POST',
-                headers: headers,
-                body: JSON.stringify(requestBody),
-                signal: signal
-            });
+            const requestId = crypto.randomUUID();
+            const requestBody = { jsonrpc: "2.0", id: requestId, method, params };
+            console.log(`A2AClient._startSse: Sending ${method} request...`);
+            const response = await fetch(this.agentEndpointUrl, { method: 'POST', headers, body: JSON.stringify(requestBody), signal });
 
-            // Check if aborted during fetch
-             if (signal?.aborted) {
-                console.log(`A2AClient._startSse (${method}): Fetch aborted.`);
-                 // StopCommunication should handle state/cleanup
-                return;
-             }
+            if (signal.aborted) { console.log(`A2AClient._startSse (${method}): Fetch aborted.`); return; }
 
-            // Handle HTTP errors immediately
             if (!response.ok) {
                 const errorText = await response.text().catch(() => `Status ${response.status}`);
-                console.error(`A2AClient._startSse (${method}): HTTP error ${response.status}. Body: ${errorText}`);
-                throw new Error(`SSE connection failed: ${response.status} ${response.statusText}`);
+                throw new Error(`SSE connection failed: ${response.status} ${response.statusText}. Body: ${errorText}`);
             }
-
-            // Verify content type
             const contentType = response.headers.get('content-type');
-            if (!contentType || !contentType.includes('text/event-stream')) {
-                console.error(`A2AClient._startSse (${method}): Invalid content-type received: ${contentType}`);
+            if (!contentType?.includes('text/event-stream')) {
                 throw new Error(`Expected text/event-stream, got ${contentType}`);
             }
-
-            if (!response.body) {
-                throw new Error("SSE response body is null");
-            }
+            if (!response.body) { throw new Error("SSE response body is null"); }
 
             console.log(`A2AClient._startSse (${method}): SSE connection established, processing stream...`);
-            this._currentState = 'connecting-sse'; // Connection successful, waiting for first event
-            await this._processSseStream(response.body); // Start processing the stream
+            this._setState('connected-sse', `startSse ${method} success`); // Transition state *before* processing
+            this._sseReconnectAttempts = 0; // Reset on successful connection
+            if(this._reconnectTimerId) clearTimeout(this._reconnectTimerId); this._reconnectTimerId = null;
 
-            // If _processSseStream finishes without error (e.g., server closed connection cleanly after final event)
-            console.log(`A2AClient._startSse (${method}): SSE stream finished processing.`);
-             // State/closure should be handled by the 'final: true' event within _processSseStream/_handleSseEvent
-             // If it finishes without 'final: true', it might be an unexpected closure.
+            await this._processSseStream(response.body);
 
-        } catch (error: any) {
-            // Handle errors during fetch or initial connection setup
-            console.error(`A2AClient._startSse (${method}): Error establishing SSE connection:`, error);
-
-             // Check if the error is due to abort
-             if (this._currentState === 'closed' || this._currentState === 'error' || this._currentState === 'canceling' || this._currentState === 'sending') {
-                 console.warn(`A2AClient._startSse (${method}): Ignoring error as client state is ${this._currentState}`);
-                 return;
+            // If processing finishes without error/abort/final event, it implies server closed prematurely
+             if (!signal.aborted && !this._isTerminalState(this._currentState)) {
+                  console.warn(`A2AClient._startSse (${method}): SSE stream ended without explicit close/final event.`);
+                  this._reconnectSse(); // Attempt reconnect if stream ends unexpectedly
              }
 
-            // If not aborted and not fatal state, attempt reconnect
+        } catch (error: any) {
+             if (signal?.aborted || this._isTerminalState(this._currentState)) {
+                 console.warn(`A2AClient._startSse (${method}): Ignoring error as client aborted or in terminal state: ${this._currentState}`);
+                 return; // Don't reconnect if aborted or closed/errored
+             }
+            console.error(`A2AClient._startSse (${method}): Error establishing/processing SSE connection:`, error);
             this._emitter.emit('error', { error, context: 'sse-connect' } satisfies ErrorPayload);
-            this._reconnectSse();
+            this._reconnectSse(); // Attempt reconnect on error
         }
     }
 
     private async _processSseStream(stream: ReadableStream<Uint8Array>): Promise<void> {
-        let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-        try {
-            reader = stream.getReader();
-            const decoder = new TextDecoder();
-            let buffer = "";
-            let eventDataBuffer = "";
-            let eventType = "message"; // Default SSE event type
+        // Implementation similar to before, but calls _handleSseEvent
+        // Needs careful handling of abort signals within the read loop
+         const reader = stream.getReader();
+         const decoder = new TextDecoder();
+         let buffer = "";
+         let eventDataBuffer = "";
+         let eventType = "message"; // Default SSE event type
 
-            while (true) {
-                 // Check for abort signal before reading
+         try {
+             while (true) {
                  if (this._abortController?.signal?.aborted) {
-                    console.log("A2AClient._processSseStream: Abort detected, stopping stream processing.");
-                    break; // Exit loop if aborted
+                     console.log("A2AClient._processSseStream: Abort detected, stopping stream processing.");
+                     break;
                  }
 
-                const { done, value } = await reader.read();
+                 const { done, value } = await reader.read();
 
-                if (done) {
-                    console.log("A2AClient._processSseStream: Stream finished (done=true).");
-                    // Process any remaining buffer content if server didn't end with \n\n
-                    if (buffer.trim()) {
-                        console.warn("A2AClient._processSseStream: Stream ended with unprocessed buffer:", buffer);
-                        // Attempt to parse last incomplete event? Risky.
-                    }
-                    // If done is true, but we haven't received a final event, trigger reconnect?
-                    // Or assume server closed connection cleanly after final event.
-                    // Let's rely on the final:true flag in the event data. If it's missing, it's an issue.
-                     if (this._currentState !== 'closed' && this._currentState !== 'error') {
-                        console.warn("A2AClient._processSseStream: Stream closed by server without a final event.");
-                        // Consider this an error and attempt reconnect? Or just close?
-                        // Let's try reconnecting.
-                        this._reconnectSse();
-                     }
-                    break; // Exit loop
-                }
-
-                buffer += decoder.decode(value, { stream: true });
-
-                // Process buffer line by line, looking for event boundaries (\n\n)
-                let boundaryIndex;
-                while ((boundaryIndex = buffer.indexOf('\n\n')) >= 0) {
-                    const eventBlock = buffer.substring(0, boundaryIndex);
-                    buffer = buffer.substring(boundaryIndex + 2); // Consume block + boundary
-
-                    if (!eventBlock.trim()) continue; // Skip empty blocks
-
-                    // Reset for next event
-                    eventDataBuffer = "";
-                    eventType = "message";
-
-                    // Parse lines within the block
-                    for (const line of eventBlock.split('\n')) {
-                        if (line.startsWith(':')) continue; // Ignore comments
-                        const separatorIndex = line.indexOf(':');
-                        if (separatorIndex === -1) continue; // Ignore lines without ':'
-
-                        const field = line.substring(0, separatorIndex).trim();
-                        const val = line.substring(separatorIndex + 1).trim();
-
-                        switch (field) {
-                            case 'event':
-                                eventType = val;
-                                break;
-                            case 'data':
-                                // Append data, handling multi-line data fields
-                                eventDataBuffer += (eventDataBuffer ? '\n' : '') + val;
-                                break;
-                            // case 'id': // Handle lastEventId if needed for reconnect logic
-                            // case 'retry': // Handle retry interval if needed
-                            //     break;
-                        }
-                    }
-
-                    // Process the complete event data
-                    if (eventDataBuffer) {
-                        try {
-                            const parsedData = JSON.parse(eventDataBuffer);
-                            // Check if the client was closed/aborted while parsing/processing
-                             if (this._currentState === 'closed' || this._currentState === 'error' || this._abortController?.signal?.aborted) {
-                                console.log("A2AClient._processSseStream: Client closed/aborted during event processing, discarding event:", eventType);
-                                continue; // Skip handling if closed
-                             }
-                            this._handleSseEvent(eventType, parsedData);
-                        } catch (parseError: any) {
-                            console.error("A2AClient._processSseStream: Failed to parse SSE event data JSON:", parseError, "Data:", eventDataBuffer);
-                             if (this._currentState !== 'closed' && this._currentState !== 'error') {
-                                this._emitter.emit('error', { error: parseError, context: 'sse-parse' } satisfies ErrorPayload);
-                             }
-                            // Don't stop processing the stream for a single parse error
-                        }
-                    }
-                } // end while(boundaryIndex)
-            } // end while(true) reader loop
-
-        } catch (error: any) {
-            // Handle errors from reader.read() or decoder
-            // console.error("A2AClient._processSseStream: Error reading or processing SSE stream:", error.name, error);
-             if (this._currentState !== 'closed' && this._currentState !== 'error' && this._currentState !== 'canceling' && this._currentState !== 'sending') {
-                 // If error wasn't due to abort/close, attempt reconnect
-                 if (error.name !== 'AbortError') {
-                    this._emitter.emit('error', { error, context: 'sse-stream' } satisfies ErrorPayload);
-                    this._reconnectSse();
+                 if (done) {
+                     console.log("A2AClient._processSseStream: Stream finished (done=true).");
+                     // Server closed the connection. Reconnect handled by _startSse if unexpected.
+                     break;
                  }
-             }
-        } finally {
-            if (reader) {
-                try {
-                    reader.releaseLock(); // Release lock if stream processing stopped unexpectedly
-                     if (!reader.closed) { // Try cancelling if still open
-                        await reader.cancel().catch(e => console.warn("Error cancelling SSE reader:", e));
+
+                 buffer += decoder.decode(value, { stream: true });
+
+                 let boundaryIndex;
+                 while ((boundaryIndex = buffer.indexOf('\n\n')) >= 0) {
+                     const eventBlock = buffer.substring(0, boundaryIndex);
+                     buffer = buffer.substring(boundaryIndex + 2);
+
+                     if (!eventBlock.trim()) continue;
+
+                     eventDataBuffer = "";
+                     eventType = "message"; // Reset for each block
+
+                     for (const line of eventBlock.split('\n')) {
+                         if (line.startsWith(':')) continue;
+                         const separatorIndex = line.indexOf(':');
+                         if (separatorIndex === -1) continue;
+
+                         const field = line.substring(0, separatorIndex).trim();
+                         const val = line.substring(separatorIndex + 1).trim();
+
+                         switch (field) {
+                             case 'event': eventType = val; break;
+                             case 'data': eventDataBuffer += (eventDataBuffer ? '\n' : '') + val; break;
+                         }
                      }
-                } catch (e) {
-                    console.warn("Error releasing SSE reader lock:", e);
-                }
-            }
-        }
+
+                     if (eventDataBuffer) {
+                         if (this._abortController?.signal?.aborted || this._isTerminalState(this._currentState)) {
+                            console.log("A2AClient._processSseStream: Client closed/aborted during event processing, discarding event:", eventType);
+                            continue;
+                         }
+                         try {
+                             const parsedData = JSON.parse(eventDataBuffer);
+                             // Check for JSON-RPC error structure within the SSE data
+                             if (parsedData.error) {
+                                 console.error("A2AClient._processSseStream: Received JSON-RPC error via SSE:", parsedData.error);
+                                 this._emitter.emit('error', { error: parsedData.error as JsonRpcError, context: 'sse-stream' });
+                                 // Should we reconnect on RPC error? Or is it fatal for the task? Assume fatal for now.
+                                 this._handleFatalError(parsedData.error, 'sse-stream');
+                                 return; // Stop processing stream on fatal error
+                             }
+                             // Assuming result structure based on spec examples
+                             const eventResult = parsedData.result;
+                              if (!eventResult || typeof eventResult !== 'object') {
+                                 throw new Error(`Invalid SSE event data structure: ${eventDataBuffer}`);
+                             }
+                             this._handleSseEvent(eventType, eventResult);
+                         } catch (parseError: any) {
+                             console.error("A2AClient._processSseStream: Failed to parse SSE event data JSON:", parseError, "Data:", eventDataBuffer);
+                             // Don't emit error for single parse failure, just log
+                             // this._emitter.emit('error', { error: parseError, context: 'sse-parse' } satisfies ErrorPayload);
+                             // Continue processing stream despite parse error for one event? Or reconnect? Let's continue for now.
+                         }
+                     }
+                 } // end while(boundaryIndex)
+             } // end while(true) reader loop
+         } catch (readError: any) {
+              // Check if the error is due to an intentional abort
+              if (readError.name === 'AbortError' || this._abortController?.signal?.aborted) {
+                  console.log("A2AClient._processSseStream: Stream reading aborted intentionally.");
+                  return; // Don't treat as error, don't reconnect
+              }
+
+              // Handle other, unexpected read errors
+              if (this._isTerminalState(this._currentState)) {
+                  console.warn("A2AClient._processSseStream: Ignoring read error as client already in terminal state.");
+                  return;
+              }
+              // Error during reader.read()
+              console.error("A2AClient._processSseStream: Error reading SSE stream:", readError);
+              this._emitter.emit('error', { error: readError, context: 'sse-stream' } satisfies ErrorPayload);
+              this._reconnectSse(); // Reconnect on *unexpected* read errors
+         } finally {
+             reader.releaseLock();
+             console.log("A2AClient._processSseStream: Released reader lock.");
+             // Don't try to cancel reader here, let abort controller handle it.
+         }
     }
 
     private _handleSseEvent(eventType: string, eventData: any): void {
-        console.log(`A2AClient._handleSseEvent: Received SSE event type: ${eventType}`); // Add data logging cautiously
+        console.log(`A2AClient._handleSseEvent: Received SSE message. Analyzing data...`);
+        // NOTE: eventType parameter is now ignored as server omits 'event:' line.
+        // We determine type by inspecting eventData (the result object).
 
-        // Reset reconnect attempts on any valid event received
-        this._sseReconnectAttempts = 0;
-        if (this._reconnectTimerId) {
-            clearTimeout(this._reconnectTimerId);
-            this._reconnectTimerId = null;
-        }
-
-        // Update state if connecting
-        if (this._currentState === 'connecting-sse') {
-            this._currentState = 'connected-sse';
-             console.log(`A2AClient._handleSseEvent: State transitioned to connected-sse`);
-        }
-
-        // Ensure we have a task object to update, create a shell if not (e.g., for resubscribe)
+        // Ensure we have a base task object to update, create shell if needed (esp. for resubscribe)
         if (!this._lastKnownTask) {
-            console.warn("A2AClient._handleSseEvent: _lastKnownTask is null. Creating shell task.");
-            // Create a minimal task shell - resubscribe should ideally send initial state?
-            this._lastKnownTask = {
-                id: this.taskId,
-                status: { state: 'unknown', timestamp: new Date().toISOString() }, // Unknown state initially
-                artifacts: [],
-                history: [],
-                 createdAt: new Date().toISOString(), // Placeholder
-                 updatedAt: new Date().toISOString(), // Placeholder
-            };
+             console.warn("A2AClient._handleSseEvent: _lastKnownTask is null. Creating shell task.");
+             this._lastKnownTask = {
+                 id: this.taskId,
+                 status: { state: 'unknown', timestamp: new Date().toISOString() },
+                 artifacts: [],
+                 history: [],
+                 createdAt: new Date().toISOString(),
+                 updatedAt: new Date().toISOString(),
+             };
         }
+
+        let taskChanged = false;
+        let specificUpdate: { status: TaskStatus } | { artifact: Artifact } | null = null;
+        let isFinalEvent = false;
 
         try {
-            switch (eventType) {
-                case 'TaskStatusUpdate': {
-                    const statusUpdate = eventData as TaskStatusUpdateEvent;
-                    if (!statusUpdate || !statusUpdate.status) {
-                         console.warn("Invalid TaskStatusUpdate event received:", eventData); return;
-                    }
-                    console.log(`A2AClient._handleSseEvent: TaskStatusUpdate - State: ${statusUpdate.status.state}, Final: ${statusUpdate.final}`);
+            // Check for Status Update
+            if ('status' in eventData && eventData.status) {
+                 console.log("A2AClient._handleSseEvent: Detected TaskStatusUpdate.");
+                 const statusUpdate = eventData as Partial<TaskStatusUpdateEvent>; // Payload is the result object
+                 const newStatus = statusUpdate.status!;
+                 const oldStatus = this._lastKnownTask!.status; // Should exist by now
+                 isFinalEvent = statusUpdate.final === true;
+                 console.log(`A2AClient._handleSseEvent: TaskStatusUpdate - State: ${newStatus.state}, Final: ${isFinalEvent}`);
 
-                    const oldStatus = this._lastKnownTask.status;
-                    const newStatus = statusUpdate.status;
-
-                    // Emit status-update event
-                    this._emitter.emit('status-update', statusUpdate satisfies TaskStatusUpdateEvent);
-
-                    // Update internal task state
-                    this._lastKnownTask.status = newStatus;
-                    this._lastKnownTask.updatedAt = newStatus.timestamp; // Update timestamp
-
-                    // Emit full task-update event
-                    this._emitter.emit('task-update', { task: this.getCurrentTask()! } satisfies TaskUpdatePayload);
-
-                    // Check for input required transition
-                    if (newStatus.state === 'input-required' && oldStatus.state !== 'input-required') {
-                        this._currentState = 'input-required';
-                        console.log("A2AClient._handleSseEvent: State set to input-required.");
-                        // Polling/SSE stream processing should inherently pause if state is input-required
-                        // because _reconnectSse and _pollTaskLoop check the state.
-                    } else if (newStatus.state !== 'input-required' && this._currentState === 'input-required') {
-                        // Transitioning out of input-required
-                         this._currentState = 'connected-sse'; // Go back to connected state
-                    }
-
-
-                    // Check for final event
-                    if (statusUpdate.final) {
-                        console.log("A2AClient._handleSseEvent: Final event received. Closing communication.");
-                        const reason = this._getCloseReasonFromState(newStatus.state);
-                        this._stopCommunication(reason);
-                    }
-                    break;
-                }
-
-                case 'TaskArtifactUpdate': {
-                    const artifactUpdate = eventData as TaskArtifactUpdateEvent;
-                     if (!artifactUpdate || !artifactUpdate.artifact || typeof artifactUpdate.artifact.index !== 'number') {
-                        console.warn("Invalid TaskArtifactUpdate event received:", eventData); return;
-                    }
-                    const artifact = artifactUpdate.artifact;
-                    console.log(`A2AClient._handleSseEvent: TaskArtifactUpdate - Index: ${artifact.index}, Append: ${artifact.append}, Parts: ${artifact.parts?.length}, LastChunk: ${artifact.lastChunk}`);
-
-                    // Ensure artifacts array exists
-                    if (!this._lastKnownTask.artifacts) {
-                        this._lastKnownTask.artifacts = [];
-                    }
-
-                    // Find existing artifact by index
-                    let existingArtifact = this._lastKnownTask.artifacts.find(a => a.index === artifact.index);
-
-                    if (artifact.append && existingArtifact) {
-                        // Append parts to existing artifact
-                         if (!existingArtifact.parts) existingArtifact.parts = [];
-                        existingArtifact.parts.push(...artifact.parts);
-                        // Update other metadata if needed (e.g., description, name - though append shouldn't change these?)
-                         existingArtifact.lastChunk = artifact.lastChunk; // Update lastChunk status
-                         existingArtifact.timestamp = artifact.timestamp || new Date().toISOString(); // Update timestamp
-                        console.log(`A2AClient._handleSseEvent: Appended parts to artifact index ${artifact.index}. Total parts: ${existingArtifact.parts.length}`);
-                    } else {
-                        // Replace or add new artifact
-                        if (existingArtifact) {
-                             console.log(`A2AClient._handleSseEvent: Replacing artifact at index ${artifact.index}.`);
-                             const idx = this._lastKnownTask.artifacts.indexOf(existingArtifact);
-                             this._lastKnownTask.artifacts[idx] = artifact; // Replace
-                        } else {
-                             console.log(`A2AClient._handleSseEvent: Adding new artifact at index ${artifact.index}.`);
-                             // Ensure array is large enough (might receive out of order theoretically?)
-                             // Simple push assumes order for now. More robust: sort or place by index.
-                             this._lastKnownTask.artifacts.push(artifact);
-                             // Sort by index after push to maintain order?
-                             this._lastKnownTask.artifacts.sort((a, b) => a.index - b.index);
-                        }
-                        existingArtifact = artifact; // Point to the newly added/replaced artifact
-                    }
-                    this._lastKnownTask.updatedAt = new Date().toISOString(); // Update task timestamp
-
-                    // Emit artifact-update event with the *complete, updated* artifact
-                    this._emitter.emit('artifact-update', { id: this.taskId, artifact: existingArtifact } satisfies TaskArtifactUpdateEvent);
-
-                    // Emit full task-update event
-                    this._emitter.emit('task-update', { task: this.getCurrentTask()! } satisfies TaskUpdatePayload);
-                    break;
-                }
-
-                default:
-                    console.warn(`A2AClient._handleSseEvent: Received unknown SSE event type: ${eventType}`);
-                    break;
+                 if (!deepEqual(newStatus, oldStatus)) {
+                     this._lastKnownTask!.status = newStatus;
+                     this._lastKnownTask!.updatedAt = newStatus.timestamp || new Date().toISOString();
+                     if (oldStatus.state !== newStatus.state || !deepEqual(oldStatus.message, newStatus.message)) {
+                         taskChanged = true;
+                     }
+                     specificUpdate = { status: newStatus };
+                 }
+                 if (newStatus.state === 'input-required' && this._currentState !== 'input-required') {
+                     this._setState('input-required', 'sse status update');
+                 } else if (newStatus.state !== 'input-required' && this._currentState === 'input-required') {
+                     this._setState('connected-sse', 'sse status recovered from input-required');
+                 }
             }
+            // Check for Artifact Update
+            else if ('artifact' in eventData && eventData.artifact) {
+                 console.log("A2AClient._handleSseEvent: Detected TaskArtifactUpdate.");
+                 const artifactUpdate = eventData as Partial<TaskArtifactUpdateEvent>; // Payload is the result object
+                 const artifactData = artifactUpdate.artifact!;
+
+                 if (typeof artifactData.index !== 'number') {
+                      throw new Error("Invalid TaskArtifactUpdate event: missing or invalid artifact index.");
+                 }
+                 console.log(`A2AClient._handleSseEvent: TaskArtifactUpdate - Index: ${artifactData.index}, Append: ${artifactData.append}, LastChunk: ${artifactData.lastChunk}`);
+
+                 if (!this._lastKnownTask!.artifacts) this._lastKnownTask!.artifacts = [];
+
+                 let existingArtifact = this._lastKnownTask!.artifacts.find(a => a.index === artifactData.index);
+                 let updatedArtifact: Artifact | null = null;
+
+                 if (artifactData.append && existingArtifact) {
+                     // Append parts
+                     if (!existingArtifact.parts) existingArtifact.parts = [];
+                     existingArtifact.parts.push(...(artifactData.parts || []));
+                     existingArtifact.lastChunk = artifactData.lastChunk;
+                     existingArtifact.timestamp = artifactData.timestamp || new Date().toISOString();
+                     updatedArtifact = existingArtifact;
+                     console.log(`A2AClient._handleSseEvent: Appended parts to artifact index ${artifactData.index}. Total parts: ${existingArtifact.parts.length}`);
+                 } else {
+                     // Replace or add new artifact
+                     const newArtifact: Artifact = {
+                         index: artifactData.index,
+                         parts: artifactData.parts || [],
+                         timestamp: artifactData.timestamp || new Date().toISOString(),
+                         name: artifactData.name,
+                         description: artifactData.description,
+                         append: artifactData.append,
+                         lastChunk: artifactData.lastChunk,
+                         metadata: artifactData.metadata,
+                     };
+                     if (existingArtifact) {
+                         const idx = this._lastKnownTask!.artifacts.indexOf(existingArtifact);
+                         this._lastKnownTask!.artifacts[idx] = newArtifact;
+                         console.log(`A2AClient._handleSseEvent: Replaced artifact at index ${artifactData.index}.`);
+                     } else {
+                         this._lastKnownTask!.artifacts.push(newArtifact);
+                         this._lastKnownTask!.artifacts.sort((a, b) => a.index - b.index);
+                         console.log(`A2AClient._handleSseEvent: Added new artifact at index ${artifactData.index}.`);
+                     }
+                     updatedArtifact = newArtifact;
+                 }
+                 this._lastKnownTask!.updatedAt = new Date().toISOString();
+                 taskChanged = true;
+                 if (updatedArtifact) {
+                     specificUpdate = { artifact: updatedArtifact };
+                 }
+            }
+            // Handle other potential event types (if any added later)
+            else {
+                 console.warn(`A2AClient._handleSseEvent: Received SSE data with unknown structure:`, eventData);
+            }
+
+             // --- Emit Events ---
+             if (taskChanged && this._lastKnownTask) {
+                 const currentTaskSnapshot = this.getCurrentTask()!; // Get deep copy
+                 if (specificUpdate) {
+                     if ('status' in specificUpdate) {
+                         this._emitter.emit('status-update', { status: specificUpdate.status, task: currentTaskSnapshot } satisfies StatusUpdatePayload);
+                     } else if ('artifact' in specificUpdate) {
+                         // Type guard specificUpdate again before accessing artifact property
+                          if (specificUpdate.artifact) {
+                             this._emitter.emit('artifact-update', { artifact: specificUpdate.artifact, task: currentTaskSnapshot } satisfies ArtifactUpdatePayload);
+                          }
+                     }
+                 }
+                 this._emitter.emit('task-update', { task: currentTaskSnapshot } satisfies TaskUpdatePayload);
+             }
+
+             // --- Handle Final Event ---
+             if (isFinalEvent) {
+                 console.log("A2AClient._handleSseEvent: Final event received. Checking task state...");
+                 // Determine close reason based on the final *task* state reported
+                 const finalTaskState = this._lastKnownTask?.status?.state ?? 'unknown';
+                 if (this._isFinalTaskState(finalTaskState)) {
+                     const reason = this._getCloseReasonFromState(finalTaskState);
+                     console.log(`A2AClient._handleSseEvent: Task state ${finalTaskState} is final. Closing communication with reason: ${reason}.`);
+                     this._stopCommunication(reason, true); // true = emit close event
+                 } else {
+                     console.log(`A2AClient._handleSseEvent: Task state ${finalTaskState} is not final. SSE stream ended, but client remains active (State: ${this._currentState}).`);
+                     // Do nothing - client should already be in the correct state (e.g., 'input-required')
+                     // Abort the current SSE request processing, but don't change client state from input-required etc.
+                     this._abortController?.abort(); // Abort any further processing of *this* stream
+                 }
+             }
+
         } catch (e: any) {
-            // Catch errors during event handling/state update
-             console.error(`A2AClient._handleSseEvent: Error processing event ${eventType}:`, e);
-             // Emit non-fatal error? Or potentially fatal if state is corrupted?
-              this._emitter.emit('error', { error: e, context: 'internal' } satisfies ErrorPayload);
+            console.error(`A2AClient._handleSseEvent: Error processing event:`, e);
+            this._emitter.emit('error', { error: e, context: 'sse-task-sync' } satisfies ErrorPayload);
+            // Consider reconnecting or going fatal on processing errors? Let's try reconnecting.
+             this._reconnectSse();
         }
     }
 
     private _reconnectSse(): void {
-         // Check state before attempting reconnect
-         if (this._currentState === 'closed' || this._currentState === 'error' || this._currentState === 'canceling' || this._currentState === 'sending') {
-             console.log(`A2AClient._reconnectSse: Cannot reconnect in state ${this._currentState}.`);
-             return;
-         }
-          if (this._reconnectTimerId) {
+        if (this._isTerminalState(this._currentState) || this._currentState === 'sending' || this._currentState === 'canceling') {
+            console.log(`A2AClient._reconnectSse: Cannot reconnect in state ${this._currentState}.`);
+            return;
+        }
+         if (this._reconnectTimerId) {
              console.log("A2AClient._reconnectSse: Reconnect already scheduled.");
-             return; // Prevent multiple reconnect schedules
+             return;
          }
 
         this._sseReconnectAttempts++;
         console.log(`A2AClient._reconnectSse: Attempting SSE reconnect (${this._sseReconnectAttempts}/${this.config.sseMaxReconnectAttempts}).`);
 
-        if (this._sseReconnectAttempts > this.config.sseMaxReconnectAttempts!) {
-            console.error("A2AClient._reconnectSse: Max SSE reconnect attempts exceeded.");
-             this._handleFatalError(new Error("SSE reconnection failed."), 'sse-reconnect-failed');
-            return;
+        if (this._sseReconnectAttempts > this.config.sseMaxReconnectAttempts) {
+            // FIX: Call _handleFatalError without returning its result
+            this._handleFatalError(new Error("SSE reconnection failed."), 'sse-reconnect-failed');
+            return; // Exit after handling fatal error
         }
 
-        // Calculate backoff delay (exponential with jitter)
-        const baseDelay = this.config.sseInitialReconnectDelayMs!;
-        const maxDelay = this.config.sseMaxReconnectDelayMs!;
-        const backoff = Math.min(maxDelay, baseDelay * Math.pow(2, this._sseReconnectAttempts - 1));
-        const jitter = backoff * 0.1 * Math.random(); // Add +/- 10% jitter
-        const delay = Math.round(backoff + jitter);
-
+        const delay = this._calculateBackoff(this._sseReconnectAttempts, this.config.sseInitialReconnectDelayMs, this.config.sseMaxReconnectDelayMs);
         console.log(`A2AClient._reconnectSse: Scheduling reconnect in ${delay}ms.`);
-        this._currentState = 'reconnecting-sse';
+        this._setState('reconnecting-sse');
 
         this._reconnectTimerId = setTimeout(async () => {
-             if (this._currentState !== 'reconnecting-sse') {
-                 console.log(`A2AClient._reconnectSse: Reconnect timer fired, but state is now ${this._currentState}. Aborting reconnect attempt.`);
-                 this._reconnectTimerId = null;
+            console.log(`A2AClient._reconnectSse: TIMER FIRED. Current state: ${this._currentState}`); // DEBUG
+            this._reconnectTimerId = null;
+            if (this._currentState !== 'reconnecting-sse') {
+                 console.log(`A2AClient._reconnectSse: Reconnect timer fired, but state is now ${this._currentState}. Aborting.`);
                  return;
-             }
-            this._reconnectTimerId = null; // Clear timer ID before starting
-            try {
-                await this._startSse('tasks/resubscribe', { id: this.taskId });
-            } catch (error) {
-                 // _startSse should handle its own errors and potentially call _reconnectSse again
-                 console.error("A2AClient._reconnectSse: Error during reconnect attempt initiation:", error);
             }
+            // Start SSE using resubscribe
+            await this._startSse('tasks/resubscribe', { id: this.taskId });
+            // _startSse will handle errors and potentially call _reconnectSse again
         }, delay);
     }
 
-    // --- Polling Handling ---
-    private async _startPolling(params: A2ATypes.TaskSendParams): Promise<void> {
-        console.log('A2AClient._startPolling: Sending initial tasks/send');
+
+    // --- Polling Implementation ---
+
+    private async _startPolling(initialParams: TaskSendParams | null): Promise<void> {
+        console.log('A2AClient._startPolling: Initiating polling...');
+        this._resetCounters();
+        this._abortController = new AbortController(); // Ensure fresh controller
+
         try {
-            const initialTask = await this._request<TaskSendParams, Task>('tasks/send', params);
-            console.log('A2AClient._startPolling: Received initial task response');
+            let initialTask: Task;
+            if (initialParams) { // Create flow
+                console.log('A2AClient._startPolling: Sending initial tasks/send');
+                 initialTask = await this._request<TaskSendParams, Task>('tasks/send', initialParams);
+                 console.log('A2AClient._startPolling: Received initial task response from send.');
+            } else { // Resume flow
+                console.log('A2AClient._startPolling: Sending initial tasks/get');
+                 const getParams: TaskGetParams = { id: this.taskId, historyLength: this.config.pollHistoryLength };
+                 initialTask = await this._request<TaskGetParams, Task>('tasks/get', getParams);
+                 console.log('A2AClient._startPolling: Received initial task response from get.');
+            }
 
-            // Process initial response (diff logic not needed for first response)
-            this._updateTaskState(initialTask);
+            // Set initial state *before* emitting events
+            this._lastKnownTask = initialTask; // No diff needed for first response
 
-             // Emit initial events based *only* on the first response
-             this._emitter.emit('status-update', { id: this.taskId, status: initialTask.status, final: false } satisfies A2ATypes.TaskStatusUpdateEvent);
-             initialTask.artifacts?.forEach(artifact => {
-                 this._emitter.emit('artifact-update', { id: this.taskId, artifact } satisfies A2ATypes.TaskArtifactUpdateEvent);
-             });
-             this._emitter.emit('task-update', { task: this.getCurrentTask()! } satisfies TaskUpdatePayload);
+            // Emit synthetic events based on the first full task response
+            this._emitSyntheticEventsFromTask(initialTask);
 
             // Check initial state for completion or input required
-            if (this._isFinalState(initialTask.status.state)) {
+            if (this._isFinalTaskState(initialTask.status.state)) {
                 const reason = this._getCloseReasonFromState(initialTask.status.state);
                 console.log(`A2AClient._startPolling: Task finished on initial response (${initialTask.status.state}). Closing.`);
-                this._stopCommunication(reason);
+                this._stopCommunication(reason, true); // Emit close
             } else if (initialTask.status.state === 'input-required') {
                 console.log('A2AClient._startPolling: Task requires input on initial response.');
-                this._currentState = 'input-required'; // Set state explicitly
-                // Do NOT start polling loop if input is required
+                this._setState('input-required', 'initial poll response'); // Set state explicitly
+                // Do NOT start polling loop
             } else {
-                // Task is active, start polling
+                // Task is active, start polling loop
                 console.log('A2AClient._startPolling: Task active, starting poll loop.');
-                this._currentState = 'polling';
-                this._pollTaskLoop();
+                this._setState('polling', 'initial poll response OK');
+                this._pollTaskLoop(); // Start the loop
             }
 
         } catch (error: any) {
-            console.error('A2AClient._startPolling: Error during initial tasks/send:', error);
-            this._handleFatalError(error, 'initial-send');
+            // Catch errors during initial send/get
+            const context = initialParams ? 'initial-send' : 'initial-get';
+            console.error(`A2AClient._startPolling: Error during initial request (${context}):`, error);
+            this._handleFatalError(error, context);
         }
     }
 
     private _pollTaskLoop(): void {
+        // Check if polling should continue
         if (this._currentState !== 'polling' && this._currentState !== 'retrying-poll') {
              console.log(`A2AClient._pollTaskLoop: Not scheduling poll, state is ${this._currentState}`);
             return;
         }
 
-        // Clear existing timer before setting a new one
-        if (this._pollTimerId) {
-            clearTimeout(this._pollTimerId);
-        }
+        // Clear existing timer
+        if (this._pollTimerId) clearTimeout(this._pollTimerId);
 
-        console.log(`A2AClient._pollTaskLoop: Scheduling next poll in ${this.config.pollIntervalMs}ms`);
+        console.log(`A2AClient._pollTaskLoop: Scheduling poll task via setTimeout in ${this.config.pollIntervalMs}ms.`); // DEBUG
         this._pollTimerId = setTimeout(async () => {
+            console.log(`A2AClient._pollTaskLoop: setTimeout CALLBACK FIRED. Current state: ${this._currentState}`); // DEBUG
+            this._pollTimerId = null; // Clear ID before running
             if (this._currentState !== 'polling' && this._currentState !== 'retrying-poll') {
                  console.log('A2AClient._pollTaskLoop: Poll timer fired, but state changed. Aborting poll.');
                  return;
             }
-            await this._pollTask();
+            await this._pollTask(); // Perform the poll
         }, this.config.pollIntervalMs);
     }
 
     private async _pollTask(): Promise<void> {
          if (this._currentState !== 'polling' && this._currentState !== 'retrying-poll') {
              console.log(`A2AClient._pollTask: Aborting poll, state is ${this._currentState}`);
-             return; // Prevent race conditions if state changed while timer was pending
+             return;
          }
-
-        console.log('A2AClient._pollTask: Performing tasks/get');
-        this._currentState = 'polling'; // Ensure we are in polling state
+        this._setState('polling', 'pollTask execution');
 
         try {
-            const getParams: TaskGetParams = { id: this.taskId, historyLength: 0 }; // History length 0 for now
+            console.log('A2AClient._pollTask: Performing tasks/get');
+            const getParams: TaskGetParams = { id: this.taskId, historyLength: this.config.pollHistoryLength };
             const newTask = await this._request<TaskGetParams, Task>('tasks/get', getParams);
-            console.log('A2AClient._pollTask: Received tasks/get response');
+            console.log('A2AClient._pollTask: Received tasks/get response.');
 
-            this._pollErrorAttempts = 0; // Reset error count on successful poll
+            this._pollErrorAttempts = 0; // Reset error count on success
 
-            // Diff and emit updates
+            // Diff and emit updates based on the new full task state
             this._diffAndEmitUpdates(newTask);
 
-            // Check new state for completion or input required
-            if (this._isFinalState(newTask.status.state)) {
+            // Check new state for completion or input required (state updated by diff)
+            if (this._isFinalTaskState(newTask.status.state)) {
                 const reason = this._getCloseReasonFromState(newTask.status.state);
                 console.log(`A2AClient._pollTask: Task finished (${newTask.status.state}). Stopping poll.`);
-                this._stopCommunication(reason);
+                this._stopCommunication(reason, true); // Emit close
             } else if (newTask.status.state === 'input-required') {
-                 console.log('A2AClient._pollTask: Task requires input. Stopping poll.');
-                // State already updated by _diffAndEmitUpdates if needed
-                // Event already emitted by _diffAndEmitUpdates
-                // Do NOT schedule next poll
+                 console.log('A2AClient._pollTask: Task requires input. Stopping poll loop.');
+                 this._setState('input-required', 'pollTask found input-required'); // Ensure state is set
+                 // Do NOT schedule next poll
             } else {
                 // Task still active, schedule next poll
                 this._pollTaskLoop();
@@ -874,313 +930,344 @@ export class A2AClient {
             console.error(`A2AClient._pollTask: Error during tasks/get (attempt ${this._pollErrorAttempts}/${this.config.pollMaxErrorAttempts}):`, error);
             this._emitter.emit('error', { error, context: 'poll-get' } satisfies ErrorPayload);
 
-            if (this._pollErrorAttempts >= this.config.pollMaxErrorAttempts!) {
-                console.error('A2AClient._pollTask: Max poll retries exceeded.');
+            if (this._pollErrorAttempts >= this.config.pollMaxErrorAttempts) {
                 this._handleFatalError(new Error(`Polling failed after ${this.config.pollMaxErrorAttempts} attempts.`), 'poll-retry-failed');
             } else {
                 // Schedule retry
-                this._currentState = 'retrying-poll';
+                this._setState('retrying-poll');
                 console.log(`A2AClient._pollTask: Scheduling poll retry.`);
-                this._pollTaskLoop();
+                this._pollTaskLoop(); // Schedule the next attempt (with delay)
             }
         }
     }
 
-    // Updates internal state and emits synthetic events based on diff
+    // Diffing logic for Polling
     private _diffAndEmitUpdates(newTask: Task): void {
-        const oldTask = this._lastKnownTask; // Keep reference to old task for comparison
+        const oldTask = this._lastKnownTask;
+        // Always update internal state first
+        this._lastKnownTask = newTask;
 
         if (!oldTask) {
-            console.warn('A2AClient._diffAndEmitUpdates: No previous task state found. Emitting initial events.');
-            this._updateTaskState(newTask); // Update internal state first
-            this._emitSyntheticEvents(newTask);
-            // Check for input required on initial load
-            if (newTask.status.state === 'input-required') {
-                 this._currentState = 'input-required';
-                 // Polling loop is prevented in _pollTask if state becomes input-required
-            }
+            // Should not happen after initial poll, but handle defensively
+            console.warn('A2AClient._diffAndEmitUpdates: No previous task state found. Emitting synthetic events.');
+            this._emitSyntheticEventsFromTask(newTask);
             return;
         }
 
         let statusChanged = false;
-        // Diff Status: Use deep compare for safety
+        let artifactsChanged = false;
+        const changedArtifacts: Artifact[] = []; // Store *new* or *changed* artifacts
+
+        // 1. Diff Status
         if (!deepEqual(newTask.status, oldTask.status)) {
-            console.log(`A2AClient._diffAndEmitUpdates: Status changed from ${oldTask.status.state} (${oldTask.status.timestamp}) to ${newTask.status.state} (${newTask.status.timestamp})`);
+            console.log(`A2AClient._diffAndEmitUpdates: Status changed from ${oldTask.status.state} to ${newTask.status.state}`);
             statusChanged = true;
-            this._emitter.emit('status-update', {
-                id: this.taskId,
-                status: newTask.status,
-                final: false // Polling never knows if status update is final
-            } satisfies A2ATypes.TaskStatusUpdateEvent);
         }
 
-        // Diff Artifacts: Check for *new* artifacts by index or length
+        // 2. Diff Artifacts (basic diff: check for new indices or changed content at existing indices)
         const oldArtifacts = oldTask.artifacts ?? [];
         const newArtifacts = newTask.artifacts ?? [];
-        let artifactsChanged = false;
-        if (newArtifacts.length > oldArtifacts.length) {
-            console.log(`A2AClient._diffAndEmitUpdates: Detected ${newArtifacts.length - oldArtifacts.length} new artifacts.`);
-            artifactsChanged = true;
-            for (let i = oldArtifacts.length; i < newArtifacts.length; i++) {
-                const newArtifact = newArtifacts[i]; // Fixed: Removed unnecessary non-null assertion
-                this._emitter.emit('artifact-update', {
-                    id: this.taskId,
-                    artifact: newArtifact
-                } satisfies A2ATypes.TaskArtifactUpdateEvent);
+        const oldIndices = new Set(oldArtifacts.map(a => a.index));
+        const newIndices = new Set(newArtifacts.map(a => a.index));
+
+        for (const newArt of newArtifacts) {
+            if (!oldIndices.has(newArt.index)) {
+                // New artifact found
+                artifactsChanged = true;
+                changedArtifacts.push(newArt);
+                 console.log(`A2AClient._diffAndEmitUpdates: New artifact found at index ${newArt.index}`);
+            } else {
+                // Existing index, check if content changed
+                const oldArt = oldArtifacts.find(a => a.index === newArt.index);
+                if (!deepEqual(newArt, oldArt)) {
+                    artifactsChanged = true;
+                    changedArtifacts.push(newArt);
+                     console.log(`A2AClient._diffAndEmitUpdates: Artifact changed at index ${newArt.index}`);
+                }
             }
         }
-        // TODO: Add diffing for appends/updates within existing artifact indices if needed?
+        // More sophisticated diffing (e.g., detecting deleted artifacts) could be added if needed
 
-        // Update internal state *after* diffing but *before* emitting task-update/input-required
-        this._updateTaskState(newTask);
+        // --- Emit Events based on Diff ---
+        const currentTaskSnapshot = this.getCurrentTask()!; // Get deep copy of *new* state
 
-        // Emit task-update if status or artifacts changed
+        if (statusChanged) {
+            this._emitter.emit('status-update', { status: newTask.status, task: currentTaskSnapshot } satisfies StatusUpdatePayload);
+        }
+        if (artifactsChanged) {
+            changedArtifacts.forEach(art => {
+                 this._emitter.emit('artifact-update', { artifact: art, task: currentTaskSnapshot } satisfies ArtifactUpdatePayload);
+            });
+        }
         if (statusChanged || artifactsChanged) {
             console.log(`A2AClient._diffAndEmitUpdates: Emitting task-update.`);
-            // Use the *newly updated* task state via getCurrentTask()
-            this._emitter.emit('task-update', { task: this.getCurrentTask()! } satisfies TaskUpdatePayload);
-        } else {
-            console.log(`A2AClient._diffAndEmitUpdates: No significant changes detected in status or artifacts.`);
-        }
-
-        // Check for transition *into* input-required state
-        if (newTask.status.state === 'input-required' && oldTask.status.state !== 'input-required') {
-            console.log('A2AClient._diffAndEmitUpdates: Transitioned to input-required state.');
-            this._currentState = 'input-required'; // Ensure state is set
-            // Polling loop is prevented in _pollTask if state becomes input-required
-        } else if (newTask.status.state !== 'input-required' && this._currentState === 'input-required') {
-            // Handle transition *out* of input-required (e.g., if agent somehow recovers)
-            console.log('A2AClient._diffAndEmitUpdates: Transitioned out of input-required state.');
-            // If polling, restart the loop
-            if (this._strategy === 'poll' && !this._isFinalState(newTask.status.state)) {
-                this._currentState = 'polling';
-                this._pollTaskLoop();
-            }
-            // If SSE, the stream should handle it.
-        }
-    }
-
-    // Helper to emit initial/polled events
-    private _emitSyntheticEvents(task: Task): void {
-        this._emitter.emit('status-update', { id: this.taskId, status: task.status, final: false } satisfies A2ATypes.TaskStatusUpdateEvent);
-        task.artifacts?.forEach(artifact => {
-            this._emitter.emit('artifact-update', { id: this.taskId, artifact } satisfies A2ATypes.TaskArtifactUpdateEvent);
-        });
-        // Ensure getCurrentTask() reflects the task passed in or the updated internal state
-        // It might be safer to pass the task directly if _updateTaskState hasn't been called yet in some flows
-        const currentTaskSnapshot = this.getCurrentTask(); // Get the latest snapshot
-        if (currentTaskSnapshot) {
             this._emitter.emit('task-update', { task: currentTaskSnapshot } satisfies TaskUpdatePayload);
         } else {
-            // Fallback if getCurrentTask somehow returns null immediately after update
-            console.warn("_emitSyntheticEvents: getCurrentTask returned null unexpectedly, using provided task object for update event.")
-             this._emitter.emit('task-update', { task: JSON.parse(JSON.stringify(task)) } satisfies TaskUpdatePayload);
+             console.log(`A2AClient._diffAndEmitUpdates: No changes detected.`);
         }
-    }
 
-    // Helper to update the internal task state (uses structuredClone)
-    private _updateTaskState(newTask: Task): void {
-        // Use structuredClone for a proper deep copy if available, else fallback
-        if (typeof structuredClone === 'function') {
-            this._lastKnownTask = structuredClone(newTask);
-        } else {
-            this._lastKnownTask = JSON.parse(JSON.stringify(newTask)); // Fallback, less robust
-        }
-         // Update internal state based on task status *if* not already handled by specific flows
-         if (this._currentState !== 'input-required' && this._currentState !== 'canceling' && this._currentState !== 'sending' && !this._isFinalState(this._currentState as TaskState) && !this._isFinalState(newTask.status.state) ) {
-              if (newTask.status.state === 'working' || newTask.status.state === 'submitted') {
-                 // If polling was successful, ensure we are in 'polling' state for next loop
-                 if (this._strategy === 'poll') this._currentState = 'polling';
-                 // If SSE, state should be 'connected-sse' (handled by SSE logic)
-             }
+         // Handle client state transition based on *new* task state
+         if (newTask.status.state === 'input-required' && oldTask.status.state !== 'input-required') {
+             this._setState('input-required', 'diff found input-required'); // Stop polling loop next cycle
+         } else if (newTask.status.state !== 'input-required' && this._currentState === 'input-required') {
+             // Recovered from input-required? Resume polling.
+             this._setState('polling', 'diff recovered from input-required');
+             this._pollTaskLoop(); // Explicitly restart loop if needed
          }
     }
+
+    // Helper to emit initial/polled events based on a full task object
+    private _emitSyntheticEventsFromTask(task: Task): void {
+        const taskSnapshot = structuredClone(task); // Ensure deep copy for events
+        // Emit status update
+        console.log("A2AClient._emitSyntheticEventsFromTask: Emitting status-update event.", taskSnapshot.status);
+        this._emitter.emit('status-update', { status: taskSnapshot.status, task: taskSnapshot } satisfies StatusUpdatePayload);
+        // Emit artifact updates for all existing artifacts
+        taskSnapshot.artifacts?.forEach(artifact => {
+            this._emitter.emit('artifact-update', { artifact, task: taskSnapshot } satisfies ArtifactUpdatePayload);
+        });
+        // Emit the overall task update
+        this._emitter.emit('task-update', { task: taskSnapshot } satisfies TaskUpdatePayload);
+        console.log("A2AClient._emitSyntheticEventsFromTask: Emitted initial events for task:", task.id);
+    }
+
+
+     // Helper to centralize updating internal state and emitting events
+     // Used by cancel() and potentially other places that directly know the final task state
+     private _updateTaskStateAndEmit(newTask: Task, sourceReason: ClientCloseReason | 'sse' | 'poll' = 'poll'): void {
+         console.log(`A2AClient._updateTaskStateAndEmit: Updating task from source: ${sourceReason}`);
+         const oldTask = this._lastKnownTask;
+         this._lastKnownTask = newTask; // Update internal state
+
+         // Determine if events should be emitted (usually yes, unless no change)
+         let emitEvents = true;
+         if (oldTask && deepEqual(newTask, oldTask)) {
+              console.log("A2AClient._updateTaskStateAndEmit: No change detected, skipping event emission.");
+              emitEvents = false;
+         }
+
+         if (emitEvents) {
+              // Emit synthetic events based on the new task state
+              this._emitSyntheticEventsFromTask(newTask);
+
+              // Update client state based on task status, if applicable
+               if (newTask.status.state === 'input-required' && this._currentState !== 'input-required') {
+                   this._setState('input-required', 'sse status update');
+               } else if (this._isFinalTaskState(newTask.status.state) && !this._isTerminalState(this._currentState)) {
+                   // If task is final, but client isn't closed/error yet, update client state
+                   const reason = this._getCloseReasonFromState(newTask.status.state);
+                   console.log(`A2AClient._updateTaskStateAndEmit: Task state ${newTask.status.state} is final, client state ${this._currentState} is not terminal. Reason: ${reason}`);
+                   // Don't call stopCommunication here, let the caller handle final closure
+                   // Just update the state conceptually if needed, but typically handled by close()
+               }
+         }
+     }
+
 
     // --- Core Communication ---
     private async _request<TParams, TResult>(method: string, params: TParams): Promise<TResult> {
         console.log(`A2AClient._request: Sending method '${method}'`);
-        const requestId = crypto.randomUUID(); // Use UUID for request IDs
-        const requestBody: A2ATypes.JsonRpcRequest<TParams> = {
-            jsonrpc: "2.0",
-            id: requestId,
-            method: method,
-            params: params
-        };
+        const requestId = crypto.randomUUID();
+        const requestBody = { jsonrpc: "2.0", id: requestId, method, params };
 
-        let headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        };
-
+        let headers: Record<string, string> = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
         try {
             const authHeaders = await this.config.getAuthHeaders();
             headers = { ...headers, ...authHeaders };
-        } catch (error: any) {
-            console.error('A2AClient._request: Failed to get auth headers:', error);
-            // Decide if this is fatal or if we proceed without auth
-            // For now, let's make it fatal as per the design (enterprise ready)
-            throw new Error(`Failed to get authentication headers: ${error.message}`);
+        } catch (authError: any) {
+             console.error('A2AClient._request: Failed to get auth headers:', authError);
+             // Throw specific error type? For now, wrap it.
+             throw new AuthenticationError(`Authentication failed: ${authError.message}`);
         }
 
+        const signal = this._abortController?.signal; // Use current abort controller
         let response: Response;
         try {
-             // Use the current abort controller if available
-             const signal = this._abortController?.signal;
-            response = await fetch(this.config.agentEndpointUrl, {
-                method: 'POST',
-                headers: headers,
-                body: JSON.stringify(requestBody),
-                signal: signal
-            });
-        } catch (error: any) {
-            // Network errors or aborts
-            console.error(`A2AClient._request: Fetch error for method '${method}':`, error);
-            if (error.name === 'AbortError') {
-                throw new Error(`Request aborted: ${method}`);
-            }
-            throw new Error(`Network error during request: ${error.message}`);
+            response = await fetch(this.agentEndpointUrl, { method: 'POST', headers, body: JSON.stringify(requestBody), signal });
+        } catch (fetchError: any) {
+            console.error(`A2AClient._request: Fetch error for method '${method}':`, fetchError);
+            if (signal?.aborted || fetchError.name === 'AbortError') { throw new Error(`Request aborted: ${method}`); }
+            throw new Error(`Network error during request: ${fetchError.message}`);
         }
+
+         if (signal?.aborted) { throw new Error(`Request aborted: ${method}`); } // Check after fetch
 
         if (!response.ok) {
-             // Log more detail for HTTP errors
              const responseText = await response.text().catch(() => '{Could not read response body}');
              console.error(`A2AClient._request: HTTP error for method '${method}': ${response.status} ${response.statusText}. Body: ${responseText}`);
-            throw new Error(`HTTP error ${response.status} for method ${method}`);
+             // Construct a JsonRpcError-like object for HTTP errors?
+             // Or just throw a generic error. Let's throw generic for now.
+             throw new Error(`HTTP error ${response.status} for method ${method}. Body: ${responseText}`);
         }
 
-        let responseData: A2ATypes.JsonRpcResponse<TResult>;
+        let responseData: any; // Use any initially
         try {
             responseData = await response.json();
-        } catch (error: any) {
-            console.error(`A2AClient._request: JSON parse error for method '${method}':`, error);
-            throw new Error(`Failed to parse JSON response: ${error.message}`);
+        } catch (parseError: any) {
+            console.error(`A2AClient._request: JSON parse error for method '${method}':`, parseError);
+            throw new Error(`Failed to parse JSON response: ${parseError.message}`);
         }
 
-        // Check for JSON-RPC level errors
-        if ('error' in responseData && responseData.error) {
-            console.warn(`A2AClient._request: Received JSON-RPC error for method '${method}':`, responseData.error);
-            // Throw the structured error object
-            throw responseData.error; // Throw the JsonRpcError directly
-        }
+        // Now check the structure and cast
+        const rpcResponse = responseData as A2ATypes.JsonRpcResponse<TResult>; // Cast here
 
-        // Check for success response structure
-        if ('result' in responseData) {
-             console.log(`A2AClient._request: Successfully received result for method '${method}'`);
-            return responseData.result;
+        if ('error' in rpcResponse && rpcResponse.error) {
+            console.warn(`A2AClient._request: Received JSON-RPC error for method '${method}':`, rpcResponse.error);
+            throw rpcResponse.error; // Throw the JsonRpcError object itself
+        }
+        if ('result' in rpcResponse) {
+            console.log(`A2AClient._request: Successfully received result for method '${method}'`);
+            return rpcResponse.result;
         } else {
-            // Should not happen if server conforms to JSON-RPC
-            console.error(`A2AClient._request: Invalid JSON-RPC response structure for method '${method}':`, responseData);
+            console.error(`A2AClient._request: Invalid JSON-RPC response for method '${method}':`, rpcResponse);
             throw new Error('Invalid JSON-RPC response structure received.');
         }
     }
 
     // --- Cleanup & State Management ---
-    private _stopCommunication(reason: ClientCloseReason): void {
-        console.log(`A2AClient._stopCommunication: Stopping communication with reason: "${reason}" (Current state: ${this._currentState}, Strategy: ${this._strategy})`);
 
-        if (this._currentState === 'closed' || this._currentState === 'error') {
-            console.log(`A2AClient._stopCommunication: Already in final state ${this._currentState}. Doing nothing.`);
+    private _stopCommunication(reason: ClientCloseReason, emitCloseEvent: boolean): void {
+        console.log(`A2AClient._stopCommunication: Stopping communication. Reason: "${reason}", EmitClose: ${emitCloseEvent}, CurrentState: ${this._currentState}`);
+
+        if (this._isTerminalState(this._currentState)) {
+            console.log(`A2AClient._stopCommunication: Already in terminal state ${this._currentState}.`);
             return;
         }
 
         const previousState = this._currentState;
-        let targetState: ClientManagedState = 'closed'; // Default target
-        // Determine target state based on reason
-        if (reason === 'error-fatal' || reason === 'sse-reconnect-failed' || reason === 'poll-retry-failed' || reason === 'error-on-cancel') {
-            targetState = 'error';
-        } else if (reason === 'sending-new-message') {
-            targetState = 'sending';
-        } else if (reason === 'canceling') {
-            targetState = 'canceling';
-        }
 
-        // Abort any in-flight fetch *before* potentially changing state
+        // 1. Abort in-flight operations
         if (this._abortController) {
-            console.log('A2AClient._stopCommunication: Aborting fetch controller.');
+            console.log('A2AClient._stopCommunication: Aborting controller.');
             this._abortController.abort();
-            this._abortController = null;
-        }
-
-        // Stop specific communication method (clears timers)
-        if (this._strategy === 'sse') {
-            this._stopSse(); // Clears reconnect timer
+            this._abortController = null; // Clear controller
         } else {
-            this._stopPolling(); // Clears poll timer
+            console.log('A2AClient._stopCommunication: No active abort controller to abort.');
         }
 
-        // Set the final state *unless* it's an intermediate stop reason
-        if (targetState === 'closed' || targetState === 'error') {
-            console.log(`A2AClient._stopCommunication: Transitioning state from ${previousState} to ${targetState}`);
-            this._currentState = targetState;
-            // Emit close event ONLY if transitioning to a final closed/error state
-            this._updateStateAndEmitClose(reason);
+
+        // 2. Clear timers
+        if (this._pollTimerId) { clearTimeout(this._pollTimerId); this._pollTimerId = null; }
+        if (this._reconnectTimerId) { clearTimeout(this._reconnectTimerId); this._reconnectTimerId = null; }
+
+        // 3. Reset counters
+        this._resetCounters();
+
+        // 4. Set final state and emit close event ONLY if requested
+        if (emitCloseEvent) {
+            // Determine final state based on reason
+            let finalState: ClientManagedState = 'closed';
+             const errorReasons: ClientCloseReason[] = ['error-fatal', 'sse-reconnect-failed', 'poll-retry-failed', 'error-on-cancel'];
+             if (errorReasons.includes(reason) || this._currentState === 'error') { // Check current state too in case error happened before stop
+                 finalState = 'error';
+             }
+             console.log(`A2AClient._stopCommunication: Transitioning state from ${previousState} to ${finalState}`);
+             this._setState(finalState);
+             this._emitter.emit('close', { reason } satisfies ClosePayload);
+
+             console.log(`A2AClient._stopCommunication: Communication stopped. Final state: ${this._currentState}`);
         } else {
-            console.log(`A2AClient._stopCommunication: Intermediate stop for reason "${reason}". State will be set by caller to ${targetState}.`);
-            // State transition ('sending', 'canceling') is handled by the calling public method (_send, _cancel)
+             // If not emitting close, the state is likely transitioning to an intermediate
+             // state like 'sending' or 'canceling', handled by the caller.
+             console.log(`A2AClient._stopCommunication: Intermediate stop for reason "${reason}". State managed by caller.`);
+             // State is set by caller (e.g., _send sets to 'sending')
         }
     }
 
-    private _stopSse(): void {
-        console.log('A2AClient._stopSse: Stopping SSE specific resources.');
-        // Abort fetch (handled by _stopCommunication via abortController)
-
-        // Clear reconnect timer if it's active
-        if (this._reconnectTimerId) {
-            console.log('A2AClient._stopSse: Clearing SSE reconnect timer.');
-            clearTimeout(this._reconnectTimerId);
-            this._reconnectTimerId = null;
+    // Centralized fatal error handler
+    private _handleFatalError(error: Error | JsonRpcError, context: ClientErrorContext): Error | JsonRpcError {
+        console.error(`>>> A2AClient FATAL ERROR (${context}):`, error);
+        if (this._isTerminalState(this._currentState)) {
+             console.warn("Fatal error occurred but client already in terminal state:", this._currentState);
+             return error; // Return error but don't process further
         }
-        this._sseReconnectAttempts = 0; // Reset counter
-        // Note: Actual closing of the SSE stream reader happens in _processSseStream or via abort controller
+        // Emit error first
+        this._emitter.emit('error', { error, context } satisfies ErrorPayload);
+        // Stop communication and transition to 'error' state, emitting 'close'
+        const reason: ClientCloseReason = context === 'sse-reconnect-failed' ? 'sse-reconnect-failed'
+                                        : context === 'poll-retry-failed' ? 'poll-retry-failed'
+                                        : 'error-fatal';
+        this._stopCommunication(reason, true); // true = emit close event
+        return error; // Return the error after handling
     }
 
-    private _stopPolling(): void {
-        console.log('A2AClient._stopPolling: Stopping polling timer.');
-        if (this._pollTimerId) {
-            clearTimeout(this._pollTimerId);
-            this._pollTimerId = null;
-        }
-    }
-
-    private _updateStateAndEmitClose(reason: ClientCloseReason): void {
-        // This method now only handles the event emission and listener cleanup
-        // State setting is handled in _stopCommunication or _handleFatalError
-        console.log(`A2AClient._updateStateAndEmitClose: Emitting close event with reason: ${reason}`);
-         if (this._currentState !== 'closed' && this._currentState !== 'error') {
-             console.warn(`A2AClient._updateStateAndEmitClose called but state is ${this._currentState}. Force setting state to closed.`);
-             this._currentState = 'closed'; // Ensure state is final
-         }
-        this._emitter.emit('close', { reason } satisfies ClosePayload);
-        this._emitter.removeAllListeners(); // Clean up listeners on final close
-    }
-
-    // Centralized error handler for fatal errors
-    private _handleFatalError(error: Error | A2ATypes.JsonRpcError, context: ClientErrorContext): void {
-        console.error(`A2AClient Fatal Error (${context}):`, error);
-         if (this._currentState === 'error' || this._currentState === 'closed') {
-             return;
-         }
-         const reason: ClientCloseReason = 'error-fatal';
-         // Emit error first, before changing state and stopping comms
-         this._emitter.emit('error', { error, context } satisfies ErrorPayload);
-
-         // Stop communication and set state to error
-         // Pass the specific fatal reason derived from the context if needed
-         // For simplicity, using 'error-fatal' for now.
-         this._stopCommunication(reason);
+    private _resetCounters(): void {
+        this._sseReconnectAttempts = 0;
+        this._pollErrorAttempts = 0;
     }
 
     // --- Utility Helpers ---
-    private _isFinalState(state: TaskState | ClientManagedState): boolean {
-        return state === 'completed' || state === 'canceled' || state === 'failed' || state === 'closed' || state === 'error';
+    private _isTerminalState(state: ClientManagedState): boolean {
+        return state === 'closed' || state === 'error';
+    }
+    private _isFinalTaskState(state: TaskState): boolean {
+         return state === 'completed' || state === 'canceled' || state === 'failed';
     }
 
     private _getCloseReasonFromState(state: TaskState): ClientCloseReason {
         switch (state) {
             case 'completed': return 'task-completed';
-            case 'canceled': return 'task-canceled-by-agent'; // Assume agent canceled if we poll and find this
+            case 'canceled': return 'task-canceled-by-agent';
             case 'failed': return 'task-failed';
-            default: return 'closed-by-caller'; // Should not happen for final task states
+            default:
+                 console.warn(`_getCloseReasonFromState called with non-final state: ${state}`);
+                 return 'closed-by-caller'; // Fallback, should ideally not happen
+        }
+    }
+
+     private _calculateBackoff(attempt: number, initialDelay: number, maxDelay: number): number {
+         const baseDelay = initialDelay;
+         const backoff = Math.min(maxDelay, baseDelay * Math.pow(2, attempt - 1));
+         const jitter = backoff * 0.2 * (Math.random() - 0.5); // +/- 10% jitter
+         return Math.round(backoff + jitter);
+     }
+
+}
+
+// Custom error class for authentication issues
+class AuthenticationError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'AuthenticationError';
+    }
+}
+
+// Re-add SimpleEventEmitter implementation if not external
+export class SimpleEventEmitter {
+    private events: Record<string, Listener[]> = {};
+
+    on(event: string, listener: Listener): void {
+        if (!this.events[event]) {
+            this.events[event] = [];
+        }
+        // Avoid adding the same listener multiple times
+        if (!this.events[event].includes(listener)) {
+             this.events[event].push(listener);
+        }
+    }
+
+    off(event: string, listener: Listener): void {
+        if (!this.events[event]) return;
+        this.events[event] = this.events[event].filter(l => l !== listener);
+    }
+
+    emit(event: string, ...args: any[]): void {
+        if (!this.events[event]) return;
+        // Use slice to avoid issues if listener removes itself during emit
+        this.events[event].slice().forEach(listener => {
+             try {
+                 listener(...args);
+             } catch (e) {
+                 console.error(`Error in event listener for "${event}":`, e);
+             }
+         });
+    }
+
+    removeAllListeners(event?: string): void {
+        if (event) {
+            delete this.events[event];
+        } else {
+            this.events = {};
         }
     }
 }

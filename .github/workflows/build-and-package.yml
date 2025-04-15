@@ -38,7 +38,7 @@ jobs:
           cp static/ehretriever.html artifact_content/ehr-callback.html # Additional copy with different name
           cp static/ehretriever.html artifact_content/ehr-connect.html # Additional copy with different name
           cp -r static/dist/* artifact_content/dist/
-          cp -r static/brands/* artifact_content/brands/ # Copy brands directory
+          cp -r static/brands/* artifact_content/brands/
 
       - name: List artifact contents (for debugging)
         run: ls -R artifact_content

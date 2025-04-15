@@ -35,7 +35,7 @@ export class JokeProcessor implements TaskProcessor {
         const topic = topicMatch?.[1];
 
         if (topic) {
-          await Bun.sleep(1000);
+          // await Bun.sleep(100);
           const jokeText = `Why was the ${topic} so good at networking? Because it had great connections!`; // Placeholder topic joke
           await updater.addArtifact({
               name: 'joke-result',
@@ -107,7 +107,7 @@ export class JokeProcessor implements TaskProcessor {
 
        try {
            await updater.updateStatus('working', { role: 'agent', parts: [{type: 'text', text: `Okay, thinking of a joke about ${topic}...`}]});
-           await Bun.sleep(1000);
+           await Bun.sleep(100);
 
            const jokeText = `Why did the ${topic} refuse to fight? Because it didn\'t want to get into a ${topic}-kle!`; // Placeholder topic joke
 

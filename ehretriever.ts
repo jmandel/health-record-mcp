@@ -948,44 +948,48 @@ document.addEventListener('DOMContentLoaded', () => {
         showProgressContainer(false); // Ensure progress is hidden
 
         // Fetch brand data and initialize the selector UI
-        fetchBrandsAndInitialize();
+        fetchBrandsAndInitialize().then(() => {
+            // Check for delivery target in hash (keep this logic)
+            const hash = window.location.hash;
+            sessionStorage.removeItem(DELIVERY_TARGET_KEY); // Clear any previous target first
+            sessionStorage.removeItem(OPENER_TARGET_ORIGIN_KEY); // Clear previous origin too
+            if (hash) {
+                const openerPrefix = '#deliver-to-opener:';
+                if (hash.startsWith(openerPrefix)) {
+                    const targetOrigin = hash.substring(openerPrefix.length);
+                    if (targetOrigin) {
+                        // Validate if it looks like an origin (basic check)
+                        try {
+                            new URL(targetOrigin); // Check if it parses as a URL
+                            sessionStorage.setItem(DELIVERY_TARGET_KEY, OPENER_TARGET_VALUE);
+                            sessionStorage.setItem(OPENER_TARGET_ORIGIN_KEY, targetOrigin);
+                            console.log(`Found and stored delivery target: Opener Window`);
+                            console.log(`Stored opener target origin: ${targetOrigin}`);
+                            history.replaceState(null, '', ' '); // Clear hash
+                        } catch (e) {
+                            console.warn(`Invalid target origin provided in hash: ${targetOrigin}`);
+                        }
+                    } else {
+                        console.warn('Found #deliver-to-opener: but target origin is empty.');
+                    }
+                } else if (hash.startsWith('#deliver-to:')) {
+                    const targetName = hash.substring('#deliver-to:'.length);
+                    if (targetName) {
+                        sessionStorage.setItem(DELIVERY_TARGET_KEY, targetName);
+                        console.log(`Found and stored delivery target: ${targetName}`);
+                        history.replaceState(null, '', ' '); // Clear hash
+                    } else {
+                        console.warn('Found #deliver-to: but target name is empty.');
+                    }
+                }
+
+
+            }
+        })
+
 
         // Ensure confirmation UI is hidden on initial load
         showConfirmationContainer(false);
 
-        // Check for delivery target in hash (keep this logic)
-        const hash = window.location.hash;
-        sessionStorage.removeItem(DELIVERY_TARGET_KEY); // Clear any previous target first
-        sessionStorage.removeItem(OPENER_TARGET_ORIGIN_KEY); // Clear previous origin too
-        if (hash) {
-            const openerPrefix = '#deliver-to-opener:';
-            if (hash.startsWith(openerPrefix)) {
-                 const targetOrigin = hash.substring(openerPrefix.length);
-                 if (targetOrigin) {
-                    // Validate if it looks like an origin (basic check)
-                    try {
-                        new URL(targetOrigin); // Check if it parses as a URL
-                        sessionStorage.setItem(DELIVERY_TARGET_KEY, OPENER_TARGET_VALUE);
-                        sessionStorage.setItem(OPENER_TARGET_ORIGIN_KEY, targetOrigin);
-                        console.log(`Found and stored delivery target: Opener Window`);
-                        console.log(`Stored opener target origin: ${targetOrigin}`);
-                        history.replaceState(null, '', ' '); // Clear hash
-                    } catch (e) {
-                         console.warn(`Invalid target origin provided in hash: ${targetOrigin}`);
-                    }
-                 } else {
-                      console.warn('Found #deliver-to-opener: but target origin is empty.');
-                 }
-            } else if (hash.startsWith('#deliver-to:')) {
-                const targetName = hash.substring('#deliver-to:'.length);
-                if (targetName) {
-                    sessionStorage.setItem(DELIVERY_TARGET_KEY, targetName);
-                    console.log(`Found and stored delivery target: ${targetName}`);
-                    history.replaceState(null, '', ' '); // Clear hash
-                } else {
-                    console.warn('Found #deliver-to: but target name is empty.');
-                }
-            }
-        }
     }
 }); 

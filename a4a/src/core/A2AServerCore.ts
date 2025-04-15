@@ -35,6 +35,8 @@ export class A2AServerCore {
   // --- Task Handling Entry Point ---
   async handleTaskSend(params: A2ATypes.TaskSendParams, authContext?: any): Promise<A2ATypes.Task> {
       const checkResult = await this._checkResumability(params);
+      console.log(`[A2ACore] Check resumability result: ${JSON.stringify(checkResult)}`);
+      console.log("total store", this.taskStore)
 
       switch (checkResult.outcome) {
           case 'initiate': {
@@ -201,53 +203,147 @@ export class A2AServerCore {
     }
   }
 
-  async handleTaskSendSubscribe(params: A2ATypes.TaskSubscribeParams, sseResponse: express.Response, authContext?: any): Promise<void> {
-      // Initial checks specific to SSE
-      const sseService = this._ensureStreamingSupportedOrThrow();
+  // --- SSE Method Handlers ---
+  async handleTaskSendSubscribe(
+       requestId: string | number | null, // Added requestId
+       params: A2ATypes.TaskSubscribeParams,
+       sseResponse: express.Response,
+       authContext?: any
+  ): Promise<void> {
+       const sseManager = this._ensureStreamingSupportedOrThrow();
 
-      // Perform the common check
-      const checkResult = await this._checkResumability(params);
+       // First, check if this ID corresponds to an existing, resumable task
+       const checkResult = await this._checkResumability(params);
+       console.log(`[A2ACore] handleTaskSendSubscribe: Resumability check result: ${checkResult.outcome}`);
 
-      // Dispatch based on outcome
-      switch (checkResult.outcome) {
-            case 'initiate':
-                console.log(`[A2ACore] Initiating new task via SSE request (ID provided: ${params.id || 'none'}).`);
-                const { task: initialTask, initialEvent } = await this._handleTaskInitiation(params, authContext);
-                sseService.addSubscription(initialTask.id, sseResponse);
-                await this._emitTaskEvent(initialEvent); // Will send to new subscriber
-                break;
-            case 'resume':
-                 // Call the UNIFIED resume helper
-                const { updatedTask, workingEvent } = await this._resumeTask(checkResult.task!, checkResult.processor!, params, authContext);
-                sseService.addSubscription(updatedTask.id, sseResponse);
-                await this._emitTaskEvent(workingEvent); // Will send to new subscriber
-                break;
-            // No 'error' or 'default' case needed here, as _checkResumability now throws directly.
-            // Errors will be caught by the main try/catch in the express handler.
-        }
+       switch (checkResult.outcome) {
+           case 'initiate': { // Task is new or non-existent, proceed with initiation
+               console.log(`[A2ACore] handleTaskSendSubscribe: Initiating new task.`);
+               // Use the unified initiation helper
+               const { task, initialEvent } = await this._handleTaskInitiation(params, authContext);
 
-      // Handler keeps connection open if successful
-  }
+               // Add subscription, storing the request ID
+               sseManager.addSubscription(task.id, requestId, sseResponse);
 
-  async handleTaskResubscribe(params: A2ATypes.TaskResubscribeParams, sseResponse: express.Response, authContext?: any): Promise<void> {
-      const sseService = this._ensureStreamingSupportedOrThrow();
+               // Broadcast the initial status update via SSE ONLY
+               try {
+                   sseManager.broadcast(task.id, 'TaskStatusUpdate', initialEvent);
+                   console.log(`[A2ACore] Broadcast initial SSE status update for task ${task.id}`);
+               } catch (error) {
+                   console.error(`[A2ACore] Error broadcasting initial SSE event for task ${task.id}:`, error);
+                   sseManager.removeSubscription(task.id, sseResponse);
+                   if (!sseResponse.closed) sseResponse.end();
+               }
+               // Note: Processor execution started by _handleTaskInitiation
+               break;
+           }
+           case 'resume': { // Task exists and is in a resumable state
+                console.log(`[A2ACore] handleTaskSendSubscribe: Resuming existing task ${checkResult.task!.id}.`);
+               const taskToResume = checkResult.task!;
+               const processor = checkResult.processor!;
 
-       const task = await this._getTaskOrThrow(params.id);
+               // Perform resume steps similar to _resumeTask, but manage SSE
+               if (!processor.resume) { // Should be guaranteed by _checkResumability, but double-check
+                   throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Processor ${processor.constructor.name} lacks a resume method.`);
+               }
+               // 1. Add Incoming History
+               if (params.message.role) {
+                    await this.taskStore.addTaskHistory(taskToResume.id, params.message);
+               } else {
+                   console.warn(`[A2ACore] Resume message (SSE) for task ${taskToResume.id} lacks role. Skipping history add.`);
+               }
+               // 2. Capture Original State
+                const originalTaskState = { ...taskToResume };
+               // 3. Update Status to Working
+                const now = new Date().toISOString();
+                const statusUpdate: A2ATypes.TaskStatus = { state: 'working', timestamp: now };
+                const updatedTask = await this.taskStore.updateTask(taskToResume.id, { status: statusUpdate });
+                if (!updatedTask) {
+                    throw this._createError(A2ATypes.A2AErrorCodes.TaskNotFound, `Task ${taskToResume.id} disappeared during SSE resume.`);
+                }
+                console.log(`[A2ACore] Task ${updatedTask.id} status set to working for SSE resume.`);
+                // 4. Prepare Working Event
+                const workingEvent: A2ATypes.TaskStatusUpdateEvent = {
+                    id: updatedTask.id, status: { ...updatedTask.status },
+                    final: false, metadata: updatedTask.metadata
+                };
+                delete workingEvent.status.message;
 
-        // Send current status immediately
-        const currentStatusEvent: A2ATypes.TaskStatusUpdateEvent = {
-            id: task.id,
-           status: { ...task.status },
-            final: ['completed', 'failed', 'canceled'].includes(task.status.state),
-            metadata: task.metadata
-        };
-      delete currentStatusEvent.status.message;
-      const sent = sseService.sendEvent(sseResponse, 'TaskStatusUpdate', currentStatusEvent);
-      if (!sent) {
-           console.error(`[A2ACore] Failed to send initial SSE status event on resubscribe for task ${task.id}. Connection may be closed.`);
-      }
-        console.log(`[A2ACore] Client resubscribed to task ${task.id}`);
+               // 5. Add SSE subscription *before* broadcasting
+               sseManager.addSubscription(updatedTask.id, requestId, sseResponse);
+
+                // 6. Broadcast the 'working' event via SSE ONLY
+               try {
+                    sseManager.broadcast(updatedTask.id, 'TaskStatusUpdate', workingEvent);
+                    console.log(`[A2ACore] Broadcast working SSE status update for task ${updatedTask.id}`);
+               } catch (error) {
+                   console.error(`[A2ACore] Error broadcasting working SSE event for task ${updatedTask.id}:`, error);
+                   sseManager.removeSubscription(updatedTask.id, sseResponse);
+                   if (!sseResponse.closed) sseResponse.end();
+                   // Should we re-throw here? Let's not for now, processor might still run.
+               }
+
+               // 7. Start Processor Resume Asynchronously
+                console.log(`[A2ACore] Executing processor resume for task ${taskToResume.id} (triggered by SSE)...`);
+                this._executeProcessorResume(processor, originalTaskState, params.message, authContext);
+               break;
+           }
+       }
+
+       // Initial task event still needs to go to general notification services (if any)
+       // We don't call _emitTaskEvent here again as the processor start/resume handles subsequent events.
+
+       // Note: Processor execution was already started by _handleTaskInitiation
    }
+
+  async handleTaskResubscribe(
+       requestId: string | number | null, // Added requestId
+       params: A2ATypes.TaskResubscribeParams,
+       sseResponse: express.Response,
+       authContext?: any
+  ): Promise<void> {
+       const sseManager = this._ensureStreamingSupportedOrThrow();
+       const taskId = params.id;
+
+       const task = await this._getTaskOrThrow(taskId); // Ensure task exists
+
+       // Basic validation (can add more checks based on state if needed)
+       if (this._isFinalState(task.status.state)) {
+           // Optionally send a final status event and close?
+           const finalEvent: A2ATypes.TaskStatusUpdateEvent = {
+               id: taskId,
+               status: task.status,
+               final: true,
+               metadata: task.metadata
+           };
+            try {
+               // Try sending a final event formatted correctly before closing
+               // Broadcast will format it using the stored requestId for this connection
+               sseManager.broadcast(taskId, 'TaskStatusUpdate', finalEvent);
+               console.log(`[A2ACore] Broadcast final state (${task.status.state}) on resubscribe for task ${taskId}. Closing connection.`);
+            } catch (e) { console.error(`[A2ACore] Error broadcasting final event on resubscribe for task ${taskId}:`, e); }
+           sseResponse.end();
+           return;
+       }
+
+       // Add subscription
+       sseManager.addSubscription(taskId, requestId, sseResponse); // Correct method call
+       console.log(`[A2ACore] Client resubscribed to task ${taskId}.`);
+
+       // Broadcast the current state immediately.
+       const currentStatusEvent: A2ATypes.TaskStatusUpdateEvent = {
+           id: taskId, status: task.status, final: false, metadata: task.metadata
+       };
+       try {
+           sseManager.broadcast(taskId, 'TaskStatusUpdate', currentStatusEvent);
+           console.log(`[A2ACore] Broadcast current status on resubscribe for task ${taskId}.`);
+       } catch (error) {
+           console.error(`[A2ACore] Error broadcasting current status on resubscribe for task ${taskId}:`, error);
+           // Cleanup if broadcast fails?
+           sseManager.removeSubscription(taskId, sseResponse); // Correct method call
+            if (!sseResponse.closed) sseResponse.end();
+       }
+  }
 
   async handleTaskGet(params: A2ATypes.TaskGetParams, authContext?: any): Promise<A2ATypes.Task> {
     const task = await this._getTaskOrThrow(params.id);
@@ -327,7 +423,7 @@ export class A2AServerCore {
       const statusEvent: A2ATypes.TaskStatusUpdateEvent = {
             id: taskId,
             status: { ...updatedTask.status },
-            final: this._isFinalState(newState),
+            final: this._isFinalState(newState) || newState === 'input-required',
             metadata: updatedTask.metadata
         };
       await this._emitTaskEvent(statusEvent);
@@ -495,14 +591,24 @@ export class A2AServerCore {
 
   // --- Event Emission Logic ---
   private async _emitTaskEvent(event: CoreTaskEvent): Promise<void> {
-      if (this.notificationServices.length === 0) return;
-      console.log(`[A2ACore] Emitting event type '${'status' in event ? 'TaskStatusUpdate' : 'TaskArtifactUpdate'}' for task ${event.id} to notification services.`);
-      const notificationPromises = this.notificationServices
-          .map(service => service.notify(event).catch(err => {
-              console.error(`[A2ACore] Notification service ${service.constructor.name} failed for task ${event.id}:`, err);
-          }));
-      await Promise.all(notificationPromises);
-  }
+        // 1. Send to notification services (includes SseConnectionManager if configured)
+        if (this.notificationServices.length > 0) {
+             const eventType = 'status' in event ? 'TaskStatusUpdate' : 'artifact' in event ? 'TaskArtifactUpdate' : 'Unknown';
+             console.log(`[A2ACore] Emitting event type ${eventType} for task ${event.id} to ${this.notificationServices.length} notification services.`);
+             // Use Promise.allSettled to notify all and log errors without stopping others
+             const results = await Promise.allSettled(
+                 this.notificationServices.map(service => service.notify(event))
+             );
+             results.forEach((result, index) => {
+                 if (result.status === 'rejected') {
+                     const serviceName = this.notificationServices[index]?.constructor?.name || `Service ${index}`;
+                    console.error(`[A2ACore] Error notifying ${serviceName} for task ${event.id}:`, result.reason);
+                 }
+             });
+        } else {
+            // console.log(`[A2ACore] No notification services configured to emit event type ${event.type} for task ${event.id}.`);
+        }
+   }
 
   // --- Utility Methods ---
   private _createError(code: number, message: string, data?: any): Error & { isA2AError: boolean, code: number, data?: any } {
@@ -588,14 +694,16 @@ export class A2AServerCore {
   // --- Capability Check Helpers ---
 
   private _ensureStreamingSupportedOrThrow(): SseConnectionManager {
-      if (!this.agentCard.capabilities.streaming) {
-            throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, `Agent capability check failed: Streaming (SSE) is not supported.`);
+      if (!this.agentCard.capabilities?.streaming) {
+            throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, 'Streaming (SSE) is not supported by this agent.');
       }
-      const sseService = this.notificationServices.find(s => s instanceof SseConnectionManager);
-      if (!sseService) {
-           throw this._createError(A2ATypes.A2AErrorCodes.UnsupportedOperation, "Server configuration error: SSE (streaming) is not enabled.");
+      // Find the SseConnectionManager instance within the configured notification services
+      const manager = this.notificationServices.find(service => service instanceof SseConnectionManager);
+      if (!manager || !(manager instanceof SseConnectionManager)) { // Type guard
+          console.error("[A2ACore] Streaming capability enabled, but SseConnectionManager not found in notificationServices.");
+          throw this._createError(A2ATypes.A2AErrorCodes.InternalError, "Server configuration error: SSE Manager not available.");
       }
-      return sseService as SseConnectionManager;
+      return manager;
   }
 
    private _ensurePushNotificationsSupportedOrThrow(): void {
