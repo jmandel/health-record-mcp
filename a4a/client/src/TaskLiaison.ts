@@ -290,19 +290,17 @@ export class TaskLiaison<TSummaryView extends UserFacingSummaryView, TPromptView
         console.log(`TaskLiaison._handleTaskUpdate: Agent State: ${newAgentState}, Prev Agent State: ${previousAgentState}, Liaison State: ${this._liaisonState}`);
         if (this._liaisonState === 'closed' || this._liaisonState === 'error') return;
 
-        // this._callSummaryViewUpdateStrategy(); 
-
         // --- Handle state transitions --- 
         if (newAgentState === 'input-required' && this._liaisonState !== 'awaiting-input' && this._liaisonState !== 'sending-input') {
             const requiredPrompt = newTask.status.message ?? { role: 'agent', parts: [{ type: 'text', text: 'Input required' }] };
-            
-            // 2. Update liaison state to awaiting-input and emit
-            this._updateLiaisonStateAndEmit('awaiting-input', { task: newTask }); 
 
              // 1. Call prompt view strategy to set prompt UI
             this.updatePromptViewStrategy(this, requiredPrompt); 
-           
-            // 3. STOP - Wait for external call to provideInput
+             
+            // 2. Update liaison state to awaiting-input and emit
+            this._updateLiaisonStateAndEmit('awaiting-input', { task: newTask }); 
+
+           // 3. STOP - Wait for external call to provideInput
             console.log('TaskLiaison: Now in awaiting-input state.');
 
         } else if (newAgentState !== 'input-required' && (this._liaisonState === 'awaiting-input' || this._liaisonState === 'sending-input')) {
@@ -452,6 +450,7 @@ export class TaskLiaison<TSummaryView extends UserFacingSummaryView, TPromptView
      private _defaultUpdatePromptViewStrategy(liaison: TaskLiaison<TSummaryView, TPromptView>, prompt: Message | null): void {
          // Default strategy just wraps the prompt message or sets null
          // A real app might parse the prompt or generate UI elements
+         console.log("TaskLiaison: Updating prompt view with:", prompt);
          const newPromptView = prompt ? { promptMessage: prompt } : null;
          liaison.setPromptView(newPromptView as TPromptView | null); // Use setter
      }

@@ -572,7 +572,7 @@ export class A2AClient {
 
         } catch (error: any) {
             // Handle errors from reader.read() or decoder
-            console.error("A2AClient._processSseStream: Error reading or processing SSE stream:", error);
+            // console.error("A2AClient._processSseStream: Error reading or processing SSE stream:", error.name, error);
              if (this._currentState !== 'closed' && this._currentState !== 'error' && this._currentState !== 'canceling' && this._currentState !== 'sending') {
                  // If error wasn't due to abort/close, attempt reconnect
                  if (error.name !== 'AbortError') {

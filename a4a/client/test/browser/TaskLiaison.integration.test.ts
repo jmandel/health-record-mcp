@@ -64,6 +64,7 @@ async function waitForLiaisonSnapshot<TSummary extends UserFacingSummaryView, TP
             lastSnapshot = snapshot;
             console.log(`waitForLiaisonSnapshot: Checking - State: ${snapshot.liaisonState}, TaskId: ${snapshot.task?.id}`); 
             if (conditionFn(snapshot)) {
+                console.log("waitForLiaisonSnapshot: conditionFn(snapshot) true");
                 clearTimeout(timer);
                 if (listener && liaison) liaison.off('change', listener);
                 resolve(snapshot);
@@ -71,18 +72,12 @@ async function waitForLiaisonSnapshot<TSummary extends UserFacingSummaryView, TP
         };
         const initialSnapshot = liaison.getCurrentSnapshot();
         if (conditionFn(initialSnapshot)) {
+            console.log("waitForLiaisonSnapshot: conditionFn(initialSnapshot) true");
              clearTimeout(timer);
              resolve(initialSnapshot);
              return; 
         }
         liaison.on('change', listener);
-         const snapshotAfterAttach = liaison.getCurrentSnapshot();
-         if (conditionFn(snapshotAfterAttach)) {
-             clearTimeout(timer);
-             if (listener) liaison.off('change', listener);
-             resolve(snapshotAfterAttach);
-             return;
-         }
     });
 }
 
@@ -218,6 +213,7 @@ describe('TaskLiaison (Integration with Joke Agent)', () => {
                 'Liaison did not reach awaiting-input state',
                 LONG_TEST_TIMEOUT
             );
+            console.log("Input Test: Awaiting-input state reached:" + JSON.stringify(inputSnapshot));
             expect(inputSnapshot?.liaisonState).toBe('awaiting-input');
             expect(inputSnapshot?.task?.status?.state).toBe('input-required');
             // Check that the default prompt strategy populated the view
