@@ -351,7 +351,7 @@ describe('A2AClient (Browser vs Joke Agent)', () => {
                  if (finalTask) {
                     console.log(`Polling Cancel Test: Final task state: ${finalTask.status.state}`);
                     expect(finalTask.status.state).toBe('canceled'); // Assert against the actual task state
-                 } 
+                 }
                  console.log('Polling Cancel Test: Client closed successfully after cancel, task state verified.');
 
             } finally {
