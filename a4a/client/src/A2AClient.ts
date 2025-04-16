@@ -193,7 +193,7 @@ export class A2AClient {
             sseInitialReconnectDelayMs: 1000,
             sseMaxReconnectDelayMs: 30000,
             pollMaxErrorAttempts: 3,
-            pollHistoryLength: 0,
+            pollHistoryLength: 50,
             ...config,
         };
         this._currentState = 'idle'; // Initial state before factories run
@@ -829,45 +829,64 @@ export class A2AClient {
         this._abortController = new AbortController(); // Ensure fresh controller
 
         try {
-            let initialTask: Task;
-            if (initialParams) { // Create flow
+            let taskAfterAction: Task; // Task state after the initial send or get
+            if (initialParams) { // Create OR Subsequent Send flow
                 console.log('A2AClient._startPolling: Sending initial tasks/send');
-                 initialTask = await this._request<TaskSendParams, Task>('tasks/send', initialParams);
-                 console.log('A2AClient._startPolling: Received initial task response from send.');
-            } else { // Resume flow
-                console.log('A2AClient._startPolling: Sending initial tasks/get');
+                // Send the action (create or subsequent input)
+                 const sendResultTask = await this._request<TaskSendParams, Task>('tasks/send', initialParams);
+                 console.log('A2AClient._startPolling: Received response from tasks/send.');
+                 
+                 // --- ADDED: Immediate follow-up GET after SEND ---
+                 console.log('A2AClient._startPolling: Performing immediate follow-up tasks/get after send.');
+                 try {
+                    const getParams: TaskGetParams = { id: this.taskId, historyLength: this.config.pollHistoryLength };
+                    taskAfterAction = await this._request<TaskGetParams, Task>('tasks/get', getParams);
+                    console.log('A2AClient._startPolling: Received response from follow-up tasks/get.');
+                 } catch (followUpGetError: any) {
+                    console.error('A2AClient._startPolling: Error during follow-up tasks/get after send:', followUpGetError);
+                    // If the follow-up GET fails, should we proceed with the original send result?
+                    // Or treat it as fatal? Let's treat failure of the GET as fatal for consistency.
+                    throw this._handleFatalError(followUpGetError, 'poll-get'); // Use poll-get context
+                 }
+                 // --- END ADDED GET ---
+
+            } else { // Resume flow (starts with GET)
+                console.log('A2AClient._startPolling: Sending initial tasks/get for resume');
                  const getParams: TaskGetParams = { id: this.taskId, historyLength: this.config.pollHistoryLength };
-                 initialTask = await this._request<TaskGetParams, Task>('tasks/get', getParams);
+                 taskAfterAction = await this._request<TaskGetParams, Task>('tasks/get', getParams);
                  console.log('A2AClient._startPolling: Received initial task response from get.');
             }
 
-            // Set initial state *before* emitting events
-            this._lastKnownTask = initialTask; // No diff needed for first response
+            // Set initial state *before* emitting events, using the result from the (follow-up) GET
+            this._lastKnownTask = taskAfterAction; 
 
-            // Emit synthetic events based on the first full task response
-            this._emitSyntheticEventsFromTask(initialTask);
+            // Emit synthetic events based on the definitive task state
+            this._emitSyntheticEventsFromTask(taskAfterAction);
 
-            // Check initial state for completion or input required
-            if (this._isFinalTaskState(initialTask.status.state)) {
-                const reason = this._getCloseReasonFromState(initialTask.status.state);
-                console.log(`A2AClient._startPolling: Task finished on initial response (${initialTask.status.state}). Closing.`);
+            // Check the definitive state for completion or input required
+            if (this._isFinalTaskState(taskAfterAction.status.state)) {
+                const reason = this._getCloseReasonFromState(taskAfterAction.status.state);
+                console.log(`A2AClient._startPolling: Task finished (${taskAfterAction.status.state}). Closing.`);
                 this._stopCommunication(reason, true); // Emit close
-            } else if (initialTask.status.state === 'input-required') {
-                console.log('A2AClient._startPolling: Task requires input on initial response.');
-                this._setState('input-required', 'initial poll response'); // Set state explicitly
+            } else if (taskAfterAction.status.state === 'input-required') {
+                console.log('A2AClient._startPolling: Task requires input. Stopping poll loop for now.');
+                this._setState('input-required', 'startPolling definitive state'); // Set state explicitly
                 // Do NOT start polling loop
             } else {
                 // Task is active, start polling loop
                 console.log('A2AClient._startPolling: Task active, starting poll loop.');
-                this._setState('polling', 'initial poll response OK');
+                this._setState('polling', 'startPolling definitive state OK');
                 this._pollTaskLoop(); // Start the loop
             }
 
         } catch (error: any) {
-            // Catch errors during initial send/get
-            const context = initialParams ? 'initial-send' : 'initial-get';
-            console.error(`A2AClient._startPolling: Error during initial request (${context}):`, error);
-            this._handleFatalError(error, context);
+            // Catch errors during initial send/get or follow-up get
+            // The context might have been set by _handleFatalError if the follow-up get failed
+            if (!this._isTerminalState(this._currentState)) {
+                const context = initialParams ? 'initial-send' : 'initial-get';
+                console.error(`A2AClient._startPolling: Error during initial request sequence (${context}):`, error);
+                this._handleFatalError(error, context);
+            }
         }
     }
 

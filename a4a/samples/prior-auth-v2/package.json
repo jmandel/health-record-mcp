@@ -1,0 +1,21 @@
+{
+  "name": "prior-auth-agent-v2",
+  "version": "1.0.0",
+  "description": "A2A Prior Authorization Agent using V2 Processor and Gemini",
+  "module": "server.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts",
+    "dev": "bun run --watch server.ts"
+  },
+  "dependencies": {
+    "@google/genai": "^0.8.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/express": "^4.17.21",
+    "@types/cors": "^2.8.17"
+  }
+}

@@ -19,7 +19,8 @@ import {
     JsonRpcError,
     TaskSendParams,
     TaskState,
-    TextPart
+    TextPart,
+    AgentCard
 } from '@a2a/client/src/types';
 
 // --- Hook Configuration & Return Types ---
@@ -58,6 +59,7 @@ export interface TaskLiaisonConfig {
 
 export interface TaskLiaisonResult {
     task: Task | null;
+    agentCard: AgentCard | null;
     summary: LiaisonSummary;
     questionForUser: Message | null;
     clientStatus: LiaisonClientStatus;
@@ -105,6 +107,7 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
     const [error, setError] = useState<Error | JsonRpcError | null>(null);
     const [lastCloseReason, setLastCloseReason] = useState<ClientCloseReason | null>(null);
     const [managedTaskId, setManagedTaskId] = useState<string | null>(initialTaskId ?? null);
+    const [agentCard, setAgentCard] = useState<AgentCard | null>(null);
 
     // State derived for the hook consumer
     const [questionForUser, setQuestionForUser] = useState<Message | null>(null);
@@ -166,6 +169,10 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
                 }
 
                 clientRef.current = localClient;
+                const fetchedCard = clientRef.current?.agentCard;
+                if (isMountedRef.current) {
+                    setAgentCard(fetchedCard ?? null);
+                }
 
                 // --- Register Listeners ---
                 localClient.on('task-update', (payload: TaskUpdatePayload) => {
@@ -302,7 +309,8 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
             setError(null);
             setLastCloseReason(null);
             setQuestionForUser(null);
-            setManagedTaskId(null); // Clear any previous managed ID
+            setManagedTaskId(null);
+            setAgentCard(null);
         }
 
         const finalGetAuth = getAuthHeaders ?? (async () => ({}));
@@ -323,7 +331,11 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
 
             clientRef.current = newClient;
             const newTaskId = newClient.taskId;
-            if (isMountedRef.current) setManagedTaskId(newTaskId);
+            const fetchedCard = newClient.agentCard;
+            if (isMountedRef.current) {
+                 setManagedTaskId(newTaskId);
+                 setAgentCard(fetchedCard ?? null);
+            }
 
             // Re-register listeners for the new client instance
             newClient.on('task-update', (payload: TaskUpdatePayload) => { if (isMountedRef.current) setTask(payload.task); });
@@ -467,6 +479,7 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
 
     return {
         task,
+        agentCard,
         summary,
         questionForUser,
         clientStatus,

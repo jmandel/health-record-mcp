@@ -26,4 +26,4 @@ export { A2AServerCoreV2 } from './core/A2AServerCoreV2';
 // Export Express Integration
 export * from './express/handlers';
 export * from './express/serverSetup';
-export * from './express/serverSetupV2';
+export * from './express/serverV2';
