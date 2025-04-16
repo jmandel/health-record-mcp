@@ -98,6 +98,11 @@ export class A2AServerCore {
 
         // 5. Start Processor Asynchronously (Common)
         console.log(`[A2ACore] Executing processor resume for task ${taskToResume.id}...`);
+        // Store processor name in internal state *before* executing resume
+        const internalState = await this.taskStore.getInternalState(taskToResume.id) ?? {};
+        internalState.a2a_processorName = processor.constructor.name;
+        await this.taskStore.setInternalState(taskToResume.id, internalState);
+
         this._executeProcessorResume(processor, originalTaskState, params.message, authContext);
 
         // 7. Return updated task and event
@@ -120,15 +125,18 @@ export class A2AServerCore {
         }
         console.log(`[A2ACore] Found initial processor ${processor.constructor.name} based on input params.`);
 
-        // 2. Prepare Metadata
+        // 2. Prepare Metadata - Keep original metadata logic
         const taskMetadata = {
              ...(params.metadata || {}),
-            _processorSkillId: params.metadata?.skillId
+             // No longer store processor name here
          };
 
         // 3. Create Task in Store
         const task = await this.taskStore.createOrGetTask({ ...params, metadata: taskMetadata });
         console.log(`[A2ACore] Created/Retrieved task ${task.id} in store.`);
+
+        // 3b. Store processor name in internal state *after* creating task
+        await this.taskStore.setInternalState(task.id, { a2a_processorName: processor.constructor.name });
 
         // 4. Add Initial History
         if (params.message.role) {
@@ -285,6 +293,11 @@ export class A2AServerCore {
 
                // 7. Start Processor Resume Asynchronously
                 console.log(`[A2ACore] Executing processor resume for task ${taskToResume.id} (triggered by SSE)...`);
+                // Store processor name in internal state before executing resume
+                const internalStateResume = await this.taskStore.getInternalState(updatedTask.id) ?? {};
+                internalStateResume.a2a_processorName = processor.constructor.name;
+                await this.taskStore.setInternalState(updatedTask.id, internalStateResume);
+
                 this._executeProcessorResume(processor, originalTaskState, params.message, authContext);
                break;
            }
@@ -374,6 +387,7 @@ export class A2AServerCore {
     }
 
     // Update status immediately (which also emits notification)
+    // No longer need to fetch task specifically to preserve metadata here
     const updatedTask = await this.updateTaskStatus(params.id, 'canceled', params.message);
 
     // Add cancellation request message to history if provided
@@ -411,7 +425,9 @@ export class A2AServerCore {
     await this._getTaskOrThrow(taskId); // Ensure task exists before updating
     const now = new Date().toISOString();
     const statusUpdate: A2ATypes.TaskStatus = { state: newState, timestamp: now, message };
+    // Update only status - internalState and metadata are handled separately
     const updatedTask = await this.taskStore.updateTask(taskId, { status: statusUpdate });
+
     if (!updatedTask) {
         console.error(`[A2ACore] Failed to update status for task ${taskId} - task not found in store.`);
         // This case should theoretically be less likely now due to the check above, but keep for robustness
@@ -422,9 +438,9 @@ export class A2AServerCore {
       // Emit status event for notifications
       const statusEvent: A2ATypes.TaskStatusUpdateEvent = {
             id: taskId,
-            status: { ...updatedTask.status },
+            status: { ...updatedTask.status }, // Status from the updated task
             final: this._isFinalState(newState) || newState === 'input-required',
-            metadata: updatedTask.metadata
+            metadata: updatedTask.metadata // Metadata from the updated task
         };
       await this._emitTaskEvent(statusEvent);
 
@@ -495,22 +511,6 @@ export class A2AServerCore {
         }
         console.log(`[A2ACore] No matching processor found for params.`);
         return null;
-    }
-
-    // Throws InternalError if essential metadata is missing.
-    private _buildLookupParamsForTask(task: A2ATypes.Task): A2ATypes.TaskSendParams {
-        const storedSkillId = task.metadata?._processorSkillId as string | undefined;
-         if (!storedSkillId) {
-             console.error(`[A2ACore] Task ${task.id} is missing the internal _processorSkillId metadata. Cannot look up processor.`);
-             throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Task ${task.id} is missing required skillId metadata.`);
-         }
-         const lookupParams: A2ATypes.TaskSendParams = {
-              message: { role: 'user', parts: [] },
-              metadata: { skillId: storedSkillId },
-              id: task.id,
-              sessionId: task.sessionId
-          };
-         return lookupParams;
     }
 
   // Helper to handle common error pattern in processor execution
@@ -657,6 +657,7 @@ export class A2AServerCore {
                  console.warn(`[TaskUpdater] Task ${taskId} already in final state. Ignoring signalCompletion(${finalStatus}).`);
                 return;
              }
+            // No longer need to fetch task to preserve metadata
             await core.updateTaskStatus(taskId, finalStatus, message);
         },
         async setInternalState(state: any): Promise<void> {
@@ -682,13 +683,35 @@ export class A2AServerCore {
       return task;
   }
 
-  // Helper to find the processor associated with an *existing* task using its stored skillId.
+  // Helper to find the processor associated with an *existing* task using its stored processor name from internalState.
   // Fetches the task internally. Throws if task not found or essential metadata is missing.
   private async _findProcessorForExistingTask(taskId: string): Promise<TaskProcessor | null> {
-    const task = await this._getTaskOrThrow(taskId);
-    // Note: _buildLookupParamsForTask will throw if _processorSkillId is missing
-    const lookupParams = this._buildLookupParamsForTask(task);
-    return this._findProcessor(lookupParams);
+    // Get internal state first, as the task object from getTask might not include it depending on store impl.
+    const internalState = await this.taskStore.getInternalState(taskId);
+    const processorName = internalState?.a2a_processorName as string | undefined;
+
+    if (!processorName) {
+        // Attempt to get the task to provide more context in the error, but the core issue is missing internalState
+        let taskExists = false;
+        try {
+            await this._getTaskOrThrow(taskId);
+            taskExists = true;
+        } catch (e) { /* ignore TaskNotFound error */ }
+
+        console.error(`[A2ACore] Task ${taskId} ${taskExists ? 'exists but' : 'does not exist or'} is missing the internal state property 'a2a_processorName'. Cannot look up processor.`);
+        throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Task ${taskId} is missing required processor name internal state.`);
+    }
+
+    const processor = this.taskProcessors.find(p => p.constructor.name === processorName);
+
+    if (!processor) {
+        console.error(`[A2ACore] No processor instance found with name '${processorName}' for task ${taskId}. Available processors: ${this.taskProcessors.map(p => p.constructor.name).join(', ')}`);
+        // This indicates a server configuration issue (processor registered at startup but maybe removed later?) or state corruption.
+        throw this._createError(A2ATypes.A2AErrorCodes.InternalError, `Configuration error: Processor '${processorName}' for task ${taskId} not found.`);
+    }
+
+    console.log(`[A2ACore] Found existing processor ${processor.constructor.name} for task ${taskId} based on stored internal state.`);
+    return processor;
   }
 
   // --- Capability Check Helpers ---

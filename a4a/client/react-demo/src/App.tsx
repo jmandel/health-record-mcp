@@ -1,12 +1,12 @@
-import React, { useState, useCallback } from 'react';
-import { useTaskLiaison, LiaisonQuestion } from './hooks/useTaskLiaison';
-import { Message, TextPart, Task, TaskSendParams } from '@a2a/client/src/types'; // A2A types
+import React, { useState, useCallback, useMemo } from 'react';
+import { useTaskLiaison } from './hooks/useTaskLiaison';
+import { Message, TextPart, Task, DataPart } from '@a2a/client/src/types'; // A2A types
 import './App.css'; // Keep default styling for now
 
 const JOKE_AGENT_URL = 'http://localhost:3100/a2a'; // Make sure your sample agent runs here
 
 function App() {
-    const [jokeTopic, setJokeTopic] = useState('');
+    const [inputValue, setInputValue] = useState('');
 
     // Custom summary logic for the Joke agent
     const jokeSummaryGenerator = useCallback((task: Task | null) => {
@@ -25,7 +25,7 @@ function App() {
     }, []);
 
     const {
-        task,
+        task: _task,
         summary,
         questionForUser,
         clientStatus,
@@ -36,40 +36,80 @@ function App() {
         taskId
     } = useTaskLiaison({
         agentUrl: JOKE_AGENT_URL,
-        // taskId: null, // Start with no specific task ID
         summaryGenerator: jokeSummaryGenerator,
     });
 
-    const handleStart = useCallback(() => {
-        console.log("Starting joke task...");
-        const params: Omit<TaskSendParams, 'id'> = { // Let hook/client generate ID
-            message: { role: 'user', parts: [{ type: 'text', text: 'Tell me a joke about...' }] },
-            metadata: { skillId: 'jokeAboutTopic' } // Assuming the sample agent uses this skillId
-        };
-        // Reset local state if needed
-        setJokeTopic('');
-        // Call the hook's start function
-        startTask(params).then(newTaskId => {
-             console.log("New task started with ID:", newTaskId);
-             // Persist newTaskId if necessary (e.g., localStorage, URL) - hook handles internal management
-        }).catch(console.error);
-    }, [startTask]);
+    // Define isRunning *before* the callbacks that use it
+    const isRunning = clientStatus !== 'idle' && clientStatus !== 'completed' && clientStatus !== 'error';
 
-    const handleSendTopic = useCallback(() => {
-        if (!questionForUser || !jokeTopic) return;
-        console.log(`Sending topic: ${jokeTopic}`);
-        const message: Message = { role: 'user', parts: [{ type: 'text', text: jokeTopic }] };
-        sendInput(message)
-            .then(() => setJokeTopic('')) // Clear input on success
+    // --- App-specific logic to interpret the questionForUser Message --- 
+    const promptText = useMemo(() => {
+        if (!questionForUser) return '\u00A0'; // Return non-breaking space if no question
+        // Find the first text part in the message
+        const textPart = questionForUser.parts.find(p => p.type === 'text') as TextPart | undefined;
+        return textPart?.text || 'Input required'; // Fallback text
+    }, [questionForUser]);
+
+    const currentOptions = useMemo(() => {
+        if (!questionForUser) return null;
+        // Find the first data part
+        const dataPart = questionForUser.parts.find(p => p.type === 'data') as DataPart | undefined;
+        // Check if it has an 'options' array
+        if (dataPart?.data && Array.isArray(dataPart.data.options)) {
+            return dataPart.data.options as string[];
+        }
+        return null;
+    }, [questionForUser]);
+    // --- End App-specific logic --- 
+
+    // Generic submission handler - now constructs the Message
+    const handleSubmit = useCallback((valueToSubmit?: string) => {
+        const finalValue = valueToSubmit ?? inputValue;
+        if (!finalValue || clientStatus !== 'awaiting-input') return;
+
+        console.log(`Constructing message for value: ${finalValue}`);
+        // Construct the standard message structure here
+        const message: Message = { 
+            role: 'user', 
+            parts: [{ type: 'text', text: finalValue }] 
+            // If App needed to send other parts, logic would go here
+        };
+
+        sendInput(message) // Call the hook's sendInput
+            .then(() => setInputValue('')) // Clear input on success
             .catch(console.error);
-    }, [sendInput, questionForUser, jokeTopic]);
+    }, [sendInput, inputValue, clientStatus]); // Use sendInput dependency
+
+    // Handler for input changes - includes auto-submit logic specific to this App
+    const handleInputChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+        const newValue = event.target.value;
+        setInputValue(newValue);
+        if (currentOptions && currentOptions.includes(newValue)) {
+            console.log(`Auto-submitting selected option: ${newValue}`);
+            handleSubmit(newValue); // Pass the string value to handleSubmit
+        }
+    }, [currentOptions, handleSubmit]);
+
+    // Handler for Enter key press
+    const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === 'Enter' && clientStatus === 'awaiting-input' && isRunning && inputValue) {
+            event.preventDefault();
+            console.log("Enter key pressed, submitting value...");
+            handleSubmit(); // Calls handleSubmit with current inputValue
+        }
+    }, [clientStatus, isRunning, inputValue, handleSubmit]);
+
+    const handleStart = useCallback(() => {
+        setInputValue(''); 
+        console.log("Starting joke task...");
+        // Start with a generic message, agent determines if input is needed
+        startTask({ message: { role: 'user', parts: [{ type: 'text', text: 'Tell me a joke' }] } })
+             .catch(console.error);
+    }, [startTask]);
 
     const handleCancel = useCallback(() => {
         cancelTask().catch(console.error);
     }, [cancelTask]);
-
-    // Determine if the task interaction is ongoing
-    const isRunning = clientStatus !== 'idle' && clientStatus !== 'completed' && clientStatus !== 'error';
 
     return (
         <div className="App">
@@ -77,49 +117,65 @@ function App() {
             <p>Agent URL: <code>{JOKE_AGENT_URL}</code></p>
 
             <div className="card">
-                <h2>Task Liaison</h2>
-                <p>
-                    Status: <strong>{summary.label}</strong> {summary.icon} <br/>
-                    <small>(Client: {clientStatus} {taskId ? `| Task: ${taskId}` : ''})</small>
-                </p>
-                {summary.detail && (
-                    <p style={{ fontStyle: 'italic', background: '#eee', padding: '10px', borderRadius: '5px' }}>
-                        {summary.detail}
-                    </p>
-                )}
-
-                {error && <p style={{ color: 'red' }}>Error: {error.message}</p>}
-
-                {/* Show Start button only when idle */}
-                {clientStatus === 'idle' && (
-                    <button onClick={handleStart}>Tell me a joke</button>
-                )}
-
-                {/* Show input section when awaiting input */}
-                {clientStatus === 'awaiting-input' && questionForUser && (
-                    <div style={{ marginTop: '15px', borderTop: '1px solid #ccc', paddingTop: '15px' }}>
-                        <label htmlFor="jokeTopicInput">{questionForUser.prompt}</label><br />
-                        <input
-                            id="jokeTopicInput"
-                            type="text"
-                            value={jokeTopic}
-                            onChange={(e) => setJokeTopic(e.target.value)}
-                            placeholder="Enter joke topic"
-                            disabled={!isRunning} // Should be true if awaiting-input
-                            style={{ marginRight: '5px' }}
-                        />
-                        <button onClick={handleSendTopic} disabled={!isRunning || !jokeTopic}>
-                            Send Topic
-                        </button>
+                <div>
+                    <h2>Task Liaison</h2>
+                    <div className="status-display">
+                        <p>
+                            Status: <strong>{summary.label}</strong> {summary.icon} <br/>
+                            <small>(Client: {clientStatus} {taskId ? `| Task: ${taskId}` : ''})</small>
+                        </p>
+                        {summary.detail && (
+                            <p className="summary-detail">
+                                {summary.detail}
+                            </p>
+                        )}
                     </div>
-                )}
 
-                {/* Show Cancel button when running and not awaiting input */}
-                {isRunning && clientStatus !== 'awaiting-input' && (
-                    <button onClick={handleCancel} style={{ marginLeft: '10px', background: '#ffdddd' }}>
-                        Cancel Task
+                    {error && <p className="error-message">Error: {error.message}</p>}
+                </div>
+
+                <div className="controls-wrapper">
+                    <div className="controls-area">
+                        {clientStatus === 'idle' && (
+                            <button onClick={handleStart}>Tell me a joke</button>
+                        )}
+
+                        {isRunning && clientStatus !== 'awaiting-input' && (
+                            <button onClick={handleCancel} className="cancel-button">
+                                Cancel Task
+                            </button>
+                        )}
+                    </div>
+                </div>
+
+                <div className={`input-section ${clientStatus === 'awaiting-input' && questionForUser ? 'active' : ''}`}>
+                    <label htmlFor="genericInput">
+                        {promptText}
+                    </label>
+                    <input
+                        id="genericInput"
+                        type="text"
+                        value={inputValue}
+                        onChange={handleInputChange}
+                        onKeyDown={handleKeyDown}
+                        placeholder={promptText.trim() || "Enter input"}
+                        disabled={clientStatus !== 'awaiting-input' || !isRunning}
+                        list={currentOptions ? "inputOptions" : undefined}
+                    />
+                    {currentOptions && (
+                        <datalist id="inputOptions">
+                            {currentOptions.map((option) => (
+                                <option key={option} value={option} />
+                            ))}
+                        </datalist>
+                    )}
+                    <button
+                        onClick={() => handleSubmit()}
+                        disabled={clientStatus !== 'awaiting-input' || !isRunning || !inputValue}
+                    >
+                        Send
                     </button>
-                )}
+                </div>
             </div>
 
             {/* Optional: Display raw task state for debugging */}

@@ -18,7 +18,8 @@ import {
     Message,
     JsonRpcError,
     TaskSendParams,
-    TaskState
+    TaskState,
+    TextPart
 } from '@a2a/client/src/types';
 
 // --- Hook Configuration & Return Types ---
@@ -42,19 +43,12 @@ export interface LiaisonSummary {
     detail?: string;
 }
 
-export interface LiaisonQuestion {
-    id: string; // Unique ID for this question instance
-    prompt: string;
-    schema?: any; // Optional schema for structured input
-    rawMessage: Message; // The original agent message
-}
-
 export interface TaskLiaisonConfig {
     taskId?: string | null; // Task to resume
     agentUrl: string;
     initialParams?: TaskSendParams | null; // Params to auto-start a new task on mount
     getAuthHeaders?: () => Record<string, string> | Promise<Record<string, string>>; // Made optional
-    autoInputHandler?: (question: LiaisonQuestion) => Promise<Message | null>;
+    autoInputHandler?: (question: Message) => Promise<Message | null>;
     summaryGenerator?: (task: Task | null) => LiaisonSummary;
     // Include relevant A2AClientConfig options to pass through
     forcePoll?: boolean;
@@ -65,13 +59,13 @@ export interface TaskLiaisonConfig {
 export interface TaskLiaisonResult {
     task: Task | null;
     summary: LiaisonSummary;
-    questionForUser: LiaisonQuestion | null;
+    questionForUser: Message | null;
     clientStatus: LiaisonClientStatus;
     error: Error | JsonRpcError | null;
-    startTask: (params: Omit<TaskSendParams, 'id'>) => Promise<string | undefined>; // Returns Task ID
+    startTask: (params: Omit<TaskSendParams, 'id'>) => Promise<string | undefined>;
     sendInput: (message: Message) => Promise<void>;
     cancelTask: () => Promise<void>;
-    taskId: string | null; // Expose the managed task ID
+    taskId: string | null;
 }
 
 // --- Default Summary Generator ---
@@ -113,7 +107,7 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
     const [managedTaskId, setManagedTaskId] = useState<string | null>(initialTaskId ?? null);
 
     // State derived for the hook consumer
-    const [questionForUser, setQuestionForUser] = useState<LiaisonQuestion | null>(null);
+    const [questionForUser, setQuestionForUser] = useState<Message | null>(null);
 
     // --- Client Lifecycle Management ---
 
@@ -179,21 +173,14 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
                 });
                 localClient.on('status-update', (payload: StatusUpdatePayload) => {
                     if (!isMountedRef.current) return;
-                    setInternalClientState(localClient?.getCurrentState() ?? 'error'); // Sync internal state
-                    setTask(payload.task); // Also update task on status change
+                    setInternalClientState(localClient?.getCurrentState() ?? 'error');
+                    setTask(payload.task);
 
+                    // Pass the raw message if input is required
                     if (payload.status.state === 'input-required') {
-                         // Attempt auto-handling first
-                        const question: LiaisonQuestion = {
-                            id: crypto.randomUUID(), // Give each question instance a unique ID
-                            prompt: (payload.task.status.message?.parts.find(p => p.type === 'text') as any)?.text || 'Input required',
-                            schema: (payload.task.status.message?.parts.find(p => p.type === 'data') as any)?.data, // Example assumes schema in data part
-                            rawMessage: payload.task.status.message!,
-                        };
-                        handleInputRequired(question);
+                        setQuestionForUser(payload.task.status.message ?? null);
                     } else {
-                         // If state is no longer input-required, clear any pending question
-                         setQuestionForUser(null);
+                        setQuestionForUser(null);
                     }
                 });
                  localClient.on('artifact-update', (payload: ArtifactUpdatePayload) => {
@@ -220,17 +207,11 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
                 // Set initial state after registering listeners
                 setInternalClientState(localClient.getCurrentState());
                 setTask(localClient.getCurrentTask()); // Get initial task state if available after resume/create
-                 // Check initial state immediately (e.g., if resume found input-required)
-                 const initialState = localClient.getCurrentState();
+                 // Check initial state immediately
                  const initialTaskState = localClient.getCurrentTask();
-                 if (initialState === 'input-required' && initialTaskState?.status.message) {
-                      const initialQuestion: LiaisonQuestion = {
-                         id: crypto.randomUUID(),
-                         prompt: (initialTaskState.status.message.parts.find(p => p.type === 'text') as any)?.text || 'Input required',
-                         schema: (initialTaskState.status.message.parts.find(p => p.type === 'data') as any)?.data,
-                         rawMessage: initialTaskState.status.message,
-                     };
-                     handleInputRequired(initialQuestion);
+                 if (localClient.getCurrentState() === 'input-required') {
+                    // Pass the raw message
+                    setQuestionForUser(initialTaskState?.status.message ?? null);
                  }
 
 
@@ -265,7 +246,7 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
     ]);
 
     // --- Automatic Input Handling ---
-    const handleInputRequired = useCallback(async (question: LiaisonQuestion) => {
+    const handleInputRequired = useCallback(async (question: Message) => {
         if (!autoInputHandler || !clientRef.current) {
             // No handler or client gone, expose question to user
             if (isMountedRef.current) setQuestionForUser(question);
@@ -350,9 +331,9 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
                  if (!isMountedRef.current) return;
                  setInternalClientState(newClient.getCurrentState());
                  setTask(payload.task);
+                 // Pass the raw message if input is required
                  if (payload.status.state === 'input-required') {
-                     const question: LiaisonQuestion = { /* ... create question ... */ id: crypto.randomUUID(), prompt: 'Input required', rawMessage: payload.task.status.message!, schema: undefined };
-                     handleInputRequired(question);
+                    setQuestionForUser(payload.task.status.message ?? null);
                  } else { setQuestionForUser(null); }
             });
             newClient.on('artifact-update', (payload: ArtifactUpdatePayload) => { if (isMountedRef.current) setTask(payload.task); });
@@ -365,11 +346,9 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
                  setInternalClientState(newClient.getCurrentState());
                  setTask(newClient.getCurrentTask());
                  // Check initial state immediately
-                 const initialState = newClient.getCurrentState();
-                 const initialTaskState = newClient.getCurrentTask();
-                 if (initialState === 'input-required' && initialTaskState?.status.message) {
-                    const initialQuestion: LiaisonQuestion = { /* ... create question ... */ id: crypto.randomUUID(), prompt: 'Input required', rawMessage: initialTaskState.status.message, schema: undefined };
-                    handleInputRequired(initialQuestion);
+                 if (newClient.getCurrentState() === 'input-required') {
+                    // Pass the raw message
+                    setQuestionForUser(newClient.getCurrentTask()?.status.message ?? null);
                  }
             }
 
@@ -385,40 +364,41 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
         }
     }, [agentUrl, clientConfigOptions, handleInputRequired]); // Dependencies for startTask - removed getAuthHeaders
 
+    // This function now becomes the exported sendInput
     const sendInput = useCallback(async (message: Message) => {
+        // Check message structure minimally (optional)
+        if (!message || typeof message !== 'object' || !message.role || !Array.isArray(message.parts)) {
+             console.error("useTaskLiaison: Invalid message object passed to sendInput.", message);
+             throw new Error("Invalid message format provided to sendInput.");
+         }
+
         if (!clientRef.current) {
             throw new Error("Cannot send input, client not active.");
         }
-        // Check the *actual* client state from A2AClient directly if possible,
-        // fallback to the hook's internal state.
         const currentClientLibState = clientRef.current?.getCurrentState();
-        if (currentClientLibState !== 'input-required' && internalClientState !== 'input-required') {
-            console.warn(`useTaskLiaison: Sending input while client state is ${currentClientLibState} (hook state: ${internalClientState})`);
+        if (currentClientLibState !== 'input-required') {
+             console.warn(`useTaskLiaison: Sending input while client state is ${currentClientLibState}`);
         }
-
-        console.log("useTaskLiaison: Sending input...");
-         if (isMountedRef.current) {
-             setError(null); // Clear error before sending
-             setQuestionForUser(null); // Clear question once input is sent
-             // Optionally set intermediate 'sending' state? A2AClient handles internal state.
-         }
+        console.log("useTaskLiaison: Sending input message...");
+        if (isMountedRef.current) {
+            setError(null);
+            setQuestionForUser(null);
+        }
         try {
-            // A2AClient handles state transitions internally based on send outcome
             await clientRef.current.send(message);
-             console.log("useTaskLiaison: Send input successful (client managing state).");
-             // Update state based on client events triggered by send
-             if (isMountedRef.current) {
-                  setInternalClientState(clientRef.current?.getCurrentState() ?? internalClientState);
-             }
+            console.log("useTaskLiaison: Send input successful.");
+            if (isMountedRef.current) {
+                 setInternalClientState(clientRef.current?.getCurrentState() ?? internalClientState);
+            }
         } catch (err: any) {
             console.error("useTaskLiaison: Error sending input:", err);
             if (isMountedRef.current) {
                 setError(err);
                 setInternalClientState(clientRef.current?.getCurrentState() ?? 'error');
             }
-            // Re-throw error? Or let the caller handle it via the main 'error' state? Let error state handle it.
+            // Re-throw or handle as needed - maybe just let error state reflect it
         }
-    }, [internalClientState]); // Dependency on internalClientState might cause issues if lagging? Check clientRef.current.state?
+    }, [internalClientState]); // Dependency remains internal state for now
 
     const cancelTask = useCallback(async () => {
         if (!clientRef.current) {
@@ -492,8 +472,8 @@ export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
         clientStatus,
         error,
         startTask,
-        sendInput,
+        sendInput, // Export sendInput again
         cancelTask,
-        taskId: managedTaskId, // Expose the ID being managed
+        taskId: managedTaskId,
     };
 }
