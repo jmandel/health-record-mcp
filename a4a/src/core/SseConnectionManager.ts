@@ -1,6 +1,7 @@
 import type * as express from 'express';
 import type * as A2ATypes from '../types'; // For event types
 import type { NotificationService, CoreTaskEvent } from '../interfaces'; // Import interface and event type
+import { EventEmitter } from 'events';
 
 // Define the structure for storing SSE subscription info
 interface SseSubscriptionInfo {
@@ -20,20 +21,18 @@ export class SseConnectionManager implements NotificationService { // <-- Implem
      * Adds a new SSE subscription for a given task ID.
      * Sets up keep-alive messages and handles connection closure.
      */
-    addSubscription(taskId: string, requestId: string | number | null, res: express.Response): void {
+    addSubscription(taskId: string, requestId: string | number | null, res: express.Response & EventEmitter): void {
         let taskSubscriptions = this.subscriptions.get(taskId);
         if (!taskSubscriptions) {
             taskSubscriptions = [];
             this.subscriptions.set(taskId, taskSubscriptions);
         }
 
-        // Avoid adding the same response object multiple times
         if (taskSubscriptions.some(sub => sub.res === res)) {
             console.warn(`[SseManager] Attempted to add duplicate SSE subscription for task ${taskId}.`);
             return;
         }
 
-        // Keep connection alive with periodic comments
         const keepAliveInterval = setInterval(() => {
             if (!res.closed) {
                 this.sendKeepAliveComment(res);
@@ -48,25 +47,36 @@ export class SseConnectionManager implements NotificationService { // <-- Implem
         taskSubscriptions.push(newSubscription);
         console.log(`[SseManager] Added SSE subscription for task ${taskId}. Total: ${taskSubscriptions.length}`);
 
-        res.once('close', () => {
-            console.log(`[SseManager] SSE connection closed by client for task ${taskId}.`);
-            clearInterval(keepAliveInterval); // Clear interval on close
-            this.removeSubscription(taskId, res);
-        });
+        let closeListenerExecuted = false; // Flag to ensure listener runs only once
+        const closeListener = () => {
+             if (closeListenerExecuted) return;
+             closeListenerExecuted = true;
+             console.log(`[SseManager] SSE connection closed by client for task ${taskId}.`);
+             clearInterval(keepAliveInterval);
+             this.removeSubscription(taskId, res);
+             // No need to explicitly remove the listener here if removeSubscription handles it,
+             // but good practice if res might persist.
+             // res.removeListener('close', closeListener);
+         };
+        res.on('close', closeListener);
     }
 
     /**
      * Removes an SSE subscription for a given task ID and response object.
      * Clears the keep-alive interval associated with the subscription.
      */
-    removeSubscription(taskId: string, resToRemove: express.Response): void {
+    removeSubscription(taskId: string, resToRemove: express.Response & EventEmitter): void {
         const taskSubscriptions = this.subscriptions.get(taskId);
         if (!taskSubscriptions) return;
 
         const index = taskSubscriptions.findIndex(sub => sub.res === resToRemove);
         if (index !== -1) {
             const [removedSubscription] = taskSubscriptions.splice(index, 1);
-            clearInterval(removedSubscription.intervalId); // Ensure interval is cleared
+            clearInterval(removedSubscription.intervalId);
+             // Try removing the 'close' listener we added, though the emitter might be gone
+             try {
+                 resToRemove.removeListener('close', () => {}); // Pass a dummy or find the real one if stored
+             } catch (e) { /* ignore error if listener removal fails */ }
             console.log(`[SseManager] Removed SSE subscription for task ${taskId}. Remaining: ${taskSubscriptions.length}`);
 
             if (taskSubscriptions.length === 0) {
@@ -74,7 +84,6 @@ export class SseConnectionManager implements NotificationService { // <-- Implem
                 console.log(`[SseManager] No more SSE subscriptions for task ${taskId}.`);
             }
         } else {
-            // This might happen if closed handler triggers remove after interval handler already did
             // console.warn(`[SseManager] Attempted to remove non-existent subscription for task ${taskId}.`);
         }
     }
@@ -116,40 +125,56 @@ export class SseConnectionManager implements NotificationService { // <-- Implem
     /**
      * Broadcasts an SSE event data payload to all active subscribers for a specific task ID.
      * Formats the event according to JSON-RPC 2.0 spec before sending.
-     * Omits the 'event:' line, sending only the 'data:' line.
+     * If the event marks the end of the stream (`final: true`), closes the connections after sending.
      */
-    broadcast(taskId: string, _eventType: string, data: any): void { // _eventType is now unused
+    broadcast(taskId: string, _eventType: string, data: any & { final?: boolean }): void { // Check for final flag in data
         const taskSubscriptions = this.subscriptions.get(taskId);
         if (!taskSubscriptions || taskSubscriptions.length === 0) {
             return;
         }
 
-        // Determine the type for logging purposes only
         const logEventType = 'status' in data ? 'TaskStatusUpdate' : 'artifact' in data ? 'TaskArtifactUpdate' : 'Unknown';
-        console.log(`[SseManager] Broadcasting ${logEventType} data to ${taskSubscriptions.length} subscribers for task ${taskId}.`);
+        const isFinalEvent = data.final === true;
+        console.log(`[SseManager] Broadcasting ${logEventType} data (final: ${isFinalEvent}) to ${taskSubscriptions.length} subscribers for task ${taskId}.`);
 
-        // Iterate over a copy in case of modifications during send/error handling
+        const subsToClose: SseSubscriptionInfo[] = [];
+
+        // Iterate over a copy
         const activeSubs = [...taskSubscriptions];
         activeSubs.forEach(subInfo => {
-            // Format the data according to JSON-RPC 2.0 response structure
             const jsonRpcPayload = {
                 jsonrpc: "2.0",
                 id: subInfo.requestId, // Use the stored request ID
                 result: data // The actual event data (TaskStatusUpdateEvent or TaskArtifactUpdateEvent)
             };
-
-            // Only construct the data line
             const dataLine = `data: ${JSON.stringify(jsonRpcPayload)}\n\n`;
-
-            // Send only the data line using the updated method
             const success = this.sendSseDataString(subInfo.res, dataLine);
-            if (!success) {
-                // If sending failed, maybe the connection died without triggering 'close'
-                // Attempt cleanup proactively
-                console.warn(`[SseManager] Failed sending SSE data to subscriber for task ${taskId}. Removing potentially dead subscription.`);
-                this.removeSubscription(taskId, subInfo.res);
+
+            if (!success || isFinalEvent) {
+                 // If sending failed OR if this is the final event, prepare to close/remove.
+                 if (!success) {
+                     console.warn(`[SseManager] Failed sending SSE data to subscriber for task ${taskId}. Marking for removal.`);
+                 }
+                 // Add to list even if send was successful, if it's the final event.
+                 subsToClose.push(subInfo);
             }
         });
+
+         // Clean up connections that failed or received the final event
+         subsToClose.forEach(subInfo => {
+             try {
+                 // Ensure interval is cleared before potentially closing
+                 clearInterval(subInfo.intervalId); 
+                 if (!subInfo.res.closed) {
+                     console.log(`[SseManager] Closing SSE connection for task ${taskId} (reqId: ${subInfo.requestId}) after final event or send failure.`);
+                     subInfo.res.end(); // Close the connection
+                 }
+             } catch (closeError) {
+                 console.error(`[SseManager] Error ending response stream for task ${taskId}:`, closeError);
+             }
+             // Remove subscription regardless of close error
+             this.removeSubscription(taskId, subInfo.res);
+         });
     }
 
     /**

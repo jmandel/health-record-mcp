@@ -1,20 +1,29 @@
 // Export Core Types
 export * from './types';
 
-// Export Interfaces
+// Export Interfaces (V1)
 export * from './interfaces';
+
+// --- V2 Interfaces ---
+export type { 
+    TaskProcessorV2, 
+    ProcessorYieldValue, 
+    YieldStatusUpdate, 
+    YieldArtifact, 
+    ProcessorInputValue, 
+    ProcessorInputMessage, 
+    ProcessorInputInternal 
+} from './interfaces/processorV2';
+export { ProcessorCancellationError } from './interfaces/processorV2';
 
 // Export Implementations
 export * from './persistence/InMemoryTaskStore';
 
-// Export Core Logic (optional, maybe hide implementation details)
-// export * from './core/A2AServerCore'; // If users need direct access
+// Export Core Logic
+export { A2AServerCore } from './core/A2AServerCore';
+export { A2AServerCoreV2 } from './core/A2AServerCoreV2';
 
 // Export Express Integration
 export * from './express/handlers';
-
-// Export Core Class for configuration (useful if handlers are not sufficient)
-export { A2AServerCore } from './core/A2AServerCore';
-
-// Export the new server setup helper
 export * from './express/serverSetup';
+export * from './express/serverSetupV2';
