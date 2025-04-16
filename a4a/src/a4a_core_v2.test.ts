@@ -164,7 +164,7 @@ beforeAll(() => {
             const url = new URL(req.url);
             if (req.method === 'GET' && url.pathname === agentCardPath) {
                 // Core now holds the complete card
-                return Response.json(core.getAgentCard()); 
+                return Response.json(core.getAgentCard());
             }
             if (req.method === 'POST' && url.pathname === rpcPath) {
                  if (req.headers.get('content-type') !== 'application/json') {
@@ -190,7 +190,7 @@ beforeAll(() => {
                          const sseEmitter = new EventEmitter();
                          let connectionClosed = false;
 
-                         const responseStream = new ReadableStream({ 
+                         const responseStream = new ReadableStream({
                              start(controller) { // Controller is defined here
 
                                  // --- Define fakeRes INSIDE start to capture controller --- //
@@ -199,17 +199,17 @@ beforeAll(() => {
                                       _headers: {} as Record<string, string>,
                                       setHeader: (name: string, value: string) => { fakeRes._headers[name.toLowerCase()] = value; },
                                       flushHeaders: () => { fakeRes.headersSent = true; },
-                                      write: (chunk: string) => { 
+                                      write: (chunk: string) => {
                                           if (connectionClosed) return;
                                           const formattedChunk = chunk.endsWith('\n') ? chunk : chunk + '\n';
                                           // Now controller is in scope
                                           try { controller.enqueue(formattedChunk); } catch (e) { console.error("SSE enqueue error", e); }
                                       },
-                                      end: () => { 
+                                      end: () => {
                                            if (connectionClosed) return;
                                            connectionClosed = true;
                                            // Now controller is in scope
-                                           try { controller.close(); } catch (e) { /* Ignore */ }
+                                          try { controller.close(); } catch (e) { /* Ignore */ }
                                            sseEmitter.emit('close'); 
                                       },
                                       on: (event: string, listener: (...args: any[]) => void) => sseEmitter.on(event, listener),
@@ -228,7 +228,7 @@ beforeAll(() => {
                                           .catch(err => { console.error("SSE resub Handler Error:", err); controller.error(err); });
                                  }
                              },
-                             cancel(reason) { 
+                             cancel(reason) {
                                  console.log("SSE Stream Cancelled by client:", reason);
                                  connectionClosed = true;
                                  sseEmitter.emit('close'); 
@@ -357,11 +357,10 @@ describe("A2A Server Core V2 - Basic Tests", () => {
             metadata: { skillId: 'counter' }
         }, "count-task-1");
         expect(res1.status).toEqual(200);
-        // Add type cast
         const jsonRes1 = await res1.json() as A2ATypes.JsonRpcSuccessResponse<{ id: string, status: A2ATypes.TaskStatus }>; 
         expect(jsonRes1.result.id).toBeString();
         const taskId = jsonRes1.result.id;
-        expect(jsonRes1.result.status.state).toEqual('working'); // Initial state set by core
+        expect(jsonRes1.result.status.state).toEqual('working'); 
 
         // Wait for processor to yield input-required
         await Bun.sleep(50);
@@ -369,10 +368,8 @@ describe("A2A Server Core V2 - Basic Tests", () => {
         // Check store state is input-required
         const getRes1 = await makeA2ARequest('tasks/get', { id: taskId });
         expect(getRes1.status).toEqual(200);
-        // Add type cast
         const getJson1 = await getRes1.json() as A2ATypes.JsonRpcSuccessResponse<A2ATypes.Task>; 
         expect(getJson1.result.status.state).toEqual('input-required');
-         // Type guard before accessing .text
          const statusPart1 = getJson1.result.status.message?.parts?.[0];
          expect(statusPart1?.type).toEqual('text');
          if (statusPart1?.type === 'text') {
@@ -382,12 +379,11 @@ describe("A2A Server Core V2 - Basic Tests", () => {
         // 2. Send input
          const numToAdd = 5;
          const res2 = await makeA2ARequest('tasks/send', {
-             id: taskId, // Resume the same task
+             id: taskId, 
              message: { role: 'user', parts: [{ type: 'text', text: String(numToAdd) }] },
-             metadata: { skillId: 'counter' } // Metadata might be ignored on resume by core, but good practice
+             metadata: { skillId: 'counter' } 
          }, "count-task-2");
          expect(res2.status).toEqual(200);
-         // Add type cast
          const jsonRes2 = await res2.json() as A2ATypes.JsonRpcSuccessResponse<{ id: string }>; 
           expect(jsonRes2.result.id).toEqual(taskId);
 
@@ -397,17 +393,26 @@ describe("A2A Server Core V2 - Basic Tests", () => {
          // 3. Get final state
          const getRes2 = await makeA2ARequest('tasks/get', { id: taskId });
          expect(getRes2.status).toEqual(200);
-         // Add type cast
          const getJson2 = await getRes2.json() as A2ATypes.JsonRpcSuccessResponse<A2ATypes.Task>; 
          expect(getJson2.result.status.state).toEqual('completed');
          expect(getJson2.result.artifacts).toBeArray();
          expect(getJson2.result.artifacts?.length).toBe(1);
-         // Type guard before accessing .text
-         const artifactPart2 = getJson2.result.artifacts?.[0]?.parts?.[0];
+         const finalArtifact = getJson2.result.artifacts?.[0];
+         expect(finalArtifact?.name).toEqual('final-count');
+         
+         // Verify artifact content
+         const artifactPart2 = finalArtifact?.parts?.[0];
          expect(artifactPart2?.type).toEqual('text');
          if (artifactPart2?.type === 'text') {
              expect(artifactPart2.text).toEqual(`Final Count: ${numToAdd}`);
          }
+         
+         // --- CONTEXT TEST --- //
+         // Verify the history length observed by the processor (passed via metadata)
+         expect(finalArtifact?.metadata?.historyLengthObserved).toBeGreaterThanOrEqual(3); 
+         // Expected history before input: [user-start, agent-working, agent-inputReq]
+         // The user message with the number (numToAdd) is added *after* the processor resumes
+         // So the context passed to the step *after* input-required should have >= 3 items
      });
 
       it("should handle tasks/cancel", async () => {
@@ -464,7 +469,7 @@ describe("A2A Server Core V2 - Streaming Tests", () => {
          const artifactUpdates = events.filter(e => e.artifact);
 
          expect(statusUpdates[0]?.status?.state).toEqual('working');
-         expect(artifactUpdates.length).toEqual(3);
+          expect(artifactUpdates.length).toEqual(3);
          expect(artifactUpdates.some(e => e.artifact?.parts?.[0]?.type === 'text' && e.artifact.parts[0].text === 'Part 1')).toBe(true);
          expect(artifactUpdates.some(e => e.artifact?.parts?.[0]?.type === 'text' && e.artifact.parts[0].text === 'Part 2')).toBe(true);
          expect(artifactUpdates.some(e => e.artifact?.parts?.[0]?.type === 'text' && e.artifact.parts[0].text === 'Part 3')).toBe(true);
@@ -476,9 +481,9 @@ describe("A2A Server Core V2 - Streaming Tests", () => {
          const taskId = events[0]?.id;
          expect(taskId).toBeString(); 
          if (taskId) {
-             const getRes = await makeA2ARequest('tasks/get', { id: taskId });
+         const getRes = await makeA2ARequest('tasks/get', { id: taskId });
              const getJson = await getRes.json() as A2ATypes.JsonRpcSuccessResponse<A2ATypes.Task>; 
-             expect(getJson.result.status.state).toEqual('completed');
+         expect(getJson.result.status.state).toEqual('completed');
          }
      });
 

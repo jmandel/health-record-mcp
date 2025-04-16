@@ -47,6 +47,15 @@ export class ProcessorCancellationError extends Error {
 }
 
 
+// --- Context Passed and MUTATED on Each Step ---
+export interface ProcessorStepContext {
+    /** The current state of the task, including history if requested or needed. */
+    task: Task;
+    /** Optional flag indicating if cancellation has been requested for this task. */
+    isCanceling?: boolean;
+}
+
+
 // --- New TaskProcessor Interface ---
 
 export interface TaskProcessorV2 {
@@ -60,13 +69,14 @@ export interface TaskProcessorV2 {
 
     /**
      * Processes the task logic as an async generator.
+     * - Receives an initial context object which is MUTATED by the core before each step.
      * - Yields status updates, artifacts, or input requests.
      * - Receives subsequent messages or internal updates via generator.next().
      * - Handles cancellation via generator.throw(new ProcessorCancellationError()).
      * - Normal completion signals 'completed' status.
      * - Throwing any other error signals 'failed' status.
      *
-     * @param initialTask The initial state of the Task (might be newly created or existing).
+     * @param context The context object. Core updates `context.task` before each step.
      * @param initialParams The parameters from the first tasks/send or tasks/sendSubscribe call.
      * @param authContext Optional authentication context.
      * @returns A Promise that resolves when the generator completes successfully.
@@ -76,11 +86,11 @@ export interface TaskProcessorV2 {
      * @receives {ProcessorInputValue | undefined} Input for subsequent steps.
      */
     process(
-        initialTask: Task,
+        context: ProcessorStepContext,
         initialParams: TaskSendParams,
         authContext?: any
     ): AsyncGenerator<ProcessorYieldValue, void, ProcessorInputValue>;
 
     // Optional: Explicitly declare capabilities if needed
-    // supportsInternalUpdates?: boolean;
+    // supportsHistoryInContext?: boolean;
 } 

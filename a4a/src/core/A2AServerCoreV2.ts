@@ -1,7 +1,7 @@
 import type * as express from 'express';
 import { randomUUID } from 'node:crypto';
 import type { TaskStore, GetAuthContextFn, NotificationService } from '../interfaces';
-import type { TaskProcessorV2, ProcessorYieldValue, ProcessorInputValue, ProcessorInputMessage, ProcessorInputInternal } from '../interfaces/processorV2';
+import type { TaskProcessorV2, ProcessorYieldValue, ProcessorInputValue, ProcessorInputMessage, ProcessorInputInternal, ProcessorStepContext } from '../interfaces/processorV2';
 import { ProcessorCancellationError } from '../interfaces/processorV2';
 import * as A2ATypes from '../types';
 import { A2AErrorCodes, type AgentCard, type Task, type Message, type Artifact, type TaskState, type TaskStatus, type TaskStatusUpdateEvent, type TaskArtifactUpdateEvent } from '../types';
@@ -25,6 +25,7 @@ export interface A2AServerConfigV2 {
 // Structure to hold active generator state
 interface ActiveGeneratorState {
     generator: AsyncGenerator<ProcessorYieldValue, void, ProcessorInputValue>;
+    context: ProcessorStepContext; // Store the context object here
     isCanceling?: boolean; // Flag to indicate cancellation is in progress
 }
 
@@ -33,9 +34,10 @@ export class A2AServerCoreV2 {
     private readonly completeAgentCard: AgentCard;
     private readonly taskStore: TaskStore;
     private readonly processors: TaskProcessorV2[];
-    private readonly sseManager: SseConnectionManager | null = null;
+    private readonly notificationServices: NotificationService[];
     private readonly getAuthContext?: GetAuthContextFn;
     private readonly maxHistoryLength: number;
+    private readonly sseManager: SseConnectionManager | null = null;
 
     // Map to store active running/paused generators and their cancellation state
     private readonly activeGenerators: Map<string, ActiveGeneratorState> = new Map();
@@ -45,6 +47,7 @@ export class A2AServerCoreV2 {
     constructor(config: A2AServerConfigV2) { // Use specific V2 config type
         this.taskStore = config.taskStore;
         this.processors = config.taskProcessors; // No cast needed
+        this.notificationServices = config.notificationServices ?? [];
         this.getAuthContext = config.getAuthContext;
         this.maxHistoryLength = config.maxHistoryLength ?? 50;
 
@@ -75,7 +78,7 @@ export class A2AServerCoreV2 {
         }
 
         // --- Initialize SSE Manager --- //
-        this.sseManager = config.notificationServices?.find(
+        this.sseManager = this.notificationServices.find(
             (service): service is SseConnectionManager => service instanceof SseConnectionManager
         ) ?? null;
 
@@ -114,10 +117,13 @@ export class A2AServerCoreV2 {
             }
 
             await this._addTaskHistory(params.id!, params.message);
+            // Fetch task WITH history to populate the context for resumption
+            // const currentTaskWithHistory = await this._getTaskOrThrow(params.id!, true); // No longer needed here
+            // const resumeContext: ProcessorStepContext = { task: currentTaskWithHistory }; // No longer needed here
+            // Pass only input, _trigger will get context from state
             this._triggerGeneratorProcessing(params.id!, activeState.generator, { type: 'message', message: params.message });
 
-            const taskNow = await this._getTaskOrThrow(params.id!); // Use _getTaskOrThrow
-            taskNow.history = await this.taskStore.getTaskHistory(params.id!, params.historyLength ?? 1);
+            const taskNow = await this._getTaskOrThrow(params.id!, true); // Fetch WITH history
             delete taskNow.internalState;
             return taskNow;
 
@@ -142,13 +148,19 @@ export class A2AServerCoreV2 {
              await this._addTaskHistory(newTask.id, params.message);
              newTask = await this._updateTaskStatus(newTask.id, 'working'); // Set to working
 
-             const generator = processor.process(newTask, params, authContext);
-             // Store the generator in the new structure
-             this.activeGenerators.set(newTask.id, { generator: generator });
+             // Create the initial context object ONCE
+             const initialContext: ProcessorStepContext = { task: newTask, isCanceling: false }; 
+             // Call process with the context object
+             const generator = processor.process(initialContext, params, authContext);
+             
+             // Store generator AND context
+             this.activeGenerators.set(newTask.id, { generator: generator, context: initialContext });
+             // Trigger the first run - no context param needed
              this._triggerGeneratorProcessing(newTask.id, generator);
 
+             // Prepare response (don't include history initially)
              const responseTask = { ...newTask };
-             responseTask.history = await this.taskStore.getTaskHistory(newTask.id, params.historyLength ?? 1);
+             responseTask.history = []; 
              delete responseTask.internalState;
              return responseTask;
         }
@@ -170,31 +182,37 @@ export class A2AServerCoreV2 {
             taskId = existingTask.id;
             console.log(`[A2ACoreV2] Resuming generator via SSE for task ${taskId}`);
             if (activeState.isCanceling) {
-                // Send error event?
-                sseResponse.status(409).end('Task is currently being canceled.'); // Conflict
+                sseResponse.status(409).end('Task is currently being canceled.'); 
                 return;
             }
             if (this._isFinalState(existingTask.status.state) && existingTask.status.state !== 'input-required') {
+                  sseManager.addSubscription(taskId, requestId, sseResponse);
                   this._sendSseEvent(sseManager, taskId, requestId, { type: 'status', status: existingTask.status, final: true, metadata: existingTask.metadata });
                   sseResponse.end(); return;
             }
              if (existingTask.status.state !== 'input-required') {
                  console.warn(`[A2ACoreV2] Resuming task ${taskId} via SSE which is not in 'input-required' state.`);
             }
+
             sseManager.addSubscription(taskId, requestId, sseResponse);
             await this._addTaskHistory(taskId, params.message);
+            // Trigger processing - context will be updated internally before next()
+            // Fetch task WITH history to populate the context for resumption
+            // const currentTaskWithHistory = await this._getTaskOrThrow(taskId, true); // No longer needed here
+            // const resumeContext: ProcessorStepContext = { task: currentTaskWithHistory }; // No longer needed here
+            // Pass only input, _trigger will get context from state
             this._triggerGeneratorProcessing(taskId, activeState.generator, { type: 'message', message: params.message });
 
         } else if (existingTask && !activeState) {
             taskId = existingTask.id;
              if (this._isFinalState(existingTask.status.state)) {
-                 sseManager.addSubscription(taskId, requestId, sseResponse); // Add before sending
+                 sseManager.addSubscription(taskId, requestId, sseResponse); 
                  this._sendSseEvent(sseManager, taskId, requestId, { type: 'status', status: existingTask.status, final: true, metadata: existingTask.metadata });
                  sseResponse.end();
                  return;
             } else {
                  console.warn(`[A2ACoreV2] Task ${taskId} found in store but no active generator. Cannot resume via SSE.`);
-                 sseResponse.status(500).end(); // Indicate server error
+                 sseResponse.status(500).end(); 
                   return;
             }
         } else {
@@ -207,10 +225,14 @@ export class A2AServerCoreV2 {
              console.log(`[A2ACoreV2] Created/Got task ${taskId} via SSE with initial status ${newTask.status.state}.`);
              await this._addTaskHistory(taskId, params.message);
              sseManager.addSubscription(taskId, requestId, sseResponse);
-             newTask = await this._updateTaskStatus(taskId, 'working'); // Set to working
+             newTask = await this._updateTaskStatus(taskId, 'working'); 
 
-             const generator = processor.process(newTask, params, authContext);
-             this.activeGenerators.set(taskId, { generator: generator }); // Store in new structure
+             // Create initial context object ONCE
+             const initialContext: ProcessorStepContext = { task: newTask, isCanceling: false };
+             const generator = processor.process(initialContext, params, authContext);
+             // Store generator AND context
+             this.activeGenerators.set(taskId, { generator: generator, context: initialContext }); 
+             // Trigger first run - no context param needed
              this._triggerGeneratorProcessing(taskId, generator);
         }
     }
@@ -225,7 +247,7 @@ export class A2AServerCoreV2 {
         const sseManager = this.sseManager!;
         const taskId = params.id;
 
-        // Ensure task exists but don't need the full object here unless needed for auth/validation later
+        // Ensure task exists but don't need the full object here unless needed
         // const task = await this._getTaskOrThrow(taskId); 
         await this.taskStore.getTask(taskId); // Check task exists without fetching full data unless needed
         // TODO: Add authorization check here if needed using authContext and task metadata/owner
@@ -241,19 +263,23 @@ export class A2AServerCoreV2 {
 
     async handleTaskGet(params: A2ATypes.TaskGetParams, authContext?: any): Promise<A2ATypes.Task> {
         const task = await this._getTaskOrThrow(params.id);
-        const historyLength = Math.min(params.historyLength ?? 0, this.maxHistoryLength);
-        task.history = await this.taskStore.getTaskHistory(params.id, historyLength);
-        delete task.internalState; // Don't expose internal state
+        if (params.historyLength !== 0) {
+             const historyLength = Math.min(params.historyLength ?? this.maxHistoryLength, this.maxHistoryLength);
+             task.history = await this.taskStore.getTaskHistory(params.id, historyLength);
+        } else {
+             delete task.history; 
+        }
+        delete task.internalState; 
         return task;
     }
 
     async handleTaskCancel(params: A2ATypes.TaskCancelParams, authContext?: any): Promise<A2ATypes.Task> {
         const taskId = params.id;
-        let task = await this._getTaskOrThrow(taskId);
+        let task = await this._getTaskOrThrow(taskId, false); // Don't need history here
         if (this._isFinalState(task.status.state)) {
             console.log(`[A2ACoreV2] Task ${taskId} already final. No cancel action needed.`);
-            task.history = await this.taskStore.getTaskHistory(taskId, 0);
             delete task.internalState;
+            delete task.history; // Ensure no history returned
             return task;
         }
         if (params.message) {
@@ -265,25 +291,21 @@ export class A2AServerCoreV2 {
         if (activeState) {
             if (activeState.isCanceling) {
                 console.log(`[A2ACoreV2] Task ${taskId} cancellation already in progress.`);
-                // Wait for the existing cancellation promise to finish?
-                // For now, just return the current state, assuming the other call will finalize.
-                task.history = await this.taskStore.getTaskHistory(taskId, 0);
-                delete task.internalState;
-                return task;
+                const currentTask = await this._getTaskOrThrow(taskId, false);
+                delete currentTask.internalState;
+                delete currentTask.history;
+                return currentTask;
             }
 
             console.log(`[A2ACoreV2] Canceling active generator for task ${taskId}.`);
-            // --- Mark as canceling --- 
             activeState.isCanceling = true;
-
+            activeState.context.isCanceling = true; // Set flag on context as well
             try {
-                // Trigger generator processing with a cancellation error and WAIT for it
+                // Trigger with error - no input or context needed for throw
                 await this._triggerGeneratorProcessing(taskId, activeState.generator, undefined, new ProcessorCancellationError());
             } finally {
-                 // --- Clear the canceling flag --- 
-                 // Ensure the flag is cleared even if _trigger throws (shouldn't happen)
                  const finalActiveState = this.activeGenerators.get(taskId);
-                 if (finalActiveState) { // Check if it wasn't deleted by processing
+                 if (finalActiveState) { 
                      finalActiveState.isCanceling = false;
                  }
             }
@@ -291,10 +313,9 @@ export class A2AServerCoreV2 {
             console.log(`[A2ACoreV2] No active generator for task ${taskId}. Updating status to canceled in store.`);
             task = await this._updateTaskStatus(taskId, 'canceled', params.message);
         }
-        // Fetch the potentially updated task for the response
-        const finalTaskState = await this.taskStore.getTask(taskId); // Status should be updated now
+        const finalTaskState = await this.taskStore.getTask(taskId); 
         if (!finalTaskState) throw this._createError(A2AErrorCodes.InternalError, `Task ${taskId} disappeared during cancel.`);
-        finalTaskState.history = [];
+        finalTaskState.history = []; // Return empty history on cancel success
         delete finalTaskState.internalState;
         return finalTaskState;
     }
@@ -324,50 +345,76 @@ export class A2AServerCoreV2 {
     private async _processGeneratorStep(
         taskId: string,
         generator: AsyncGenerator<ProcessorYieldValue, void, ProcessorInputValue>,
+        context: ProcessorStepContext, // Accept context 
         inputValue?: ProcessorInputValue,
         errorToThrow?: Error
     ): Promise<{ done: boolean, requiresInput: boolean }> {
         const activeState = this.activeGenerators.get(taskId);
-        if (!activeState && !errorToThrow) { // Allow throw even if state was deleted (e.g. concurrent cancel)
+        // Check activeState *before* potentially fetching task for context update
+        if (!activeState && !errorToThrow) { 
              console.warn(`[A2ACoreV2] _processGeneratorStep called for task ${taskId} but no active generator state found. Aborting step.`);
-             return { done: true, requiresInput: false }; // Treat as done
+             return { done: true, requiresInput: false }; 
         }
 
         try {
-            console.log(`[A2ACoreV2] Processing step for task ${taskId}. Input: ${inputValue?.type}, Error: ${errorToThrow?.name}`);
+            // --- Check for cancellation BEFORE proceeding --- //
+            if (activeState?.isCanceling && !errorToThrow) { 
+                console.log(`[A2ACoreV2] Cancellation flag detected for task ${taskId} before step execution. Forcing cancellation error.`);
+                // Force the error to be the cancellation error
+                errorToThrow = new ProcessorCancellationError();
+                inputValue = undefined; // Ensure no input is passed when throwing due to cancellation flag
+            }
+            // --- End Cancellation Check --- //
+
+            // --- MUTATE CONTEXT (Moved Here) --- //
+            // Fetch latest task state WITH history before EVERY generator step
+            // unless we are throwing a cancellation error (where context might not matter)
+            if (!errorToThrow || !(errorToThrow instanceof ProcessorCancellationError)) { 
+                 try {
+                    const currentTask = await this._getTaskOrThrow(taskId, true); 
+                    // Mutate the task property of the existing context object
+                    context.task = currentTask; 
+                 } catch (taskFetchError) {
+                     console.error(`[A2ACoreV2] Error fetching task ${taskId} to update context before generator step:`, taskFetchError);
+                     // If we can't fetch the task, we probably can't proceed safely.
+                     // Throw the fetch error to be caught by the outer try/catch.
+                     throw taskFetchError;
+                 }
+            }
+            // --- END MUTATE CONTEXT --- //
+
+            console.log(`[A2ACoreV2] Processing step for task ${taskId}. Input: ${inputValue?.type}, Error: ${errorToThrow?.name}, History Length: ${context.task.history?.length ?? 0}`);
             let result: IteratorResult<ProcessorYieldValue, void>;
             if (errorToThrow) {
+                // Don't need context when throwing 
                 result = await generator.throw(errorToThrow);
             } else {
+                // Pass input value to next(). Context is implicitly available
+                // via the mutated object in the generator's scope.
                 result = await generator.next(inputValue);
             }
             console.log(`[A2ACoreV2] Generator step result for task ${taskId}. Done: ${result.done}`);
 
             if (result.done) {
                  console.log(`[A2ACoreV2] Generator for task ${taskId} completed successfully.`);
-                 const currentActiveState = this.activeGenerators.get(taskId); // Re-fetch state
-
+                 const currentActiveState = this.activeGenerators.get(taskId); 
                  if (currentActiveState?.isCanceling) {
                      console.log(`[A2ACoreV2] Generator finished, but task ${taskId} is marked for cancellation. Skipping 'completed' state.`);
-                     // Rely on the cancellation flow to set the final 'canceled' state.
                  } else {
-                     // Only set completed if not being canceled
-                     const currentTask = await this.taskStore.getTask(taskId);
+                     const currentTask = await this._getTaskOrThrow(taskId);
                      if (currentTask && !this._isFinalState(currentTask.status.state)) {
                          await this._updateTaskStatus(taskId, 'completed');
                      } else {
                          console.log(`[A2ACoreV2] Generator finished, but task state is already final (${currentTask?.status.state}) or being canceled. Not setting to completed.`);
                      }
                  }
-                this.activeGenerators.delete(taskId); // Remove regardless of flag
+                this.activeGenerators.delete(taskId); 
                 return { done: true, requiresInput: false };
             } else {
-                // --- Handle Yielded Value --- //
                 const yieldValue = result.value;
                 console.log(`[A2ACoreV2] Task ${taskId} yielded: ${yieldValue.type}`);
                 let requiresInput = false;
                 let yieldedState: A2ATypes.TaskState | null = null;
-
                 switch (yieldValue.type) {
                     case 'statusUpdate':
                         yieldedState = yieldValue.state;
@@ -378,30 +425,25 @@ export class A2AServerCoreV2 {
                         await this._addTaskArtifact(taskId, yieldValue.artifactData);
                         break;
                 }
-
                 const isProcessorYieldFinal = yieldedState !== null && this._isFinalState(yieldedState);
-
                 if (isProcessorYieldFinal) {
                     console.log(`[A2ACoreV2] Processor yielded final state (${yieldedState}). Stopping loop for task ${taskId}.`);
-                    this.activeGenerators.delete(taskId); // Remove from active map
-                    return { done: true, requiresInput: false }; // Signal done to stop the core's loop
+                    this.activeGenerators.delete(taskId); 
+                    return { done: true, requiresInput: false }; 
                 }
-
                 console.log(`[A2ACoreV2] Processed yield for task ${taskId}. Requires Input: ${requiresInput}`);
                 return { done: false, requiresInput: requiresInput };
             }
         } catch (error: any) {
-             // --- Handle Errors During Processing --- //
              console.error(`[A2ACoreV2] Error during generator processing step for task ${taskId}:`, error);
-             this.activeGenerators.delete(taskId); // Ensure generator state is removed
+             this.activeGenerators.delete(taskId); 
 
              const finalState = error instanceof ProcessorCancellationError ? 'canceled' : 'failed';
              const errorMessage: A2ATypes.Message | undefined = finalState === 'failed' ? 
                  { role: 'agent', parts: [{ type: 'text', text: `Task failed: ${error.message}` }] } : 
-                 undefined; // No automatic message for cancellation error caught here
-
+                 undefined; 
              try {
-                 const currentTask = await this.taskStore.getTask(taskId);
+                 const currentTask = await this._getTaskOrThrow(taskId);
                  if (currentTask && !this._isFinalState(currentTask.status.state)) {
                       console.log(`[A2ACoreV2] Setting task ${taskId} state to ${finalState} after generator error.`);
                       await this._updateTaskStatus(taskId, finalState, errorMessage);
@@ -411,25 +453,40 @@ export class A2AServerCoreV2 {
             } catch (updateError) {
                  console.error(`[A2ACoreV2] CRITICAL: Failed to update task ${taskId} status after generator error:`, updateError);
             }
-             return { done: true, requiresInput: false }; // Error means processing is done
+             return { done: true, requiresInput: false }; 
         }
     }
 
-    /** Triggers the processing of a task's generator, looping until it pauses or completes. Returns the promise for the enqueued work. */
+    /** Triggers the processing of a task's generator, looping until it pauses or completes. */
     private _triggerGeneratorProcessing(
         taskId: string,
         generator: AsyncGenerator<ProcessorYieldValue, void, ProcessorInputValue>,
-        initialInputValue?: ProcessorInputValue, // Input for the *first* step only
-        initialErrorToThrow?: Error // Error for the *first* step only
+        initialInputValue?: ProcessorInputValue, 
+        initialErrorToThrow?: Error
+        // REMOVED initialContext?: ProcessorStepContext 
     ): Promise<any> { 
          console.log(`[A2ACoreV2] Enqueuing generator processing trigger for task ${taskId}`);
         return this._enqueueGeneratorWork(taskId, async () => {
             console.log(`[A2ACoreV2] Starting generator processing chain for task ${taskId}`);
-            let stepResult = await this._processGeneratorStep(taskId, generator, initialInputValue, initialErrorToThrow);
-            // Loop only if not done AND not paused for input AND generator still exists (wasn't deleted by concurrent cancel)
+            
+            const activeState = this.activeGenerators.get(taskId);
+            if (!activeState) {
+                 console.warn(`[A2ACoreV2] _triggerGeneratorProcessing started for task ${taskId} but no active state found. Aborting.`);
+                 return; 
+            }
+            // Get context from the active state
+            const context = activeState.context; 
+            
+            // Initial step uses the provided context and initial input/error
+            let stepResult = await this._processGeneratorStep(taskId, generator, context, initialInputValue, initialErrorToThrow);
+            
+            // Subsequent steps within the loop
             while (!stepResult.done && !stepResult.requiresInput && this.activeGenerators.has(taskId)) {
                 console.log(`[A2ACoreV2] Continuing generator loop for task ${taskId}...`);
-                stepResult = await this._processGeneratorStep(taskId, generator);
+                
+                // Pass the *same* (but now mutated) context object to the next step
+                // No input/error for subsequent steps in the loop
+                stepResult = await this._processGeneratorStep(taskId, generator, context);
             }
             console.log(`[A2ACoreV2] Generator processing loop finished for task ${taskId}. Done: ${stepResult.done}, Requires Input: ${stepResult.requiresInput}, Generator Active: ${this.activeGenerators.has(taskId)}`);
         });
@@ -449,17 +506,24 @@ export class A2AServerCoreV2 {
         throw this._createError(A2AErrorCodes.MethodNotFound, `No V2 processor found capable of handling the request.`);
     }
 
-     private async _getTaskOrThrow(taskId: string): Promise<A2ATypes.Task> {
+     private async _getTaskOrThrow(taskId: string, includeHistory: boolean = false): Promise<A2ATypes.Task> {
         const task = await this.taskStore.getTask(taskId);
         if (!task) {
             console.warn(`[A2ACoreV2] Task with id ${taskId} not found.`);
             throw this._createError(A2AErrorCodes.TaskNotFound, `Task with id ${taskId} not found.`);
         }
+        if (includeHistory) {
+            if (!task.history || task.history.length === 0) { 
+                task.history = await this.taskStore.getTaskHistory(taskId, this.maxHistoryLength);
+            }
+        } else {
+            delete task.history;
+        }
         return task;
     }
 
     private async _updateTaskStatus(taskId: string, newState: A2ATypes.TaskState, message?: A2ATypes.Message): Promise<A2ATypes.Task> {
-        const taskBefore = await this._getTaskOrThrow(taskId); 
+        const taskBefore = await this._getTaskOrThrow(taskId, false); 
         const now = new Date().toISOString();
         const statusUpdate: A2ATypes.TaskStatus = { state: newState, timestamp: now, message };
 
@@ -474,14 +538,11 @@ export class A2AServerCoreV2 {
          }
 
          if (this.sseManager) {
-             // --- Revert to Original Logic --- //
-             // Mark event as final if state is terminal OR requires input.
              const isStreamEndingEvent = this._isFinalState(newState) || newState === 'input-required'; 
-
              this._sendSseEvent(this.sseManager, taskId, null, { 
                  type: 'status',
                  status: updatedTask.status,
-                 final: isStreamEndingEvent, // Use reverted logic
+                 final: isStreamEndingEvent, 
                  metadata: updatedTask.metadata
              });
          }
@@ -489,7 +550,7 @@ export class A2AServerCoreV2 {
     }
 
     private async _addTaskArtifact(taskId: string, artifactData: Omit<A2ATypes.Artifact, 'index' | 'id' | 'timestamp'>): Promise<A2ATypes.Artifact> {
-         const task = await this._getTaskOrThrow(taskId);
+         const task = await this._getTaskOrThrow(taskId, false);
          const currentArtifacts = task.artifacts ?? [];
          const newIndex = currentArtifacts.length;
          const now = new Date().toISOString();
