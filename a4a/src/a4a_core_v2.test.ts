@@ -5,7 +5,7 @@ import { EventEmitter } from 'node:events'; // Import EventEmitter
 import { A2AServerCoreV2, A2AServerConfigV2 } from './core/A2AServerCoreV2'; // Adjust path
 import { InMemoryTaskStore } from './store/InMemoryTaskStore'; // Adjust path
 import { SseConnectionManager } from './core/SseConnectionManager'; // Adjust path
-import { EchoProcessor, CounterProcessor, StreamingProcessor, CancelProcessor, InputRequiredProcessor } from '../samples/test-processors'; // Adjust path
+import { EchoProcessor, CounterProcessor, StreamingProcessor, CancelProcessor, InputRequiredProcessor, PauseProcessor } from '../samples/test-processors'; // Adjust path
 import type * as A2ATypes from './types'; // Adjust path
 import { A2AErrorCodes } from './types'; // Adjust path
 
@@ -34,8 +34,11 @@ const testAgentCardPartial: Partial<A2ATypes.AgentCard> = {
          { id: 'stream', name: 'Streamer', description: 'Streams parts', tags: ['test', 'streaming'] },
          { id: 'cancelTest', name: 'Cancel Test', description: 'Waits to be cancelled', tags: ['test', 'cancel'] },
          { id: 'inputRequired', name: 'Input Required Test', description: 'Tests input-required via SSE', tags: ['test', 'sse'] },
+         { id: 'pauseTest', name: 'Pause Test', description: 'Tests resubscribe during pause', tags: ['test', 'sse', 'resubscribe'] },
     ]
 };
+
+// --- Helper Functions --- //
 
 /** Helper to make JSON-RPC requests */
 async function makeA2ARequest(method: string, params: any, id: number | string | null = 1): Promise<Response> {
@@ -57,7 +60,6 @@ function parseSseEvent(line: string): any | null {
          try {
             // Attempt to parse the JSON data part
              const jsonData = line.substring(5).trim(); // Remove 'data:' prefix and trim whitespace
-             // Handle potential wrapping if core sends full JSON-RPC structure in data
              const parsed = JSON.parse(jsonData);
              if (parsed.jsonrpc === "2.0" && parsed.result) {
                  return parsed.result; // Extract A2A event from JSON-RPC wrapper
@@ -71,17 +73,32 @@ function parseSseEvent(line: string): any | null {
      return null;
 }
 
-/** Helper to read all events from an SSE stream */
-async function readAllSseEvents(response: Response): Promise<any[]> {
-    const reader = response.body!.getReader();
+/** 
+ * Helper to read events from an SSE stream.
+ * Reads until the stream closes or the optional `stopCondition` returns true.
+ */
+async function readSseEvents(
+    response: Response, 
+    stopCondition?: (event: any) => boolean
+): Promise<any[]> { 
+    if (!response.body) {
+        throw new Error("Response body is null");
+    }
+    const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     const events: any[] = [];
+    let stopReading = false;
+    let streamFinished = false;
 
     try {
-        while (true) {
+        while (!stopReading) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) {
+                console.log("[readSseEvents] Stream finished (done=true).");
+                streamFinished = true;
+                break;
+            }
             buffer += decoder.decode(value, { stream: true });
 
             let eventBoundary = buffer.indexOf('\n\n');
@@ -95,13 +112,34 @@ async function readAllSseEvents(response: Response): Promise<any[]> {
                     const event = parseSseEvent(line);
                     if (event) {
                         events.push(event);
+                        if (stopCondition && stopCondition(event)) {
+                            console.log("[readSseEvents] Stop condition met.");
+                            stopReading = true;
+                            break; 
+                        }
                     }
                 }
+                if (stopReading) break; 
                 eventBoundary = buffer.indexOf('\n\n');
             }
         }
+    } catch (e) {
+        console.error("[readSseEvents] Error during reading:", e);
+        // Propagate error? Or just log and continue cleanup?
+        streamFinished = true; // Treat error as end of stream for cleanup
     } finally {
-        reader.releaseLock();
+        try {
+            console.log("[readSseEvents] Releasing reader lock.");
+            reader.releaseLock();
+            // If the stream didn't finish naturally (e.g., stop condition met, or maybe even if it did done=true),
+            // explicitly cancel it from the client side to signal we are done with the response body.
+            if (!streamFinished || stopReading) { 
+                console.log("[readSseEvents] Explicitly cancelling response body stream...");
+                await response.body.cancel("Client finished reading events");
+            }
+        } catch (cancelError) {
+            console.warn("[readSseEvents] Error during stream cancel/releaseLock:", cancelError);
+        }
     }
     return events;
 }
@@ -114,7 +152,8 @@ beforeAll(() => {
         new CounterProcessor(), 
         new StreamingProcessor(), 
         new CancelProcessor(), 
-        new InputRequiredProcessor()
+        new InputRequiredProcessor(),
+        new PauseProcessor(500)
     ];
 
     // --- Start Server First to get URL --- //
@@ -415,41 +454,8 @@ describe("A2A Server Core V2 - Streaming Tests", () => {
          expect(res.status).toEqual(200);
          expect(res.headers.get('Content-Type')).toEqual('text/event-stream');
 
-         const reader = res.body!.getReader();
-         const decoder = new TextDecoder();
-         let buffer = "";
-         const events: any[] = [];
-
-         try {
-             while (true) {
-                 const { done, value } = await reader.read();
-                 if (done) break;
-                 buffer += decoder.decode(value, { stream: true });
-
-                 // Process buffer line by line (Handle potential multiple events per chunk)
-                 let eventBoundary = buffer.indexOf('\n\n');
-                 while (eventBoundary !== -1) {
-                    const eventText = buffer.substring(0, eventBoundary);
-                    buffer = buffer.substring(eventBoundary + 2);
-
-                    const lines = eventText.split('\n');
-                    for (const line of lines) {
-                        if (line.trim() === '') continue;
-                        const event = parseSseEvent(line);
-                        if (event) {
-                             // console.log("Received SSE Event:", JSON.stringify(event));
-                             events.push(event);
-                        }
-                    }
-                    eventBoundary = buffer.indexOf('\n\n');
-                }
-             }
-             // Process any remaining buffer after stream closes (should be empty for valid SSE)
-             // ... (optional handling for remaining buffer)
-
-         } finally {
-             reader.releaseLock();
-         }
+         // Read all events until the stream closes (no stop condition)
+         const events = await readSseEvents(res);
 
          // Assert the sequence of events
          expect(events.length).toBeGreaterThanOrEqual(5); 
@@ -457,114 +463,54 @@ describe("A2A Server Core V2 - Streaming Tests", () => {
          const statusUpdates = events.filter(e => e.status);
          const artifactUpdates = events.filter(e => e.artifact);
 
-         // Check initial working state (might be the first or second event)
          expect(statusUpdates[0]?.status?.state).toEqual('working');
-
-         // Check artifacts (allow for interleaved status updates)
          expect(artifactUpdates.length).toEqual(3);
-         // Type guard before accessing .text
          expect(artifactUpdates.some(e => e.artifact?.parts?.[0]?.type === 'text' && e.artifact.parts[0].text === 'Part 1')).toBe(true);
          expect(artifactUpdates.some(e => e.artifact?.parts?.[0]?.type === 'text' && e.artifact.parts[0].text === 'Part 2')).toBe(true);
          expect(artifactUpdates.some(e => e.artifact?.parts?.[0]?.type === 'text' && e.artifact.parts[0].text === 'Part 3')).toBe(true);
 
-         // Check final completed state
           const lastEvent = events[events.length - 1];
           expect(lastEvent?.status?.state).toEqual('completed');
           expect(lastEvent?.final).toBe(true);
 
-         // Verify task is completed in store
          const taskId = events[0]?.id;
-         expect(taskId).toBeString(); // Ensure we got an ID
+         expect(taskId).toBeString(); 
          if (taskId) {
              const getRes = await makeA2ARequest('tasks/get', { id: taskId });
-             // Add type cast
              const getJson = await getRes.json() as A2ATypes.JsonRpcSuccessResponse<A2ATypes.Task>; 
              expect(getJson.result.status.state).toEqual('completed');
          }
      });
 
-    // --- Test Case for Input Required (Corrected for stream closing) --- //
     it("should handle input-required via SSE", async () => {
         const initialText = "Start task requiring input";
         const inputText = "Here is the required input";
         let taskId: string | null = null;
 
-        // 1. Start the task with sendSubscribe
+        // 1. Start task
         const res1 = await makeA2ARequest('tasks/sendSubscribe', {
             message: { role: 'user', parts: [{ type: 'text', text: initialText }] },
             metadata: { skillId: 'inputRequired' }
         }, "input-req-1");
-
         expect(res1.status).toEqual(200);
-        expect(res1.headers.get('Content-Type')).toEqual('text/event-stream');
 
-        const reader = res1.body!.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        const initialEventsReceived: any[] = [];
-        let receivedInputRequired = false;
-
-        // 2. Read initial events until input-required (which is final) or stream closes
-        try {
-            while (!receivedInputRequired) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    console.log("SSE stream closed during initial read."); // Should close AFTER input-required
-                    break;
-                }
-                buffer += decoder.decode(value, { stream: true });
-
-                let eventBoundary = buffer.indexOf('\n\n');
-                while (eventBoundary !== -1) {
-                    const eventText = buffer.substring(0, eventBoundary);
-                    buffer = buffer.substring(eventBoundary + 2);
-
-                    const lines = eventText.split('\n');
-                    for (const line of lines) {
-                        if (line.trim() === '') continue;
-                        const event = parseSseEvent(line);
-                        if (event) {
-                            initialEventsReceived.push(event);
-                            if (!taskId) taskId = event.id; // Capture taskId
-                            if (event.status?.state === 'input-required') {
-                                console.log("Received input-required event via SSE.");
-                                expect(event.final).toBe(true); // Verify it's marked as final
-                                receivedInputRequired = true;
-                                // Break inner loop, outer loop condition will handle exit
-                                break; 
-                            }
-                            // Optional: Check if somehow another final event came first
-                            if (event.final === true) {
-                                 console.warn("SSE stream sent a different final event before input-required.");
-                                 receivedInputRequired = true; // Treat as finished for loop exit
-                                 break;
-                            }
-                        }
-                    }
-                     if (receivedInputRequired) break; // Exit outer loop if inner loop found it
-                    eventBoundary = buffer.indexOf('\n\n');
-                }
-            }
-        } finally {
-            // Release the lock regardless of how the loop exited
-            reader.releaseLock(); 
-            console.log("Released reader lock for initial SSE stream.");
-        }
+        // 2. Read events until input-required is received
+        const stopCondition = (event: any) => event.status?.state === 'input-required';
+        const initialEventsReceived = await readSseEvents(res1, stopCondition);
         
-        // Assert that input-required was indeed received
-        expect(receivedInputRequired).toBe(true);
-        expect(taskId).toBeString();
-
-        // Verify input-required state details from the received events
-        const inputRequiredEvent = initialEventsReceived.find(e => e.status?.state === 'input-required');
+        // Assert input-required was received
+        const inputRequiredEvent = initialEventsReceived.find(stopCondition);
         expect(inputRequiredEvent).toBeDefined();
+        expect(inputRequiredEvent.final).toBe(true); // Check it was marked final
+        taskId = inputRequiredEvent.id; // Get taskId
+        expect(taskId).toBeString();
         const promptPart = inputRequiredEvent.status?.message?.parts?.[0];
         expect(promptPart?.type).toEqual('text');
         if (promptPart?.type === 'text') {
             expect(promptPart.text).toContain('Please provide the required input');
         }
 
-        // 3. Send the required input using tasks/send
+        // 3. Send input
         console.log(`Sending input '${inputText}' for task ${taskId}...`);
         const res2 = await makeA2ARequest('tasks/send', {
             id: taskId,
@@ -572,8 +518,7 @@ describe("A2A Server Core V2 - Streaming Tests", () => {
         }, "input-req-2");
         expect(res2.status).toEqual(200); 
 
-        // 4. Wait for processing triggered by tasks/send to complete
-        // Since the SSE stream is closed, we poll the state via tasks/get
+        // 4. Poll for final state
         console.log("Waiting for background processing after input...");
         let finalTaskState: A2ATypes.Task | null = null;
         for (let i = 0; i < 10; i++) { // Poll for up to ~500ms
@@ -586,11 +531,9 @@ describe("A2A Server Core V2 - Streaming Tests", () => {
             }
         }
 
-        // 5. Assert the final state fetched via tasks/get
+        // 5. Assert final state
         expect(finalTaskState).toBeDefined();
         expect(finalTaskState?.status.state).toEqual('completed');
-        
-        // Check the artifact created *after* input was processed
         expect(finalTaskState?.artifacts).toBeArray();
         expect(finalTaskState?.artifacts?.length).toBe(1); 
         const finalArtifact = finalTaskState?.artifacts?.[0];
@@ -602,6 +545,81 @@ describe("A2A Server Core V2 - Streaming Tests", () => {
         }
     });
 
-    // TODO: Add tests for tasks/resubscribe if needed (more complex setup)
+    // --- Resubscribe Test (Strict Spec: No initial state on resubscribe) --- //
+    it("should handle resubscribe during pause", async () => {
+        const pauseDurationMs = 500;
+        let taskId: string | null = null;
+        const abortController = new AbortController(); // To close the first connection
+
+        // 1. Start task with sendSubscribe
+        const res1Promise = fetch(`${serverUrl}${rpcPath}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: "2.0", id: "pause-1", method: 'tasks/sendSubscribe', 
+                params: {
+                    message: { role: 'user', parts: [{ type: 'text', text: "Start pause test" }] },
+                    metadata: { skillId: 'pauseTest' }
+                }
+            }),
+            signal: abortController.signal 
+        });
+        const res1 = await res1Promise;
+        expect(res1.status).toEqual(200);
+
+        // 2. Read only the first event(s) (e.g., the initial 'working' status)
+        // We still need the taskId from the first event(s)
+        const initialEvents = await readSseEvents(res1, (event) => { 
+            if (!taskId) taskId = event.id; 
+            return !!taskId; // Stop as soon as we have the taskId
+        });
+        expect(initialEvents.length).toBeGreaterThanOrEqual(1);
+        expect(initialEvents[0]?.status?.state).toEqual('working');
+        expect(taskId).toBeString();
+        console.log(`Resubscribe/Pause Test: Task ${taskId} started.`);
+
+        // 3. Abort the first connection *before* pause finishes
+        console.log(`Resubscribe/Pause Test: Aborting first connection...`);
+        abortController.abort("Simulating client disconnect");
+
+        // 4. Wait briefly for abort processing
+        await Bun.sleep(50); 
+
+        // 5. Resubscribe to the task
+        console.log(`Resubscribe/Pause Test: Resubscribing to task ${taskId}...`);
+        const res2 = await makeA2ARequest('tasks/resubscribe', { id: taskId! }, "pause-resub-2");
+        expect(res2.status).toEqual(200);
+        expect(res2.headers.get('Content-Type')).toEqual('text/event-stream');
+
+        // 6. Read all events from the *second* stream until it closes.
+        // We should ONLY receive events generated AFTER the pause.
+        const secondStreamEvents = await readSseEvents(res2);
+
+        // 7. Assert events received on the second stream
+        console.log("Resubscribe/Pause Test: Events received on second stream:", JSON.stringify(secondStreamEvents));
+        // Expect: working (resume), artifact, completed
+        expect(secondStreamEvents.length).toBeGreaterThanOrEqual(3); 
+
+        // Check *NO* initial status event was sent immediately on resubscribe
+        // The first event should be the one generated *after* the pause
+        expect(secondStreamEvents[0]?.status?.message?.parts?.[0]?.text).toEqual('Resuming after pause.');
+        expect(secondStreamEvents[0]?.status?.state).toEqual('working');
+        expect(secondStreamEvents[0]?.final).toBe(false); 
+
+        // Check artifact was received
+        const artifactEvent = secondStreamEvents.find(e => e.artifact?.name === 'pause-result');
+        expect(artifactEvent).toBeDefined();
+        expect(artifactEvent?.artifact?.parts?.[0]?.text).toEqual('Pause complete');
+
+        // Check final event
+        const lastEvent = secondStreamEvents[secondStreamEvents.length - 1];
+        expect(lastEvent?.status?.state).toEqual('completed');
+        expect(lastEvent?.final).toBe(true);
+
+        // Optional: Verify final state in store via tasks/get if needed
+        // const getRes = await makeA2ARequest('tasks/get', { id: taskId! });
+        // const getJson = await getRes.json() as A2ATypes.JsonRpcSuccessResponse<A2ATypes.Task>;
+        // expect(getJson.result.status.state).toEqual('completed');
+    });
 });
 

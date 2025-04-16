@@ -174,4 +174,39 @@ export class InputRequiredProcessor implements TaskProcessorV2 {
         };
         console.log(`[InputReqProc ${initialTask.id}] Finishing.`);
     }
+}
+
+export class PauseProcessor implements TaskProcessorV2 {
+    private pauseDurationMs: number;
+
+    constructor(pauseDurationMs: number = 500) {
+        this.pauseDurationMs = pauseDurationMs;
+    }
+
+    async canHandle(params: TaskSendParams): Promise<boolean> {
+        return params.metadata?.skillId === 'pauseTest';
+    }
+
+    async *process(initialTask: Task, initialParams: TaskSendParams): AsyncGenerator<ProcessorYieldValue, void, ProcessorInputValue> {
+        const taskId = initialTask.id;
+        console.log(`[PauseProc ${taskId}] Starting, will pause for ${this.pauseDurationMs}ms.`);
+        yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Starting pause...' }] } };
+        
+        await Bun.sleep(this.pauseDurationMs);
+        
+        console.log(`[PauseProc ${taskId}] Resuming after pause.`);
+        yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Resuming after pause.' }] } };
+        
+        await Bun.sleep(10); // Simulate final work
+
+        yield {
+            type: 'artifact',
+            artifactData: {
+                name: 'pause-result',
+                parts: [{ type: 'text', text: 'Pause complete' }]
+            }
+        };
+        console.log(`[PauseProc ${taskId}] Finishing.`);
+        // Core handles final 'completed' state
+    }
 } 

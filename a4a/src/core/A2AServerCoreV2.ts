@@ -225,36 +225,18 @@ export class A2AServerCoreV2 {
         const sseManager = this.sseManager!;
         const taskId = params.id;
 
-        const task = await this._getTaskOrThrow(taskId); // Ensure task exists
+        // Ensure task exists but don't need the full object here unless needed for auth/validation later
+        // const task = await this._getTaskOrThrow(taskId); 
+        await this.taskStore.getTask(taskId); // Check task exists without fetching full data unless needed
+        // TODO: Add authorization check here if needed using authContext and task metadata/owner
 
-        // Add subscription (SseManager handles duplicates if any)
+        // Just add the subscription. The SseManager will handle sending future events.
         sseManager.addSubscription(taskId, requestId, sseResponse);
-        console.log(`[A2ACoreV2] Client resubscribed to task ${taskId}.`);
+        console.log(`[A2ACoreV2] Client resubscribed to task ${taskId}. Waiting for new events.`);
 
-        // Send current state immediately
-        const isFinal = this._isFinalState(task.status.state);
-        this._sendSseEvent(sseManager, taskId, requestId, {
-            type: 'status',
-            status: task.status,
-            final: isFinal,
-            metadata: task.metadata
-        });
-
-        // Send existing artifacts
-        for (const artifact of task.artifacts ?? []) {
-             this._sendSseEvent(sseManager, taskId, requestId, {
-                 type: 'artifact',
-                 artifact: artifact,
-                 metadata: task.metadata
-             });
-        }
-
-        // If task is already final, close the connection after sending state
-        if (isFinal) {
-            console.log(`[A2ACoreV2] Task ${taskId} is final (${task.status.state}). Closing resubscribe connection.`);
-            sseResponse.end();
-             // No need to remove subscription here, SseManager handles closed connections
-        }
+        // Note: The connection remains open until the client disconnects,
+        // or until the SseManager receives a final event for this task
+        // (which will be broadcast to this connection if it happens after resubscription).
     }
 
     async handleTaskGet(params: A2ATypes.TaskGetParams, authContext?: any): Promise<A2ATypes.Task> {
