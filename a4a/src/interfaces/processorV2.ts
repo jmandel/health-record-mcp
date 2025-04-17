@@ -12,7 +12,13 @@ export interface YieldStatusUpdate {
 
 export interface YieldArtifact {
     type: 'artifact';
-    artifactData: Omit<Artifact, 'index' | 'id' | 'timestamp'>; // Core provides index/id/timestamp
+    // Core provides id/timestamp automatically.
+    // Processor can optionally provide index, append, and lastChunk for streaming.
+    artifactData: Omit<Artifact, 'id' | 'timestamp'> & {
+      index?: number; // Optional: Target artifact index (for append/insert)
+      append?: boolean; // Optional: Append parts to artifact at index?
+      lastChunk?: boolean; // Optional: Is this the last chunk for this artifact?
+    };
 }
 
 // Union of all possible yield types

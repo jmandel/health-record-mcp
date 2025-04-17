@@ -3,9 +3,11 @@ import express from 'express';
 import cors from 'cors'; 
 import http from 'node:http';
 import type net from 'node:net'; // For graceful shutdown
+import { randomUUID } from 'crypto';
 
 // Import Core V2 and types directly
-import { A2AServerCoreV2 } from '../core/A2AServerCoreV2';
+import { A2AServerCoreLite } from '../core/A2AServerCoreLite';
+import type { A2ACoreLiteConfig } from '../core/A2AServerCoreLite'; // Import the config type
 import { SseConnectionManager } from '../core/SseConnectionManager'; // Default notification service
 // Import V2 Processor Interfaces
 import type { TaskProcessorV2 } from '../interfaces/processorV2'; 
@@ -34,7 +36,7 @@ export interface A2AServerConfigV2 {
     serverCapabilities?: Partial<AgentCard['capabilities']>;
     serverAuthentication?: AgentCard['authentication'];
     getAuthContext?: GetAuthContextFn; // Should now resolve
-    configureApp?: (app: express.Application, core: A2AServerCoreV2, completeAgentCard: AgentCard) => void;
+    configureApp?: (app: express.Application, core: A2AServerCoreLite, completeAgentCard: AgentCard) => void;
     maxHistoryLength?: number;
 }
 
@@ -43,7 +45,7 @@ export interface A2AServerConfigV2 {
 /**
  * Creates Express request handlers specifically for A2AServerCoreV2.
  */
-export function createA2AExpressHandlersV2(core: A2AServerCoreV2, config: A2AServerConfigV2) {
+export function createA2AExpressHandlersV2(core: A2AServerCoreLite, config: A2AServerConfigV2) {
 
     const agentCardHandler: express.RequestHandler = (req, res) => {
         try {
@@ -89,22 +91,22 @@ export function createA2AExpressHandlersV2(core: A2AServerCoreV2, config: A2ASer
                 res.flushHeaders(); 
 
                 if (body.method === 'tasks/sendSubscribe') {
-                    await core.handleTaskSendSubscribe(requestId, body.params, res, authContext);
+                    await core.handleTaskSendSubscribe(requestId, body.params, res);
                 } else { 
-                    await core.handleTaskResubscribe(requestId, body.params, res, authContext);
+                    await core.handleTaskResubscribe(requestId, body.params, res);
                 }
                 return; 
             }
 
             switch (body.method) {
                 case 'tasks/send':
-                    result = await core.handleTaskSend(body.params, authContext);
+                    result = await core.handleTaskSend(body.params);
                     break;
                 case 'tasks/get':
-                    result = await core.handleTaskGet(body.params, authContext);
+                    result = await core.handleTaskGet(body.params);
                     break;
                 case 'tasks/cancel':
-                    result = await core.handleTaskCancel(body.params, authContext);
+                    result = await core.handleTaskCancel(body.params);
                     break;
                 // Add other V2 methods if needed
                 default:
@@ -148,8 +150,8 @@ export function createA2AExpressHandlersV2(core: A2AServerCoreV2, config: A2ASer
 
 export function startA2AExpressServerV2(config: A2AServerConfigV2): http.Server {
     const { 
-        agentCard: agentDefinition, // Rename for clarity within function
-        taskProcessors, 
+        agentCard: agentDefinition,
+        taskProcessors,
         taskStore,
         notificationServices: configNotificationServices,
         port: configPort,
@@ -165,6 +167,13 @@ export function startA2AExpressServerV2(config: A2AServerConfigV2): http.Server 
 
     const PORT = configPort ?? parseInt(process.env.PORT || '3001', 10);
     const BASE_URL = configBaseUrl ?? process.env.BASE_URL ?? `http://localhost:${PORT}`;
+    const RPC_PATH = configRpcPath || '/a2a'; // Ensure RPC_PATH has a value
+    const AGENT_CARD_PATH = configAgentCardPath || '/.well-known/agent.json';
+
+    // --- Construct and Set the Final Agent URL --- 
+    const finalAgentUrl = `${BASE_URL}${RPC_PATH}`;
+    // Explicitly set the URL on the agent definition BEFORE passing to the core
+    agentDefinition.url = finalAgentUrl;
 
     // --- Determine Notification Services --- 
     // Check capabilities defined in the partial card first
@@ -176,22 +185,18 @@ export function startA2AExpressServerV2(config: A2AServerConfigV2): http.Server 
     }
 
     // --- Configure the A2A Server Core V2 --- 
-    // Pass the potentially updated services and auth function
-    const coreV2Config: A2AServerConfigV2 = {
-         ...config, // Spread the original config
-         notificationServices: servicesToUse,
-         baseUrl: BASE_URL,
-         rpcPath: configRpcPath,
-         // The core itself will merge capabilities and auth, and build the final agent card
-         // We pass the partial definition and overrides.
-         agentCard: agentDefinition,
-         serverCapabilities: serverCapabilities,
-         serverAuthentication: serverAuthentication,
-         getAuthContext: getAuthContext, 
-         maxHistoryLength: maxHistoryLength,
+    const coreLiteConfig: A2ACoreLiteConfig = {
+      agentCard: agentDefinition, // Pass the UPDATED partial card definition
+      taskStore: taskStore,
+      processors: taskProcessors, 
+      notificationServices: servicesToUse,
+      // Add any other relevant overrides from server config if needed by core constructor
+      // e.g., if capabilities/auth were directly part of core config:
+      // capabilities: { ...agentDefinition.capabilities, ...serverCapabilities },
+      // authentication: serverAuthentication ?? agentDefinition.authentication,
     };
-    const a2aCore = new A2AServerCoreV2(coreV2Config);
-    const completeAgentCard = a2aCore.getAgentCard(); // Get the final card built by the core
+    const a2aCore = new A2AServerCoreLite(coreLiteConfig);
+    const completeAgentCard = a2aCore.getAgentCard(); // This should now have the correct URL
 
     // --- Set up Express app --- 
     const app = express();
@@ -199,11 +204,11 @@ export function startA2AExpressServerV2(config: A2AServerConfigV2): http.Server 
     app.use(express.json()); 
 
     // --- Create Handlers using V2 Core --- 
-    const { agentCardHandler, a2aRpcHandler } = createA2AExpressHandlersV2(a2aCore, config); // Pass core and original config
+    const { agentCardHandler, a2aRpcHandler } = createA2AExpressHandlersV2(a2aCore, config); 
 
     // --- Standard A2A Routes --- 
-    app.get(configAgentCardPath, agentCardHandler);
-    app.post(configRpcPath, a2aRpcHandler);
+    app.get(AGENT_CARD_PATH, agentCardHandler);
+    app.post(RPC_PATH, a2aRpcHandler);
 
     // --- Custom App Configuration --- 
     if (configureApp) {
@@ -212,7 +217,7 @@ export function startA2AExpressServerV2(config: A2AServerConfigV2): http.Server 
 
     // --- Basic Root Endpoint --- 
     app.get('/', (req, res) => {
-        res.send(`${completeAgentCard.name} running! Visit ${configAgentCardPath} for capabilities. POST to ${configRpcPath} for A2A communication.`);
+        res.send(`${completeAgentCard.name} running! Visit ${AGENT_CARD_PATH} for capabilities. POST to ${RPC_PATH} for A2A communication.`);
     });
 
     // --- Start Server --- 
@@ -222,55 +227,76 @@ export function startA2AExpressServerV2(config: A2AServerConfigV2): http.Server 
         console.log(`🚀 ${completeAgentCard.name} (v${completeAgentCard.version}) [V2 Core] server started`);
         console.log(`👂 Listening on port: ${PORT}`);
         console.log(`🔗 Base URL: ${BASE_URL}`);
-        console.log(`🃏 Agent Card: ${BASE_URL}${configAgentCardPath}`);
-        console.log(`⚡ A2A Endpoint (POST): ${completeAgentCard.url}`);
+        console.log(`🃏 Agent Card: ${BASE_URL}${AGENT_CARD_PATH}`);
+        // Use the finalAgentUrl constructed earlier for the endpoint log
+        console.log(`⚡ A2A Endpoint (POST): ${finalAgentUrl}`); 
         console.log(`-------------------------------------------------------`);
     }).on('error', (err: NodeJS.ErrnoException) => {
         console.error(`❌ Failed to start V2 server on port ${PORT}:`, err);
         process.exit(1);
     });
 
-    // --- Graceful Shutdown Logic (Optional but Recommended) --- 
+    // --- Graceful Shutdown Logic (REVISED) --- 
     const connections = new Map<string, net.Socket>();
     server.on('connection', (conn) => {
-        const key = `${conn.remoteAddress}:${conn.remotePort}`;
+        const key = conn.remoteAddress && conn.remotePort ? `${conn.remoteAddress}:${conn.remotePort}` : randomUUID(); // Handle potential undefined values
         connections.set(key, conn);
         conn.on('close', () => { connections.delete(key); });
     });
 
     let shuttingDown = false;
     const gracefulShutdown = async (signal: string) => {
-        if (shuttingDown) return;
+        if (shuttingDown) {
+            console.log('[A2A Server V2] Shutdown already in progress...');
+            return;
+        }
         shuttingDown = true;
         console.log(`[A2A Server V2] Received ${signal}. Starting graceful shutdown...`);
 
-        // 1. Close Notification Services
-        if (servicesToUse && servicesToUse.length > 0) {
-            console.log('[A2A Server V2] Closing notification services...');
-            await Promise.all(servicesToUse
-                .filter(s => typeof s.closeAll === 'function')
-                .map(s => s.closeAll!().catch((e: any) => console.error(`Error closing ${s.constructor.name}:`, e))) // Corrected lambda syntax
-            );
-            console.log('[A2A Server V2] Notification services closed.');
-        }
-
-        // 2. Stop accepting new connections & close existing
-        server.close((err) => {
-            if (err) console.error('[A2A Server V2] Error closing server:', err);
-            else console.log('[A2A Server V2] Server closed.');
-        });
-
-        // 3. Destroy remaining connections after a short delay
-        setTimeout(() => {
-            console.log(`[A2A Server V2] Destroying ${connections.size} remaining connections...`);
-            connections.forEach((conn) => conn.destroy());
-        }, 500); // Adjust delay as needed
-
-         // 4. Failsafe exit
-         setTimeout(() => {
-             console.error('[A2A Server V2] Shutdown timeout reached. Forcing exit.');
+        // Failsafe exit timer
+        const failsafeTimeout = setTimeout(() => {
+             console.error('[A2A Server V2] Shutdown timeout reached (10s). Forcing exit.');
              process.exit(1);
-         }, 5000).unref(); // e.g., 5 seconds
+         }, 10000).unref(); // e.g., 10 seconds
+
+        try {
+            // 1. Close Notification Services
+            if (servicesToUse && servicesToUse.length > 0) {
+                console.log('[A2A Server V2] Closing notification services...');
+                await Promise.all(servicesToUse
+                    .filter(s => typeof s.closeAll === 'function')
+                    .map(s => s.closeAll!().catch((e: any) => console.error(`Error closing ${s.constructor.name}:`, e)))
+                );
+                console.log('[A2A Server V2] Notification services closed.');
+            }
+
+            // 2. Stop accepting new connections & wait for server close
+            console.log('[A2A Server V2] Closing server...');
+            await new Promise<void>((resolve, reject) => {
+                server.close((err) => {
+                    if (err) {
+                        console.error('[A2A Server V2] Error closing server:', err);
+                        return reject(err);
+                    }
+                    console.log('[A2A Server V2] Server closed successfully.');
+                    resolve();
+                });
+
+                // 3. Immediately destroy existing connections after starting close
+                console.log(`[A2A Server V2] Destroying ${connections.size} existing connections...`);
+                connections.forEach((conn) => conn.destroy());
+            });
+
+            // 4. Shutdown successful
+            console.log('[A2A Server V2] Graceful shutdown complete.');
+            clearTimeout(failsafeTimeout); // Cancel the failsafe timer
+            process.exit(0); // Exit cleanly
+
+        } catch (error) {
+            console.error('[A2A Server V2] Error during graceful shutdown:', error);
+            clearTimeout(failsafeTimeout); // Cancel timer before forced exit
+            process.exit(1); // Exit with error
+        }
     };
 
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));

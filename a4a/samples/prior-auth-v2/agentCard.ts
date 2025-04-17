@@ -22,12 +22,6 @@ export const priorAuthAgentCardPartial: Partial<AgentCard> = {
         }
     ],
     documentationUrl: "https://example.com/docs/prior-auth-agent",
-    // Capabilities will be filled in by the server setup
-    capabilities: {
-        streaming: false, // This agent doesn't stream by default
-        pushNotifications: false,
-        stateTransitionHistory: true // Assuming store supports it
-    },
     // No specific authentication defined here, can be added by server setup
     authentication: { schemes: [] }
 }; 

@@ -36,11 +36,28 @@ export class KeywordEvaluator implements PriorAuthEvaluator {
     async findRelevantPolicy(requestDetails: PriorAuthRequestDetails, availablePolicies: string[], taskId?: string): Promise<string | null> {
         console.log(`[KeywordEval${taskId ? ' Task ' + taskId : ''}] Finding policy for:`, requestDetails);
         
-        // Quick Fix: Extract keywords from summary too
+        // Quick Fix: Extract keywords from summary (handle JSON and plain text)
+        let summaryKeywords: string[] = [];
+        try {
+            const parsed = JSON.parse(requestDetails.clinicalSummary);
+            summaryKeywords = Object.entries(parsed).flatMap(([key, value]) => [
+                key.toLowerCase(),
+                ...(typeof value === 'string'
+                    ? value.toLowerCase()
+                        .split(',')
+                        .flatMap(seg => seg.replace(/[()]/g, '').trim().split(/\s+/))
+                    : [])
+            ]);
+        } catch {
+            summaryKeywords = requestDetails.clinicalSummary
+                .toLowerCase()
+                .split(',')
+                .flatMap(seg => seg.replace(/[()]/g, '').trim().split(/\s+/));
+        }
         const keywords = [
             ...(requestDetails.procedure?.toLowerCase().split(/\s+/) || []),
             ...(requestDetails.diagnosis?.toLowerCase().split(/\s+/) || []),
-            ...(requestDetails.clinicalSummary.toLowerCase().split(/\s+|[.,!?;:]/).filter(Boolean) || []) // Split summary more aggressively
+            ...summaryKeywords
         ].filter(kw => kw.length > 2); // Simple filtering
         const uniqueKeywords = [...new Set(keywords)]; // Remove duplicates
 

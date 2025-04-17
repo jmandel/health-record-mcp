@@ -51,6 +51,13 @@ export class A2AServerCoreV2 {
         this.getAuthContext = config.getAuthContext;
         this.maxHistoryLength = config.maxHistoryLength ?? 50;
 
+        // --- Determine SSE capability FIRST --- //
+        this.sseManager = this.notificationServices.find(
+            (service): service is SseConnectionManager => service instanceof SseConnectionManager
+        ) ?? null;
+        const defaultStreamingCapability = !!this.sseManager;
+        console.log(`[A2ACoreV2] Detected SSE Capability based on NotificationServices: ${defaultStreamingCapability}`);
+
         // --- Build Complete Agent Card --- //
         const port = process.env.PORT || '3001'; // Default port if not specified via baseUrl
         const defaultBaseUrl = `http://localhost:${port}`;
@@ -62,7 +69,14 @@ export class A2AServerCoreV2 {
             version: config.agentCard.version ?? '0.0.0',
             description: config.agentCard.description ?? 'No description provided',
             url: `${baseUrl.replace(/\/$/, '')}${rpcPath}`, // Construct full URL
-            capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: false, ...config.agentCard.capabilities },
+            // Build capabilities: Start with detected defaults, then merge config
+            capabilities: {
+                streaming: defaultStreamingCapability,
+                pushNotifications: false, // TODO: Detect push capability?
+                stateTransitionHistory: false, // TODO: Detect history capability from store?
+                // Merge capabilities from the partial card config - these will override defaults
+                ...(config.agentCard.capabilities ?? {}),
+            },
             authentication: { schemes: [], ...config.agentCard.authentication },
             defaultInputModes: config.agentCard.defaultInputModes ?? ['text/plain'],
             defaultOutputModes: config.agentCard.defaultOutputModes ?? ['text/plain'],
@@ -77,19 +91,17 @@ export class A2AServerCoreV2 {
             throw new Error("A2A Core V2: AgentCard is missing required fields (name, version, url) after construction.");
         }
 
-        // --- Initialize SSE Manager --- //
-        this.sseManager = this.notificationServices.find(
-            (service): service is SseConnectionManager => service instanceof SseConnectionManager
-        ) ?? null;
-
+        // --- Final Checks/Warnings --- //
         if (this.processors.length === 0) {
             console.warn("[A2ACoreV2] No TaskProcessors (V2) configured.");
         }
+        // Warn if card *claims* streaming but manager wasn't found (shouldn't happen with new logic unless overridden)
         if (this.completeAgentCard.capabilities?.streaming && !this.sseManager) {
-            console.warn("[A2ACoreV2] Streaming enabled in AgentCard but SseConnectionManager not found in notificationServices.");
+            console.warn("[A2ACoreV2] Streaming enabled in final AgentCard but SseConnectionManager instance not available.");
         }
 
         console.log(`[A2ACoreV2] Initialized for agent: ${this.completeAgentCard.name} (v${this.completeAgentCard.version})`);
+        console.log(`[A2ACoreV2] Final Agent Card Capabilities:`, this.completeAgentCard.capabilities);
     }
 
     getAgentCard(): AgentCard {
@@ -100,37 +112,39 @@ export class A2AServerCoreV2 {
     // --- Core Task Handling ---
 
     async handleTaskSend(params: A2ATypes.TaskSendParams, authContext?: any): Promise<A2ATypes.Task> {
-        const existingTask = params.id ? await this.taskStore.getTask(params.id) : undefined;
+        const existingTaskCheck = params.id ? await this.taskStore.getTask(params.id) : undefined;
         const activeState = params.id ? this.activeGenerators.get(params.id) : undefined;
 
-        if (existingTask && activeState) {
+        if (existingTaskCheck && activeState) {
             // Task exists and generator is active/paused - attempt to resume
             console.log(`[A2ACoreV2] Resuming generator for task ${params.id}`);
             if (activeState.isCanceling) {
                  throw this._createError(A2AErrorCodes.InvalidRequest, `Task ${params.id} is currently being canceled and cannot accept input.`);
             }
-            if (this._isFinalState(existingTask.status.state) && existingTask.status.state !== 'input-required') {
-                 throw this._createError(A2AErrorCodes.InvalidRequest, `Task ${params.id} is in final state ${existingTask.status.state} and cannot be resumed.`);
+            if (this._isFinalState(existingTaskCheck.status.state) && existingTaskCheck.status.state !== 'input-required') {
+                 throw this._createError(A2AErrorCodes.InvalidRequest, `Task ${params.id} is in final state ${existingTaskCheck.status.state} and cannot be resumed.`);
             }
-            if (existingTask.status.state !== 'input-required') {
+            if (existingTaskCheck.status.state !== 'input-required') {
                  console.warn(`[A2ACoreV2] Resuming task ${params.id} which is not in 'input-required' state. Generator might not expect input.`);
             }
 
+            // --- History Update Logic (Reverted) --- 
+            // REMOVED: Logic to add previous agent message
+            // Just add the new incoming user message
             await this._addTaskHistory(params.id!, params.message);
-            // Fetch task WITH history to populate the context for resumption
-            // const currentTaskWithHistory = await this._getTaskOrThrow(params.id!, true); // No longer needed here
-            // const resumeContext: ProcessorStepContext = { task: currentTaskWithHistory }; // No longer needed here
-            // Pass only input, _trigger will get context from state
+            // --- End History Update Logic --- 
+            
+            // Trigger processing
             this._triggerGeneratorProcessing(params.id!, activeState.generator, { type: 'message', message: params.message });
 
-            const taskNow = await this._getTaskOrThrow(params.id!, true); // Fetch WITH history
+            const taskNow = await this._getTaskOrThrow(params.id!, true); 
             delete taskNow.internalState;
             return taskNow;
 
-        } else if (existingTask && !activeState) {
+        } else if (existingTaskCheck && !activeState) {
             // Task exists in store but no active generator (e.g., server restart, already completed/failed)
-             if (this._isFinalState(existingTask.status.state)) {
-                throw this._createError(A2AErrorCodes.InvalidRequest, `Task ${params.id} is already in final state ${existingTask.status.state}.`);
+             if (this._isFinalState(existingTaskCheck.status.state)) {
+                throw this._createError(A2AErrorCodes.InvalidRequest, `Task ${params.id} is already in final state ${existingTaskCheck.status.state}.`);
             } else {
                  // This simple core cannot resume generators across restarts.
                  // Option 1: Error out
@@ -145,20 +159,16 @@ export class A2AServerCoreV2 {
              const taskMetadata = { ...(params.metadata || {}), a2a_processorName: processor.constructor.name };
              let newTask = await this.taskStore.createOrGetTask({ ...params, metadata: taskMetadata });
              console.log(`[A2ACoreV2] Created/Got task ${newTask.id} with initial status ${newTask.status.state}.`);
+             // --- History Update Logic (New Task - Unchanged) --- 
              await this._addTaskHistory(newTask.id, params.message);
+             // --- End History Update Logic --- 
              newTask = await this._updateTaskStatus(newTask.id, 'working'); // Set to working
 
-             // Create the initial context object ONCE
              const initialContext: ProcessorStepContext = { task: newTask, isCanceling: false }; 
-             // Call process with the context object
              const generator = processor.process(initialContext, params, authContext);
-             
-             // Store generator AND context
              this.activeGenerators.set(newTask.id, { generator: generator, context: initialContext });
-             // Trigger the first run - no context param needed
              this._triggerGeneratorProcessing(newTask.id, generator);
 
-             // Prepare response (don't include history initially)
              const responseTask = { ...newTask };
              responseTask.history = []; 
              delete responseTask.internalState;
@@ -174,40 +184,38 @@ export class A2AServerCoreV2 {
     ): Promise<void> {
         this._ensureSseSupportedOrThrow();
         const sseManager = this.sseManager!;
-        const existingTask = params.id ? await this.taskStore.getTask(params.id) : undefined;
+        const existingTaskCheck = params.id ? await this.taskStore.getTask(params.id) : undefined;
         const activeState = params.id ? this.activeGenerators.get(params.id) : undefined;
         let taskId: string;
 
-        if (existingTask && activeState) {
-            taskId = existingTask.id;
+        if (existingTaskCheck && activeState) {
+            taskId = existingTaskCheck.id;
             console.log(`[A2ACoreV2] Resuming generator via SSE for task ${taskId}`);
             if (activeState.isCanceling) {
                 sseResponse.status(409).end('Task is currently being canceled.'); 
                 return;
             }
-            if (this._isFinalState(existingTask.status.state) && existingTask.status.state !== 'input-required') {
+            if (this._isFinalState(existingTaskCheck.status.state) && existingTaskCheck.status.state !== 'input-required') {
                   sseManager.addSubscription(taskId, requestId, sseResponse);
-                  this._sendSseEvent(sseManager, taskId, requestId, { type: 'status', status: existingTask.status, final: true, metadata: existingTask.metadata });
+                  this._sendSseEvent(sseManager, taskId, requestId, { type: 'status', status: existingTaskCheck.status, final: true, metadata: existingTaskCheck.metadata });
                   sseResponse.end(); return;
             }
-             if (existingTask.status.state !== 'input-required') {
+             if (existingTaskCheck.status.state !== 'input-required') {
                  console.warn(`[A2ACoreV2] Resuming task ${taskId} via SSE which is not in 'input-required' state.`);
             }
 
             sseManager.addSubscription(taskId, requestId, sseResponse);
-            await this._addTaskHistory(taskId, params.message);
-            // Trigger processing - context will be updated internally before next()
-            // Fetch task WITH history to populate the context for resumption
-            // const currentTaskWithHistory = await this._getTaskOrThrow(taskId, true); // No longer needed here
-            // const resumeContext: ProcessorStepContext = { task: currentTaskWithHistory }; // No longer needed here
-            // Pass only input, _trigger will get context from state
+             // --- History Update Logic (Reverted) --- 
+             // REMOVED: Logic to add previous agent message
+             await this._addTaskHistory(taskId, params.message);
+             // --- End History Update Logic --- 
             this._triggerGeneratorProcessing(taskId, activeState.generator, { type: 'message', message: params.message });
 
-        } else if (existingTask && !activeState) {
-            taskId = existingTask.id;
-             if (this._isFinalState(existingTask.status.state)) {
+        } else if (existingTaskCheck && !activeState) {
+            taskId = existingTaskCheck.id;
+             if (this._isFinalState(existingTaskCheck.status.state)) {
                  sseManager.addSubscription(taskId, requestId, sseResponse); 
-                 this._sendSseEvent(sseManager, taskId, requestId, { type: 'status', status: existingTask.status, final: true, metadata: existingTask.metadata });
+                 this._sendSseEvent(sseManager, taskId, requestId, { type: 'status', status: existingTaskCheck.status, final: true, metadata: existingTaskCheck.metadata });
                  sseResponse.end();
                  return;
             } else {
@@ -223,16 +231,15 @@ export class A2AServerCoreV2 {
              let newTask = await this.taskStore.createOrGetTask({ ...params, metadata: taskMetadata });
              taskId = newTask.id;
              console.log(`[A2ACoreV2] Created/Got task ${taskId} via SSE with initial status ${newTask.status.state}.`);
+             // --- History Update Logic (New Task - Unchanged) --- 
              await this._addTaskHistory(taskId, params.message);
+             // --- End History Update Logic --- 
              sseManager.addSubscription(taskId, requestId, sseResponse);
              newTask = await this._updateTaskStatus(taskId, 'working'); 
 
-             // Create initial context object ONCE
              const initialContext: ProcessorStepContext = { task: newTask, isCanceling: false };
              const generator = processor.process(initialContext, params, authContext);
-             // Store generator AND context
              this.activeGenerators.set(taskId, { generator: generator, context: initialContext }); 
-             // Trigger first run - no context param needed
              this._triggerGeneratorProcessing(taskId, generator);
         }
     }
@@ -262,7 +269,9 @@ export class A2AServerCoreV2 {
     }
 
     async handleTaskGet(params: A2ATypes.TaskGetParams, authContext?: any): Promise<A2ATypes.Task> {
+        console.log(`[A2ACoreV2] handleTaskGet: params: ${JSON.stringify(params)}`);
         const task = await this._getTaskOrThrow(params.id);
+        console.log(`[A2ACoreV2] handleTaskGet: task: ${JSON.stringify(task)}`);
         if (params.historyLength !== 0) {
              const historyLength = Math.min(params.historyLength ?? this.maxHistoryLength, this.maxHistoryLength);
              task.history = await this.taskStore.getTaskHistory(params.id, historyLength);
@@ -275,16 +284,21 @@ export class A2AServerCoreV2 {
 
     async handleTaskCancel(params: A2ATypes.TaskCancelParams, authContext?: any): Promise<A2ATypes.Task> {
         const taskId = params.id;
-        let task = await this._getTaskOrThrow(taskId, false); // Don't need history here
+        let task = await this._getTaskOrThrow(taskId, false); 
         if (this._isFinalState(task.status.state)) {
             console.log(`[A2ACoreV2] Task ${taskId} already final. No cancel action needed.`);
             delete task.internalState;
             delete task.history; // Ensure no history returned
             return task;
         }
+
+        // --- History Update Logic (Reverted) --- 
+        // REMOVED: Logic to add previous agent message
+        // Add the user's cancellation message if provided
         if (params.message) {
             await this._addTaskHistory(taskId, params.message);
         }
+        // --- End History Update Logic --- 
 
         const activeState = this.activeGenerators.get(taskId);
 
@@ -311,11 +325,12 @@ export class A2AServerCoreV2 {
             }
         } else {
             console.log(`[A2ACoreV2] No active generator for task ${taskId}. Updating status to canceled in store.`);
-            task = await this._updateTaskStatus(taskId, 'canceled', params.message);
+            task = await this._updateTaskStatus(taskId, 'canceled', undefined); // Don't pass cancel message to status
         }
         const finalTaskState = await this.taskStore.getTask(taskId); 
         if (!finalTaskState) throw this._createError(A2AErrorCodes.InternalError, `Task ${taskId} disappeared during cancel.`);
-        finalTaskState.history = []; // Return empty history on cancel success
+        // Don't return history on cancel
+        // finalTaskState.history = []; // <-- Let history be returned if needed/fetched
         delete finalTaskState.internalState;
         return finalTaskState;
     }
@@ -523,9 +538,8 @@ export class A2AServerCoreV2 {
     }
 
     private async _updateTaskStatus(taskId: string, newState: A2ATypes.TaskState, message?: A2ATypes.Message): Promise<A2ATypes.Task> {
-        const taskBefore = await this._getTaskOrThrow(taskId, false); 
         const now = new Date().toISOString();
-        const statusUpdate: A2ATypes.TaskStatus = { state: newState, timestamp: now, message };
+        const statusUpdate: A2ATypes.TaskStatus = { state: newState, timestamp: now, message }; 
 
         const updatedTask = await this.taskStore.updateTask(taskId, { status: statusUpdate });
          if (!updatedTask) {
@@ -533,16 +547,20 @@ export class A2AServerCoreV2 {
          }
          console.log(`[A2ACoreV2] Task ${taskId} status updated to ${newState} in store.`);
 
-         if (message && message.role === 'agent' && newState !== 'input-required') {
+         // Add agent message to history immediately 
+         if (message && message.role === 'agent') {
+             console.log(`[A2ACoreV2] Adding agent message from status update to history for task ${taskId}.`);
              await this._addTaskHistory(taskId, message);
          }
 
          if (this.sseManager) {
-             const isStreamEndingEvent = this._isFinalState(newState) || newState === 'input-required'; 
+             // Final flag should ONLY be true for terminal task states
+             const isStreamEndingEvent = this._isFinalState(newState);
+             console.log(`[A2ACoreV2] Sending SSE status update for task ${taskId}. State: ${newState}, Final: ${isStreamEndingEvent}`);
              this._sendSseEvent(this.sseManager, taskId, null, { 
                  type: 'status',
-                 status: updatedTask.status,
-                 final: isStreamEndingEvent, 
+                 status: updatedTask.status, 
+                 final: isStreamEndingEvent, // Correctly set based only on terminal states
                  metadata: updatedTask.metadata
              });
          }

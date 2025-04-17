@@ -110,6 +110,11 @@ export class A2AClient {
     private _sseReconnectAttempts: number = 0;
     private _pollErrorAttempts: number = 0;
 
+    // Flag to prevent concurrent task fetches triggered by SSE
+    // REMOVED: private _isFetchingTaskState = false;
+    // Controller for the currently active tasks/get triggered by SSE/polling
+    private _currentTaskFetchController: AbortController | null = null;
+
     // --- Static Factory Methods ---
 
     /**
@@ -423,17 +428,29 @@ export class A2AClient {
 
         try {
             // Perform the cancel request using the current abort controller
-            const result = await this._request<TaskCancelParams, Task>('tasks/cancel', { id: this.taskId });
+            // Use the main abort controller for the cancel action itself.
+            const result = await this._request<TaskCancelParams, Task>('tasks/cancel', { id: this.taskId }, this._abortController?.signal);
             console.log('A2AClient.cancel: tasks/cancel successful.');
 
-            // Update local task state based on cancel response
-            // Use the new _updateAndEmit method for consistency
-            this._updateTaskStateAndEmit(result, 'task-canceled-by-client'); // Force update with final state
+            // --- ADDED: Fetch final state AFTER successful cancel --- 
+            console.log('A2AClient.cancel: Fetching final task state after cancellation...');
+            await this._fetchAndUpdateTaskState();
+            // _fetchAndUpdateTaskState will handle emitting final status/task events.
+            // --- END ADDED --- 
+
+            // Don't update from potentially incomplete `result` anymore
+            // REMOVED: this._updateTaskStateAndEmit(result, 'task-canceled-by-client'); 
 
             // Explicitly close with the final reason
              this._stopCommunication('task-canceled-by-client', true); // true = emit close event
 
         } catch (error: any) {
+            // Ignore abort errors specifically for the cancel request itself
+            if (error.name === 'AbortError') {
+                console.warn('A2AClient.cancel: tasks/cancel request aborted. This might happen if close() was called concurrently.');
+                // Do not transition to error state if the cancel itself was aborted
+                return;
+            }
             console.error('Error during tasks/cancel request:', error);
             this._emitter.emit('error', { error, context: 'cancel' } satisfies ErrorPayload);
              // Close with an error reason
@@ -464,6 +481,11 @@ export class A2AClient {
     /** Gets the current internal management state of the client. */
     public getCurrentState(): ClientManagedState {
         return this._currentState;
+    }
+
+    /** Gets the agent card, if fetched. */
+    public get agentCard(): A2ATypes.AgentCard | null {
+        return this._agentCard ? structuredClone(this._agentCard) : null;
     }
 
     /** Registers an event listener. */
@@ -640,150 +662,130 @@ export class A2AClient {
     }
 
     private _handleSseEvent(eventType: string, eventData: any): void {
-        console.log(`A2AClient._handleSseEvent: Received SSE message. Analyzing data...`);
-        // NOTE: eventType parameter is now ignored as server omits 'event:' line.
-        // We determine type by inspecting eventData (the result object).
+        console.log(`A2AClient._handleSseEvent: Received SSE event. Data keys: ${Object.keys(eventData).join(', ')}`);
+        // NOTE: eventType parameter is ignored.
 
-        // Ensure we have a base task object to update, create shell if needed (esp. for resubscribe)
-        if (!this._lastKnownTask) {
-             console.warn("A2AClient._handleSseEvent: _lastKnownTask is null. Creating shell task.");
-             this._lastKnownTask = {
-                 id: this.taskId,
-                 status: { state: 'unknown', timestamp: new Date().toISOString() },
-                 artifacts: [],
-                 history: [],
-                 createdAt: new Date().toISOString(),
-                 updatedAt: new Date().toISOString(),
-             };
+        let isFinalEvent = false;
+        let isStatusUpdate = false;
+        let isArtifactUpdate = false;
+
+        // Determine event type and if it's final
+            if ('status' in eventData && eventData.status) {
+            isStatusUpdate = true;
+            // The 'final' flag indicates the end of *this* SSE response stream
+            isFinalEvent = eventData.final === true; 
+            console.log(`A2AClient._handleSseEvent: Status event detected (Stream Final: ${isFinalEvent}, State: ${eventData.status.state}).`);
+        } else if ('artifact' in eventData && eventData.artifact) {
+            isArtifactUpdate = true;
+             console.log(`A2AClient._handleSseEvent: Artifact event detected.`);
+             // Artifact events themselves don't carry the 'final' flag for the stream
+        } else {
+            console.warn(`A2AClient._handleSseEvent: Received SSE data with unknown structure:`, eventData);
+            return; // Ignore unknown events
         }
 
-        let taskChanged = false;
-        let specificUpdate: { status: TaskStatus } | { artifact: Artifact } | null = null;
-        let isFinalEvent = false;
-
-        try {
-            // Check for Status Update
-            if ('status' in eventData && eventData.status) {
-                 console.log("A2AClient._handleSseEvent: Detected TaskStatusUpdate.");
-                 const statusUpdate = eventData as Partial<TaskStatusUpdateEvent>; // Payload is the result object
-                 const newStatus = statusUpdate.status!;
-                 const oldStatus = this._lastKnownTask!.status; // Should exist by now
-                 isFinalEvent = statusUpdate.final === true;
-                 console.log(`A2AClient._handleSseEvent: TaskStatusUpdate - State: ${newStatus.state}, Final: ${isFinalEvent}`);
-
-                 if (!deepEqual(newStatus, oldStatus)) {
-                     this._lastKnownTask!.status = newStatus;
-                     this._lastKnownTask!.updatedAt = newStatus.timestamp || new Date().toISOString();
-                     if (oldStatus.state !== newStatus.state || !deepEqual(oldStatus.message, newStatus.message)) {
-                         taskChanged = true;
-                     }
-                     specificUpdate = { status: newStatus };
-                 }
-                 if (newStatus.state === 'input-required' && this._currentState !== 'input-required') {
-                     this._setState('input-required', 'sse status update');
-                 } else if (newStatus.state !== 'input-required' && this._currentState === 'input-required') {
-                     this._setState('connected-sse', 'sse status recovered from input-required');
-                 }
+        // --- Trigger Task Fetch for ALL Status/Artifact Updates --- 
+        // We always fetch the full state via GET upon receiving an SSE update trigger.
+        const shouldFetchUpdate = isStatusUpdate || isArtifactUpdate;
+        if (shouldFetchUpdate) {
+            if (!this._currentTaskFetchController) {
+                this._currentTaskFetchController = new AbortController();
             }
-            // Check for Artifact Update
-            else if ('artifact' in eventData && eventData.artifact) {
-                 console.log("A2AClient._handleSseEvent: Detected TaskArtifactUpdate.");
-                 const artifactUpdate = eventData as Partial<TaskArtifactUpdateEvent>; // Payload is the result object
-                 const artifactData = artifactUpdate.artifact!;
+            console.log("A2AClient._handleSseEvent: Initiating _fetchAndUpdateTaskState triggered by SSE event.");
+            this._fetchAndUpdateTaskState() 
+                .finally(() => {
+                    this._currentTaskFetchController = null;
+                });
+        }
 
-                 if (typeof artifactData.index !== 'number') {
-                      throw new Error("Invalid TaskArtifactUpdate event: missing or invalid artifact index.");
-                 }
-                 console.log(`A2AClient._handleSseEvent: TaskArtifactUpdate - Index: ${artifactData.index}, Append: ${artifactData.append}, LastChunk: ${artifactData.lastChunk}`);
-
-                 if (!this._lastKnownTask!.artifacts) this._lastKnownTask!.artifacts = [];
-
-                 let existingArtifact = this._lastKnownTask!.artifacts.find(a => a.index === artifactData.index);
-                 let updatedArtifact: Artifact | null = null;
-
-                 if (artifactData.append && existingArtifact) {
-                     // Append parts
-                     if (!existingArtifact.parts) existingArtifact.parts = [];
-                     existingArtifact.parts.push(...(artifactData.parts || []));
-                     existingArtifact.lastChunk = artifactData.lastChunk;
-                     existingArtifact.timestamp = artifactData.timestamp || new Date().toISOString();
-                     updatedArtifact = existingArtifact;
-                     console.log(`A2AClient._handleSseEvent: Appended parts to artifact index ${artifactData.index}. Total parts: ${existingArtifact.parts.length}`);
-                 } else {
-                     // Replace or add new artifact
-                     const newArtifact: Artifact = {
-                         index: artifactData.index,
-                         parts: artifactData.parts || [],
-                         timestamp: artifactData.timestamp || new Date().toISOString(),
-                         name: artifactData.name,
-                         description: artifactData.description,
-                         append: artifactData.append,
-                         lastChunk: artifactData.lastChunk,
-                         metadata: artifactData.metadata,
-                     };
-                     if (existingArtifact) {
-                         const idx = this._lastKnownTask!.artifacts.indexOf(existingArtifact);
-                         this._lastKnownTask!.artifacts[idx] = newArtifact;
-                         console.log(`A2AClient._handleSseEvent: Replaced artifact at index ${artifactData.index}.`);
-                     } else {
-                         this._lastKnownTask!.artifacts.push(newArtifact);
-                         this._lastKnownTask!.artifacts.sort((a, b) => a.index - b.index);
-                         console.log(`A2AClient._handleSseEvent: Added new artifact at index ${artifactData.index}.`);
-                     }
-                     updatedArtifact = newArtifact;
-                 }
-                 this._lastKnownTask!.updatedAt = new Date().toISOString();
-                 taskChanged = true;
-                 if (updatedArtifact) {
-                     specificUpdate = { artifact: updatedArtifact };
-                 }
-            }
-            // Handle other potential event types (if any added later)
-            else {
-                 console.warn(`A2AClient._handleSseEvent: Received SSE data with unknown structure:`, eventData);
-            }
-
-             // --- Emit Events ---
-             if (taskChanged && this._lastKnownTask) {
-                 const currentTaskSnapshot = this.getCurrentTask()!; // Get deep copy
-                 if (specificUpdate) {
-                     if ('status' in specificUpdate) {
-                         this._emitter.emit('status-update', { status: specificUpdate.status, task: currentTaskSnapshot } satisfies StatusUpdatePayload);
-                     } else if ('artifact' in specificUpdate) {
-                         // Type guard specificUpdate again before accessing artifact property
-                          if (specificUpdate.artifact) {
-                             this._emitter.emit('artifact-update', { artifact: specificUpdate.artifact, task: currentTaskSnapshot } satisfies ArtifactUpdatePayload);
-                          }
-                     }
-                 }
-                 this._emitter.emit('task-update', { task: currentTaskSnapshot } satisfies TaskUpdatePayload);
-             }
-
-             // --- Handle Final Event ---
-             if (isFinalEvent) {
-                 console.log("A2AClient._handleSseEvent: Final event received. Checking task state...");
-                 // Determine close reason based on the final *task* state reported
-                 const finalTaskState = this._lastKnownTask?.status?.state ?? 'unknown';
-                 if (this._isFinalTaskState(finalTaskState)) {
-                     const reason = this._getCloseReasonFromState(finalTaskState);
-                     console.log(`A2AClient._handleSseEvent: Task state ${finalTaskState} is final. Closing communication with reason: ${reason}.`);
-                     this._stopCommunication(reason, true); // true = emit close event
-                 } else {
-                     console.log(`A2AClient._handleSseEvent: Task state ${finalTaskState} is not final. SSE stream ended, but client remains active (State: ${this._currentState}).`);
-                     // Do nothing - client should already be in the correct state (e.g., 'input-required')
-                     // Abort the current SSE request processing, but don't change client state from input-required etc.
-                     this._abortController?.abort(); // Abort any further processing of *this* stream
-                 }
-             }
-
-        } catch (e: any) {
-            console.error(`A2AClient._handleSseEvent: Error processing event:`, e);
-            this._emitter.emit('error', { error: e, context: 'sse-task-sync' } satisfies ErrorPayload);
-            // Consider reconnecting or going fatal on processing errors? Let's try reconnecting.
-             this._reconnectSse();
+        // --- Handle Stream End --- 
+        // If the server indicated this specific stream is ending (final:true),
+        // abort the current SSE stream reader processing loop, but DO NOT close the client instance.
+        // The client state (e.g., input-required) will be set correctly by the _fetchAndUpdateTaskState call triggered above.
+        if (isFinalEvent) {
+            console.log("A2AClient._handleSseEvent: SSE stream marked as final. Aborting current stream reader.");
+            // Abort the controller currently processing this specific SSE stream.
+            // NOTE: This assumes _startSse creates a controller per attempt. If it uses the main one,
+            // this could interfere with user actions. Let's assume for now _startSse manages its own stream controller.
+            // If _startSse uses the main _abortController, we should NOT abort it here, just let the stream end naturally.
+            // Re-checking _startSse - it DOES create a new AbortController per attempt.
+            this._abortController?.abort(); // Okay to abort the current stream processing.
         }
     }
 
+    /** 
+     * Fetches the full task state via tasks/get and processes the update.
+     * Used by SSE handler and potentially polling retry logic.
+     */
+    private async _fetchAndUpdateTaskState(): Promise<void> {
+        // Check state before fetching - don't fetch if closed/error
+        if (this._isTerminalState(this._currentState)) {
+            console.log("A2AClient._fetchAndUpdateTaskState: Client is in terminal state, skipping fetch.");
+            return;
+        }
+
+        // Abort any previously running fetch triggered by this method
+        if (this._currentTaskFetchController) {
+            console.log("A2AClient._fetchAndUpdateTaskState: Aborting previous in-flight task fetch.");
+            this._currentTaskFetchController.abort();
+        }
+
+        // Create a new controller for *this* fetch attempt
+        const fetchAbortController = new AbortController();
+        this._currentTaskFetchController = fetchAbortController;
+        
+        console.log("A2AClient._fetchAndUpdateTaskState: Fetching latest task state via tasks/get.");
+        try {
+            const getParams: TaskGetParams = { id: this.taskId, historyLength: this.config.pollHistoryLength };
+            // Pass the specific signal for this fetch to _request
+            const newTask = await this._request<TaskGetParams, Task>('tasks/get', getParams, fetchAbortController.signal);
+            
+            // If the fetch completed but was aborted just before processing, don't process.
+            if (fetchAbortController.signal.aborted) {
+                console.log("A2AClient._fetchAndUpdateTaskState: Fetch completed but controller was aborted before processing. Skipping update.");
+                return;
+            }
+            
+            console.log(`A2AClient._fetchAndUpdateTaskState: Received tasks/get response. State: ${newTask.status.state}`);
+
+            // Process the fetched task using the same diffing logic as polling
+            this._diffAndEmitUpdates(newTask);
+
+            // State management after diffing (final/input-required) is handled within _diffAndEmitUpdates
+            // Check if we need to resume SSE connection if state recovered from input-required?
+             if (this._currentState === 'connected-sse') { // Check if diff put us back in connected state
+                 console.log("A2AClient._fetchAndUpdateTaskState: Task updated, remaining in connected-sse state.");
+                 // SSE connection should still be alive, do nothing extra.
+             }
+             // If diffAndEmitUpdates changed state to final/input-required, it will be handled there.
+
+        } catch (error: any) {
+            // Ignore AbortErrors as they are expected if a newer fetch cancels this one
+            if (error.name === 'AbortError') {
+                console.log("A2AClient._fetchAndUpdateTaskState: Task fetch aborted (likely by a newer fetch). Ignoring error.");
+                return;
+            }
+            // Treat other errors during this fetch similar to polling errors
+             // --- MODIFIED: Check for AbortError before logging as error --- 
+             if (!(error instanceof Error && error.name === 'AbortError')) {
+                 console.error("A2AClient._fetchAndUpdateTaskState: Error during tasks/get:", error);
+             }
+             // --- END MODIFIED --- 
+             this._emitter.emit('error', { error, context: 'poll-get' } satisfies ErrorPayload); // Reuse poll context
+             // Decide if this should trigger reconnect/retry or be fatal? 
+             // If SSE is still connected, maybe just log and wait for next SSE trigger?
+             // If SSE disconnected, _reconnectSse would handle retries.
+             // Let's just log for now, assuming SSE connection might still trigger another update.
+             // If this fetch was triggered by polling, the polling logic handles retries.
+        } finally {
+            // Clear the controller reference *only if* it's still the one from this call
+            if (this._currentTaskFetchController === fetchAbortController) {
+                this._currentTaskFetchController = null;
+            }
+        }
+    }
+
+    // --- Reconnect Logic (Restored) ---
     private _reconnectSse(): void {
         if (this._isTerminalState(this._currentState) || this._currentState === 'sending' || this._currentState === 'canceling') {
             console.log(`A2AClient._reconnectSse: Cannot reconnect in state ${this._currentState}.`);
@@ -798,8 +800,7 @@ export class A2AClient {
         console.log(`A2AClient._reconnectSse: Attempting SSE reconnect (${this._sseReconnectAttempts}/${this.config.sseMaxReconnectAttempts}).`);
 
         if (this._sseReconnectAttempts > this.config.sseMaxReconnectAttempts) {
-            // FIX: Call _handleFatalError without returning its result
-            this._handleFatalError(new Error("SSE reconnection failed."), 'sse-reconnect-failed');
+            this._handleFatalError(new Error("SSE reconnection failed after maximum attempts."), 'sse-reconnect-failed');
             return; // Exit after handling fatal error
         }
 
@@ -808,18 +809,18 @@ export class A2AClient {
         this._setState('reconnecting-sse');
 
         this._reconnectTimerId = setTimeout(async () => {
-            console.log(`A2AClient._reconnectSse: TIMER FIRED. Current state: ${this._currentState}`); // DEBUG
+            console.log(`A2AClient._reconnectSse: Reconnect timer fired. Current state: ${this._currentState}`);
             this._reconnectTimerId = null;
             if (this._currentState !== 'reconnecting-sse') {
-                 console.log(`A2AClient._reconnectSse: Reconnect timer fired, but state is now ${this._currentState}. Aborting.`);
+                 console.log(`A2AClient._reconnectSse: Reconnect timer fired, but state is now ${this._currentState}. Aborting reconnect attempt.`);
                  return;
             }
-            // Start SSE using resubscribe
+            // Start SSE using resubscribe - state will transition inside _startSse
+            console.log(`A2AClient._reconnectSse: Calling _startSse with tasks/resubscribe.`);
             await this._startSse('tasks/resubscribe', { id: this.taskId });
-            // _startSse will handle errors and potentially call _reconnectSse again
         }, delay);
     }
-
+    // --- End Reconnect Logic ---
 
     // --- Polling Implementation ---
 
@@ -839,7 +840,7 @@ export class A2AClient {
                  // --- ADDED: Immediate follow-up GET after SEND ---
                  console.log('A2AClient._startPolling: Performing immediate follow-up tasks/get after send.');
                  try {
-                    const getParams: TaskGetParams = { id: this.taskId, historyLength: this.config.pollHistoryLength };
+                 const getParams: TaskGetParams = { id: this.taskId, historyLength: this.config.pollHistoryLength };
                     taskAfterAction = await this._request<TaskGetParams, Task>('tasks/get', getParams);
                     console.log('A2AClient._startPolling: Received response from follow-up tasks/get.');
                  } catch (followUpGetError: any) {
@@ -883,9 +884,9 @@ export class A2AClient {
             // Catch errors during initial send/get or follow-up get
             // The context might have been set by _handleFatalError if the follow-up get failed
             if (!this._isTerminalState(this._currentState)) {
-                const context = initialParams ? 'initial-send' : 'initial-get';
+            const context = initialParams ? 'initial-send' : 'initial-get';
                 console.error(`A2AClient._startPolling: Error during initial request sequence (${context}):`, error);
-                this._handleFatalError(error, context);
+            this._handleFatalError(error, context);
             }
         }
     }
@@ -920,34 +921,21 @@ export class A2AClient {
         this._setState('polling', 'pollTask execution');
 
         try {
-            console.log('A2AClient._pollTask: Performing tasks/get');
-            const getParams: TaskGetParams = { id: this.taskId, historyLength: this.config.pollHistoryLength };
-            const newTask = await this._request<TaskGetParams, Task>('tasks/get', getParams);
-            console.log('A2AClient._pollTask: Received tasks/get response.');
-
+            await this._fetchAndUpdateTaskState(); // Use the common fetch+update logic
             this._pollErrorAttempts = 0; // Reset error count on success
 
-            // Diff and emit updates based on the new full task state
-            this._diffAndEmitUpdates(newTask);
-
-            // Check new state for completion or input required (state updated by diff)
-            if (this._isFinalTaskState(newTask.status.state)) {
-                const reason = this._getCloseReasonFromState(newTask.status.state);
-                console.log(`A2AClient._pollTask: Task finished (${newTask.status.state}). Stopping poll.`);
-                this._stopCommunication(reason, true); // Emit close
-            } else if (newTask.status.state === 'input-required') {
-                 console.log('A2AClient._pollTask: Task requires input. Stopping poll loop.');
-                 this._setState('input-required', 'pollTask found input-required'); // Ensure state is set
-                 // Do NOT schedule next poll
+            // Check state *after* the update is processed
+            if (this._currentState === 'polling') { // Still polling?
+                this._pollTaskLoop(); // Schedule next poll
             } else {
-                // Task still active, schedule next poll
-                this._pollTaskLoop();
+                 console.log(`A2AClient._pollTask: State changed to ${this._currentState} after fetch/update. Not rescheduling poll.`);
             }
-
         } catch (error: any) {
+            // Error handling moved into _fetchAndUpdateTaskState, but polling needs retry logic
             this._pollErrorAttempts++;
-            console.error(`A2AClient._pollTask: Error during tasks/get (attempt ${this._pollErrorAttempts}/${this.config.pollMaxErrorAttempts}):`, error);
-            this._emitter.emit('error', { error, context: 'poll-get' } satisfies ErrorPayload);
+            console.error(`A2AClient._pollTask: Error during poll cycle (attempt ${this._pollErrorAttempts}/${this.config.pollMaxErrorAttempts}):`, error);
+            // Emit error? _fetchAndUpdate should have done it.
+            // this._emitter.emit('error', { error, context: 'poll-get' } satisfies ErrorPayload);
 
             if (this._pollErrorAttempts >= this.config.pollMaxErrorAttempts) {
                 this._handleFatalError(new Error(`Polling failed after ${this.config.pollMaxErrorAttempts} attempts.`), 'poll-retry-failed');
@@ -955,7 +943,7 @@ export class A2AClient {
                 // Schedule retry
                 this._setState('retrying-poll');
                 console.log(`A2AClient._pollTask: Scheduling poll retry.`);
-                this._pollTaskLoop(); // Schedule the next attempt (with delay)
+                this._pollTaskLoop(); 
             }
         }
     }
@@ -1084,7 +1072,7 @@ export class A2AClient {
 
 
     // --- Core Communication ---
-    private async _request<TParams, TResult>(method: string, params: TParams): Promise<TResult> {
+    private async _request<TParams, TResult>(method: string, params: TParams, signal?: AbortSignal): Promise<TResult> {
         console.log(`A2AClient._request: Sending method '${method}'`);
         const requestId = crypto.randomUUID();
         const requestBody = { jsonrpc: "2.0", id: requestId, method, params };
@@ -1099,17 +1087,22 @@ export class A2AClient {
              throw new AuthenticationError(`Authentication failed: ${authError.message}`);
         }
 
-        const signal = this._abortController?.signal; // Use current abort controller
         let response: Response;
         try {
             response = await fetch(this.agentEndpointUrl, { method: 'POST', headers, body: JSON.stringify(requestBody), signal });
         } catch (fetchError: any) {
+            // --- MODIFIED: Check for AbortError *before* logging --- 
+            if (signal?.aborted || (fetchError instanceof Error && fetchError.name === 'AbortError')) { 
+                // Don't log expected aborts as errors
+                throw new DOMException(`Request aborted: ${method}`, 'AbortError'); 
+            }
+            // Log only actual unexpected fetch errors
             console.error(`A2AClient._request: Fetch error for method '${method}':`, fetchError);
-            if (signal?.aborted || fetchError.name === 'AbortError') { throw new Error(`Request aborted: ${method}`); }
-            throw new Error(`Network error during request: ${fetchError.message}`);
+            // --- END MODIFIED --- 
+            throw new Error(`Network error during request: ${fetchError.message}`); // Generic wrapper for other errors
         }
 
-         if (signal?.aborted) { throw new Error(`Request aborted: ${method}`); } // Check after fetch
+         if (signal?.aborted) { throw new DOMException(`Request aborted: ${method}`, 'AbortError'); } // Check after fetch
 
         if (!response.ok) {
              const responseText = await response.text().catch(() => '{Could not read response body}');
@@ -1155,15 +1148,21 @@ export class A2AClient {
 
         const previousState = this._currentState;
 
-        // 1. Abort in-flight operations
+        // 1. Abort main controller (for SSE/Polling loop)
         if (this._abortController) {
-            console.log('A2AClient._stopCommunication: Aborting controller.');
+            console.log('A2AClient._stopCommunication: Aborting main controller.');
             this._abortController.abort();
             this._abortController = null; // Clear controller
         } else {
-            console.log('A2AClient._stopCommunication: No active abort controller to abort.');
+            console.log('A2AClient._stopCommunication: No active main abort controller to abort.');
         }
 
+        // Abort any in-flight task fetch controller
+        if (this._currentTaskFetchController) {
+            console.log('A2AClient._stopCommunication: Aborting current task fetch controller.');
+            this._currentTaskFetchController.abort();
+            this._currentTaskFetchController = null;
+        }
 
         // 2. Clear timers
         if (this._pollTimerId) { clearTimeout(this._pollTimerId); this._pollTimerId = null; }
@@ -1172,7 +1171,7 @@ export class A2AClient {
         // 3. Reset counters
         this._resetCounters();
 
-        // 4. Set final state and emit close event ONLY if requested
+        // 4. Set final state and emit close event
         if (emitCloseEvent) {
             // Determine final state based on reason
             let finalState: ClientManagedState = 'closed';

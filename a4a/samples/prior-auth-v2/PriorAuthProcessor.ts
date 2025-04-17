@@ -23,7 +23,7 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
     }
 
     async canHandle(_params: TaskSendParams): Promise<boolean> {
-        return true;
+            return true;
     }
 
     async *process(context: ProcessorStepContext, initialParams: TaskSendParams): AsyncGenerator<ProcessorYieldValue, void, ProcessorInputValue> {
@@ -37,24 +37,52 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
             yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Processing prior authorization request...' }] } };
 
             // --- 1. Extract Request Text --- 
-            const initialTextPart = initialParams.message.parts.find((p): p is TextPart => p.type === 'text');
-            if (!initialTextPart?.text) {
-                yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: 'Request message must contain text describing the prior authorization need.' }] } };
-                return;
+            let initialRequestText = initialParams.message.parts.find((p): p is TextPart => p.type === 'text')?.text;
+            // Prompt user for request text until provided
+            while (!initialRequestText) {
+                const inputPrompt: Message = {
+                    role: 'agent',
+                    parts: [{ type: 'text', text: 'Please describe the prior authorization need.' }]
+                };
+                const userInput = yield { type: 'statusUpdate', state: 'input-required', message: inputPrompt };
+                if (!userInput || userInput.type !== 'message') {
+                    throw new ProcessorCancellationError('User did not provide the prior authorization request details.');
+                }
+                const textPart = userInput.message.parts.find((p): p is TextPart => p.type === 'text');
+                if (!textPart?.text) {
+                    yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text. Please describe the request.' }] } };
+                    continue;
+                }
+                initialRequestText = textPart.text;
             }
-            const initialRequestText = initialTextPart.text;
             console.log(`[PriorAuthProc ${taskId}] Received request text: ${initialRequestText.substring(0, 100)}...`);
 
 
             // --- 2. Parse Request Details using Evaluator --- 
-            yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Parsing request details...' }] } };
-            try {
-                 requestDetails = await this.evaluator.parseInitialRequest(initialRequestText, taskId);
-                 console.log(`[PriorAuthProc ${taskId}] Parsed request details:`, requestDetails);
-            } catch (parseError: any) {
-                 console.error(`[PriorAuthProc ${taskId}] Error parsing request details:`, parseError);
-                 yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: `Failed to understand the request: ${parseError.message}` }] } };
-                 return;
+            let parsed = false;
+            while (!parsed) {
+                yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Parsing request details...' }] } };
+                try {
+                    requestDetails = await this.evaluator.parseInitialRequest(initialRequestText!, taskId);
+                    console.log(`[PriorAuthProc ${taskId}] Parsed request details:`, requestDetails);
+                    parsed = true;
+                } catch (parseError: any) {
+                    console.error(`[PriorAuthProc ${taskId}] Error parsing request details:`, parseError);
+                    const detailPrompt: Message = {
+                        role: 'agent',
+                        parts: [{ type: 'text', text: `Failed to understand the request: ${parseError.message}. Please provide more details.` }]
+                    };
+                    const userInput = yield { type: 'statusUpdate', state: 'input-required', message: detailPrompt };
+                    if (!userInput || userInput.type !== 'message') {
+                        throw new ProcessorCancellationError('User did not provide additional details for the request.');
+                    }
+                    const textPart = userInput.message.parts.find((p): p is TextPart => p.type === 'text');
+                    if (!textPart?.text) {
+                        yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text. Please provide additional details.' }] } };
+                        continue;
+                    }
+                    initialRequestText = textPart.text;
+                }
             }
 
 
@@ -76,7 +104,7 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
 
 
             // --- 4. Find Relevant Policy using Evaluator --- 
-            const selectedPolicyFilename = await this.evaluator.findRelevantPolicy(requestDetails, policyFiles, taskId);
+            const selectedPolicyFilename = await this.evaluator.findRelevantPolicy(requestDetails!, policyFiles, taskId);
 
             if (!selectedPolicyFilename) {
                 console.log(`[PriorAuthProc ${taskId}] Evaluator did not find a relevant policy.`);
@@ -100,7 +128,7 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
             // --- 6. Initial Evaluation ---
             yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Evaluating clinical summary against policy criteria...' }] } };
             try {
-                 evaluationResult = await this.evaluator.evaluateAgainstPolicy(policyText, requestDetails, taskId);
+                 evaluationResult = await this.evaluator.evaluateAgainstPolicy(policyText, requestDetails!, taskId);
                  console.log(`[PriorAuthProc ${taskId}] Initial evaluation result:`, evaluationResult);
             } catch (evalError: any) {
                  console.error(`[PriorAuthProc ${taskId}] Error during initial evaluation:`, evalError);
@@ -117,7 +145,7 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                 yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Drafting question for more information...' }] } };
                 let questionText: string;
                 try {
-                    questionText = await this.evaluator.draftResponse(evaluationResult, requestDetails, taskId);
+                    questionText = await this.evaluator.draftResponse(evaluationResult, requestDetails!, taskId);
                 } catch (draftError: any) {
                     console.error(`[PriorAuthProc ${taskId}] Error drafting question:`, draftError);
                     questionText = `Decision: ${evaluationResult.decision}. Reason: ${evaluationResult.reason}. Failed to draft specific question (${draftError.message}). Please provide more details.`;
@@ -229,11 +257,11 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                 } else {
                     // --- Yield standard evaluation result for non-approved finals ---
                     console.log(`[PriorAuthProc ${taskId}] Yielding standard evaluation artifact (Decision: ${evaluationResult.decision}).`);
-                     yield {
-                         type: 'artifact',
-                         artifactData: {
+             yield {
+                 type: 'artifact',
+                 artifactData: {
                              name: 'prior-auth-evaluation-final',
-                             parts: [
+                     parts: [
                                  { type: 'data', data: evaluationResult } 
                              ]
                          }
@@ -249,7 +277,7 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
             yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Drafting final response...' }] } };
             let finalMessageText: string;
              try {
-                 finalMessageText = await this.evaluator.draftResponse(evaluationResult!, requestDetails, taskId);
+                 finalMessageText = await this.evaluator.draftResponse(evaluationResult!, requestDetails!, taskId);
              } catch (draftError: any) {
                 console.error(`[PriorAuthProc ${taskId}] Error drafting final response:`, draftError);
                  finalMessageText = `Decision: ${evaluationResult!.decision}. Reason: ${evaluationResult!.reason}. Failed to draft detailed response (${draftError.message}).`;

@@ -1,0 +1,69 @@
+diff --git a/src/A2AClientV2.ts b/src/A2AClientV2.ts
+index ead3f1e..a7c9b2d 100644
+--- a/src/A2AClientV2.ts
++++ b/src/A2AClientV2.ts
+@@ -360,26 +360,50 @@ private async _startPolling(initialParams: TaskSendParams | null) {
+     this.state = 'starting-poll';
+     this.abort = new AbortController();
+
+-    // initial SEND or GET
+-    let first: Task;
+-    if (initialParams) {
+-      first = await this.transport.request<Task>(
+-        'tasks/send',
+-        initialParams as TaskSendParams,
+-        this.abort.signal
+-      );
+-    } else {
+-      first = await this.transport.request<Task>(
+-        'tasks/get',
+-        { id: this.taskId } as TaskGetParams,
+-        this.abort.signal
+-      );
+-    }
+-    this.store.apply(first);
+-    if (['completed','canceled','failed'].includes(first.status.state)) {
+-      this._stopComms(true, this._closeReasonFromState(first.status.state));
+-      return;
+-    }
+-    if (first.status.state === 'input-required') {
+-      this.state = 'input-required';
+-      return;
+-    }
++    // initial SEND or GET (with immediate follow-up GET on CREATE)
++    let first: Task;
++    if (initialParams) {
++      // 1) send
++      const sent = await this.transport.request<Task>(
++        'tasks/send',
++        initialParams as TaskSendParams,
++        this.abort.signal
++      );
++      this.store.apply(sent);
++
++      // 2) immediate follow-up GET for definitive state
++      first = await this.transport.request<Task>(
++        'tasks/get',
++        { id: this.taskId } as TaskGetParams,
++        this.abort.signal
++      );
++      this.store.apply(first);
++    } else {
++      // resume path or pure GET
++      first = await this.transport.request<Task>(
++        'tasks/get',
++        { id: this.taskId } as TaskGetParams,
++        this.abort.signal
++      );
++      this.store.apply(first);
++    }
++
++    // handle final or input-required
++    if (['completed','canceled','failed'].includes(first.status.state)) {
++      this._stopComms(true, this._closeReasonFromState(first.status.state));
++      return;
++    }
++    if (first.status.state === 'input-required') {
++      this.state = 'input-required';
++      return;
++    }

@@ -1,0 +1,72 @@
+diff --git a/src/A2AClientV2.ts b/src/A2AClientV2.ts
+--- a/src/A2AClientV2.ts
++++ b/src/A2AClientV2.ts
+@@ -54,6 +54,17 @@ export type ClientManagedState =
+   | 'closed'
+   | 'error';
+
++/** ClientCloseReason mirrors V1 reasons for shutdown handling */
++type ClientCloseReason =
++  | 'closed-by-caller'
++  | 'task-completed'
++  | 'task-canceled-by-agent'
++  | 'task-canceled-by-client'
++  | 'task-failed'
++  | 'error-fatal'
++  | 'sse-reconnect-failed'
++  | 'poll-retry-failed'
++  | 'error-on-cancel';
++
+ interface ClientConfig {
+   endpoint: string;
+   getAuthHeaders: RpcTransportOptions['getAuthHeaders'];
+@@ -402,13 +413,40 @@ private async _startPolling(initialParams: TaskSendParams | null) {
+     this.pollLoop.start();
+   }
+
+-  /** ----- STOP COMMUNICATION, CLEANUP, EMIT close ----- */
+-  private _stopComms(emitClose: boolean, reason: string = 'closed-by-caller') {
+-    if (this.state === 'closed') return;
+-    // abort SSE and poll
+-    this.abort.abort();
+-    this.pollLoop?.stop();
+-    // final state
+-    this.state = emitClose ? (['task-completed','task-canceled-by-agent','task-canceled-by-client','task-failed','error-fatal','sse-reconnect-failed','poll-retry-failed'].includes(reason)
+-      ? 'closed'
+-      : 'closed') : this.state;
+-    if (emitClose) this.emit('close');
+-  }
++  /** ----- STOP COMMUNICATION, CLEANUP, EMIT close ----- */
++  private _stopComms(
++    emitClose: boolean,
++    reason: ClientCloseReason = 'closed-by-caller'
++  ): void {
++    const prevState = this.state;
++    if (prevState === 'closed' || prevState === 'error') {
++      return;
++    }
++
++    // abort any in‑flight SSE or polling
++    this.abort.abort();
++    this.pollLoop?.stop();
++
++    // decide the next state
++    let nextState: ClientManagedState;
++    if (emitClose) {
++      const fatalReasons: ClientCloseReason[] = [
++        'error-fatal',
++        'sse-reconnect-failed',
++        'poll-retry-failed',
++        'error-on-cancel',
++      ];
++      nextState = fatalReasons.includes(reason) ? 'error' : 'closed';
++    } else {
++      nextState = prevState;
++    }
++    this.state = nextState;
++
++    if (emitClose) {
++      this.emit('close');
++    }
++  }
+

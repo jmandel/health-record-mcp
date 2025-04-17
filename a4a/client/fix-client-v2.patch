@@ -1,0 +1,120 @@
+--- src/A2AClientV2.ts
+@@
+   export class A2AClient extends Emitter<ClientEvents>{
+@@
+-  static async start(
+-    endpoint: string,
+-    initialParams: any,
+-    cfg: Omit<ClientConfig, "endpoint"> = {},
+-  ) {
+-    const id = initialParams?.id ?? uuid();
+-    const client = new A2AClient(id, { endpoint, ...cfg });
+-    await client.start(initialParams);
+-    return client;
+-  }
++  static async start(
++    endpoint: string,
++    initialParams: any,
++    cfg: Omit<ClientConfig, "endpoint"> = {},
++  ) {
++    const id = initialParams?.id ?? uuid();
++    const client = new A2AClient(id, { endpoint, ...cfg });
++    // Kick off the actual start in the background so callers can subscribe
++    client.start(initialParams).catch(e => client.emit('error', e));
++    return client;
++  }
+@@
+-  private async startPolling(initialParams:any){
+-        // initial SEND
+-    const firstTask = await this.transport.request<Task>(
+-      "tasks/send",
+-      initialParams,
+-      this.abort.signal,
+-    );
+-    this.store.apply(firstTask);
+-    
+-    this.poll = new PollingLoop(async ()=>{
+-      const t = await this.transport.request<Task>('tasks/get',{ id:this.taskId },this.abort.signal);
+-      this.store.apply(t);
+-    },{interval:this.cfg.pollInterval??5000,maxErrors:3},this.abort.signal);
+-    this.poll.start();
+-  }
++  private async startPolling(initialParams:any){
++    // 1) initial SEND
++    const firstTask = await this.transport.request<Task>(
++      "tasks/send",
++      initialParams,
++      this.abort.signal,
++    );
++    this.store.apply(firstTask);
++
++    // 2) immediate follow‑up GET for definitive state
++    try {
++      const definitiveTask = await this.transport.request<Task>(
++        "tasks/get",
++        { id: this.taskId },
++        this.abort.signal,
++      );
++      this.store.apply(definitiveTask);
++      // if it’s already done, close right away
++      if (
++        definitiveTask.status.state === "completed" ||
++        definitiveTask.status.state === "canceled" ||
++        definitiveTask.status.state === "failed"
++      ) {
++        this.close();
++        return;
++      }
++    } catch (err) {
++      this.emit("error", err);
++      this.close();
++      return;
++    }
++
++    // 3) otherwise, start the polling loop
++    this.poll = new PollingLoop(
++      async () => {
++        const t = await this.transport.request<Task>(
++          "tasks/get",
++          { id: this.taskId },
++          this.abort.signal
++        );
++        this.store.apply(t);
++        if (
++          t.status.state === "completed" ||
++          t.status.state === "canceled" ||
++          t.status.state === "failed"
++        ) {
++          this.close();
++        }
++      },
++      { interval: this.cfg.pollInterval ?? 5000, maxErrors: 3 },
++      this.abort.signal
++    );
++    this.poll.start();
++  }
+@@
+-  private onSse(ev:any){
+-    if(ev.result) this.store.apply(ev.result);
+-    if(ev.error){ this.emit('error',ev.error); this.abort.abort(); this.emit('close'); }
+-  }
++  private onSse(ev:any){
++    if (ev.result) {
++      this.store.apply(ev.result);
++      // if this was the final SSE event, fetch final state and then close
++      if ((ev.result as any).final) {
++        this.transport
++          .request<Task>("tasks/get", { id: this.taskId }, this.abort.signal)
++          .then(finalTask => {
++            this.store.apply(finalTask);
++            this.close();
++          })
++          .catch(err => this.emit("error", err));
++      }
++    }
++    if (ev.error) {
++      this.emit("error", ev.error);
++      this.close();
++    }
++  }
+

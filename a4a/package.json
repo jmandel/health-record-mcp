@@ -37,6 +37,8 @@
     "src"
   ],
   "dependencies": {
-    "cors": "^2.8.5"
+    "async-mutex": "^0.5.0",
+    "cors": "^2.8.5",
+    "pino": "^9.6.0"
   }
 }

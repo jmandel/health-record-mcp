@@ -1,7 +1,7 @@
 import {
     InMemoryTaskStore,
     // Import the V2 server setup function
-    startA2AExpressServerV2 
+    startA2AExpressServerLite 
 } from '@a2a/bun-express'; 
 
 import { jokeAgentCard } from './agentCard'; // Import V2 agent card
@@ -17,7 +17,7 @@ const randomJokeProcessorV2 = new RandomJokeProcessorV2();
 const topicJokeProcessorV2 = new TopicJokeProcessorV2();
 
 // 3. Start the server using the V2 helper function
-startA2AExpressServerV2({ // Call the V2 setup function
+startA2AExpressServerLite({ // Call the V2 setup function
     agentDefinition: jokeAgentCard, // Pass the V2 partial agent card
     taskStore: taskStore,
     // Pass the V2 processors

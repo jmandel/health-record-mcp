@@ -1,492 +1,390 @@
 // src/hooks/useTaskLiaison.ts
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Dispatch, useCallback, useEffect, useMemo, useReducer } from 'react';
+// Assuming A2AClient resolves to the correct V2 client in your environment
+// import { A2AClient } from '@a2a/client';
+// Use corrected imports for V2 client file
+import { A2AClient } from '@a2a/client/src/A2AClientV2';
 import {
-    A2AClient,
-    A2AClientConfig,
-    ClientManagedState as InternalClientState, // Rename for clarity
-    TaskUpdatePayload,
-    StatusUpdatePayload,
-    ArtifactUpdatePayload,
-    ErrorPayload,
-    ClosePayload,
-    ClientErrorContext,
-    ClientCloseReason,
-} from '@a2a/client/src/A2AClient';
-import {
-    Task,
-    Message,
+    AgentCard, // Needed for start/resume
     JsonRpcError,
-    TaskSendParams,
-    TaskState,
-    TextPart,
-    AgentCard
+    Message,
+    Task,
+    TaskStatus
 } from '@a2a/client/src/types';
+import { v4 as uuid } from 'uuid'; // Use uuid for ID generation
 
-// --- Hook Configuration & Return Types ---
+// --- State & Action Types ---
 
-// Simplified state exposed by the hook
-export type LiaisonClientStatus =
-    | 'idle'
-    | 'initializing' // Includes fetching card, determining strategy
-    | 'connecting'   // Starting SSE or initial Poll
-    | 'running'      // Connected SSE or actively Polling
-    | 'awaiting-input'
-    | 'reconnecting' // Only relevant for SSE
-    | 'sending'      // Sending subsequent input
-    | 'canceling'
-    | 'completed'    // Task reached a final state (completed, canceled, failed)
-    | 'error';
-
-export interface LiaisonSummary {
-    label: string;
-    icon?: string;
-    detail?: string;
+// Define the structure for the summary
+export interface TaskSummary {
+    friendlyLabel: string;
+    emoji: string;
 }
 
-export interface TaskLiaisonConfig {
-    taskId?: string | null; // Task to resume
-    agentUrl: string;
-    initialParams?: TaskSendParams | null; // Params to auto-start a new task on mount
-    getAuthHeaders?: () => Record<string, string> | Promise<Record<string, string>>; // Made optional
-    autoInputHandler?: (question: Message) => Promise<Message | null>;
-    summaryGenerator?: (task: Task | null) => LiaisonSummary;
-    // Include relevant A2AClientConfig options to pass through
-    forcePoll?: boolean;
-    pollIntervalMs?: number;
-    // ... other config options if needed
-}
+type A2AStatus = 'idle' | 'connecting' | 'running' | 'awaiting-input' | 'completed' | 'error';
 
-export interface TaskLiaisonResult {
+interface A2AState {
+    status: A2AStatus;
     task: Task | null;
-    agentCard: AgentCard | null;
-    summary: LiaisonSummary;
-    questionForUser: Message | null;
-    clientStatus: LiaisonClientStatus;
+    question: Message | null; // The specific message requiring input
     error: Error | JsonRpcError | null;
-    startTask: (params: Omit<TaskSendParams, 'id'>) => Promise<string | undefined>;
-    sendInput: (message: Message) => Promise<void>;
-    cancelTask: () => Promise<void>;
     taskId: string | null;
+    agentUrl: string | null; // Store agentUrl used
+    summary: TaskSummary; // Add the summary field
 }
 
-// --- Default Summary Generator ---
+type A2AAction =
+    | { type: 'STARTING'; payload: { agentUrl: string } }
+    | { type: 'TASK_UPDATED'; payload: Task }
+    | { type: 'ERROR'; payload: Error | JsonRpcError }
+    | { type: 'CLOSED' } // Client connection closed
+    | { type: 'RESUME_TASK'; payload: { agentUrl: string; id: string } }
+    | { type: 'START_TASK'; payload: { agentUrl: string; id: string; message: Message } }
+    | { type: 'SEND_INPUT'; payload: Message }
+    | { type: 'CANCEL_TASK' }
+    | { type: 'UPDATE_SUMMARY'; payload: TaskSummary }; // New action type
 
-const defaultSummaryGenerator = (task: Task | null): LiaisonSummary => {
-    if (!task) return { label: 'Idle' };
+// --- Initial State ---
+
+// Define the default summary generator function
+const defaultSummaryGenerator = (task: Task | null): TaskSummary => {
+    console.log("sumamry gen", task)
+    if (!task) {
+        return { friendlyLabel: 'Idle', emoji: '😴' };
+    }
+
     switch (task.status.state) {
-        case 'submitted': return { label: 'Submitted...', icon: '⏳' };
-        case 'working': return { label: 'Working...', icon: '⏳' };
-        case 'input-required': return { label: 'Input Required', icon: '❓' };
-        case 'completed': return { label: 'Completed', icon: '✅' };
-        case 'canceled': return { label: 'Canceled', icon: '❌' };
-        case 'failed': return { label: 'Failed', icon: '🔥' };
-        default: return { label: `Status: ${task.status.state}` };
+        case 'submitted':
+        case 'working':
+            return { friendlyLabel: 'Working', emoji: '⏳' };
+        case 'input-required':
+            return { friendlyLabel: 'Input Required', emoji: '❓' };
+        case 'completed':
+            return { friendlyLabel: 'Completed', emoji: '✅' };
+        case 'canceled':
+            return { friendlyLabel: 'Canceled', emoji: '❌' };
+        case 'failed':
+            return { friendlyLabel: 'Failed', emoji: '🔥' };
+        default:
+            // Should not happen with known states, but provide a fallback
+            return { friendlyLabel: task.status.state, emoji: '🤔' };
     }
 };
 
-// --- The Hook ---
+const initialState: A2AState = {
+    status: 'idle',
+    task: null,
+    question: null,
+    error: null,
+    taskId: null,
+    agentUrl: null,
+    summary: defaultSummaryGenerator(null), // Initialize with default idle summary
+};
 
-export function useTaskLiaison(config: TaskLiaisonConfig): TaskLiaisonResult {
-    const {
-        taskId: initialTaskId,
-        agentUrl,
-        initialParams,
-        getAuthHeaders,
-        autoInputHandler,
-        summaryGenerator = defaultSummaryGenerator,
-        ...clientConfigOptions // Rest are A2AClient options
-    } = config;
+// --- Reducer (Simplified) ---
 
-    const clientRef = useRef<A2AClient | null>(null);
-    const isMountedRef = useRef(true); // Track mount state for async operations
-
-    // Internal state mirroring A2AClient events
-    const [internalClientState, setInternalClientState] = useState<InternalClientState>('idle');
-    const [task, setTask] = useState<Task | null>(null);
-    const [error, setError] = useState<Error | JsonRpcError | null>(null);
-    const [lastCloseReason, setLastCloseReason] = useState<ClientCloseReason | null>(null);
-    const [managedTaskId, setManagedTaskId] = useState<string | null>(initialTaskId ?? null);
-    const [agentCard, setAgentCard] = useState<AgentCard | null>(null);
-
-    // State derived for the hook consumer
-    const [questionForUser, setQuestionForUser] = useState<Message | null>(null);
-
-    // --- Client Lifecycle Management ---
-
-    useEffect(() => {
-        isMountedRef.current = true;
-        let localClient: A2AClient | null = null; // Keep local ref for cleanup
-
-        const initializeClient = async () => {
-            if (!agentUrl) {
-                console.error("useTaskLiaison: agentUrl is required.");
-                if (isMountedRef.current) {
-                    setError(new Error("Missing agentUrl in config."));
-                    setInternalClientState('error');
-                }
-                return;
-            }
-
-            // Determine if resuming or starting
-            const taskIdToUse = managedTaskId ?? initialTaskId; // Prefer state over initial prop after first run
-            const shouldResume = !!taskIdToUse;
-            const shouldStart = !shouldResume && !!initialParams;
-
-            if (!shouldResume && !shouldStart) {
-                console.log("useTaskLiaison: Idle - No taskId to resume and no initialParams to start.");
-                if (isMountedRef.current) setInternalClientState('idle');
-                return; // Do nothing if no action specified
-            }
-
-            const a2aConfig: Omit<A2AClientConfig, 'getAuthHeaders'> & { getAuthHeaders?: TaskLiaisonConfig['getAuthHeaders'] } = {
-                agentEndpointUrl: agentUrl, // Pass explicitly
-                ...clientConfigOptions, // Pass through other options
+// No longer need a factory
+function reducer(state: A2AState, action: A2AAction): A2AState {
+    switch (action.type) {
+        case 'STARTING':
+            // Reset state, status is connecting, summary will be updated by useEffect
+            return {
+                ...initialState,
+                agentUrl: action.payload.agentUrl,
+                status: 'connecting',
             };
+        case 'TASK_UPDATED': {
+            const task = action.payload;
+            const taskState = task.status.state;
+            let newStatus: A2AStatus;
 
-            try {
-                // Prepare auth function or default
-                const finalGetAuth = getAuthHeaders ?? (async () => ({}));
-
-                if (shouldResume && taskIdToUse) {
-                    console.log(`useTaskLiaison: Resuming task ${taskIdToUse}...`);
-                    if (isMountedRef.current) setInternalClientState('initializing');
-                    localClient = await A2AClient.resume(agentUrl, taskIdToUse, { ...a2aConfig, getAuthHeaders: finalGetAuth });
-                } else if (shouldStart && initialParams) {
-                    console.log("useTaskLiaison: Starting task with initialParams...");
-                    if (isMountedRef.current) setInternalClientState('initializing');
-                    localClient = await A2AClient.create(agentUrl, initialParams, { ...a2aConfig, getAuthHeaders: finalGetAuth });
-                    if (isMountedRef.current && localClient.taskId) {
-                        setManagedTaskId(localClient.taskId);
-                    }
-                } else {
-                    return; // Should not happen based on checks above
-                }
-
-                if (!isMountedRef.current) { // Check mount state *after* await
-                    localClient?.close('closed-by-restart'); // Cleanup if unmounted during creation
-                    return;
-                }
-
-                clientRef.current = localClient;
-                const fetchedCard = clientRef.current?.agentCard;
-                if (isMountedRef.current) {
-                    setAgentCard(fetchedCard ?? null);
-                }
-
-                // --- Register Listeners ---
-                localClient.on('task-update', (payload: TaskUpdatePayload) => {
-                    if (isMountedRef.current) setTask(payload.task);
-                });
-                localClient.on('status-update', (payload: StatusUpdatePayload) => {
-                    if (!isMountedRef.current) return;
-                    setInternalClientState(localClient?.getCurrentState() ?? 'error');
-                    setTask(payload.task);
-
-                    // Pass the raw message if input is required
-                    if (payload.status.state === 'input-required') {
-                        setQuestionForUser(payload.task.status.message ?? null);
-                    } else {
-                        setQuestionForUser(null);
-                    }
-                });
-                 localClient.on('artifact-update', (payload: ArtifactUpdatePayload) => {
-                     if (isMountedRef.current) setTask(payload.task); // Task object contains updated artifacts
-                 });
-                localClient.on('error', (payload: ErrorPayload) => {
-                    console.error("useTaskLiaison: Received client error:", payload);
-                    if (isMountedRef.current) {
-                        setError(payload.error);
-                        // Sync state, client might already be 'error' but call getCurrentState
-                        setInternalClientState(localClient?.getCurrentState() ?? 'error');
-                    }
-                });
-                localClient.on('close', (payload: ClosePayload) => {
-                    console.log(`useTaskLiaison: Received client close: ${payload.reason}`);
-                    if (isMountedRef.current) {
-                        setInternalClientState(localClient?.getCurrentState() ?? 'closed');
-                        setLastCloseReason(payload.reason);
-                        setQuestionForUser(null); // Clear question on close
-                        clientRef.current = null; // Release client instance ref
-                    }
-                });
-
-                // Set initial state after registering listeners
-                setInternalClientState(localClient.getCurrentState());
-                setTask(localClient.getCurrentTask()); // Get initial task state if available after resume/create
-                 // Check initial state immediately
-                 const initialTaskState = localClient.getCurrentTask();
-                 if (localClient.getCurrentState() === 'input-required') {
-                    // Pass the raw message
-                    setQuestionForUser(initialTaskState?.status.message ?? null);
-                 }
-
-
-            } catch (err: any) {
-                console.error("useTaskLiaison: Error initializing client:", err);
-                 if (isMountedRef.current) {
-                     setError(err);
-                     setInternalClientState('error');
-                 }
-            }
-        };
-
-        initializeClient();
-
-        // Cleanup function
-        return () => {
-            isMountedRef.current = false;
-            console.log("useTaskLiaison: Unmounting, closing client connection...");
-            // Use the localClient captured at effect start for cleanup
-            localClient?.close('closed-by-restart');
-            clientRef.current = null;
-        };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [
-        initialTaskId, // Re-run if the *initial* task ID prop changes
-        agentUrl,
-        // Do NOT include initialParams here - it's only for the very first init
-        // Include other config options that might change how the client behaves if necessary
-        autoInputHandler, // If handler logic changes, re-init
-        clientConfigOptions.forcePoll,
-        clientConfigOptions.pollIntervalMs,
-    ]);
-
-    // --- Automatic Input Handling ---
-    const handleInputRequired = useCallback(async (question: Message) => {
-        if (!autoInputHandler || !clientRef.current) {
-            // No handler or client gone, expose question to user
-            if (isMountedRef.current) setQuestionForUser(question);
-            return;
-        }
-
-        // Clear previous question while auto-handler runs
-        if (isMountedRef.current) setQuestionForUser(null);
-
-        try {
-            console.log("useTaskLiaison: Attempting auto-input handling...");
-            const responseMessage = await autoInputHandler(question);
-
-            if (!isMountedRef.current) return; // Check after await
-
-            if (responseMessage) {
-                console.log("useTaskLiaison: Auto-handler provided response, sending input...");
-                setError(null); // Clear previous errors
-                // State handled by sendInput calling _setState internally via client events
-                await clientRef.current?.send(responseMessage);
-                console.log("useTaskLiaison: Auto-input sent.");
+            if (taskState === 'input-required') {
+                newStatus = 'awaiting-input';
+            } else if (['completed', 'canceled', 'failed'].includes(taskState)) {
+                newStatus = 'completed';
+            } else if (state.status !== 'connecting' && state.status !== 'error') {
+                newStatus = 'running';
             } else {
-                // Auto-handler couldn't handle it, expose question
-                console.log("useTaskLiaison: Auto-handler returned null, exposing question.");
-                setQuestionForUser(question);
+                newStatus = state.status;
             }
-        } catch (err: any) {
-            console.error("useTaskLiaison: Error during auto-input handling or sending:", err);
-            if (isMountedRef.current) {
-                 setError(err);
-                 setInternalClientState(clientRef.current?.getCurrentState() ?? 'error');
-                 setQuestionForUser(question); // Re-expose question on error? Maybe.
-            }
+
+            // Update status, task, question, taskId; summary will be updated by useEffect
+            return {
+                ...state,
+                status: newStatus,
+                task: task,
+                question: taskState === 'input-required' ? (task.status.message ?? null) : null,
+                taskId: task.id,
+                error: null,
+            };
         }
-    }, [autoInputHandler]);
-
-    // --- Actions exposed by the hook ---
-
-    const startTask = useCallback(async (params: Omit<TaskSendParams, 'id'>): Promise<string | undefined> => {
-        if (clientRef.current) {
-            console.warn("useTaskLiaison: Cannot start new task, client already active.");
-            throw new Error("Client already managing a task.");
+        case 'ERROR': {
+            console.error("Reducer received ERROR:", action.payload);
+            return { ...state, status: 'error', error: action.payload, question: null  };
         }
-        if (!agentUrl) {
-             throw new Error("Missing agentUrl in config.");
+        case 'CLOSED': {
+            const finalStates: TaskStatus['state'][] = ['completed', 'canceled', 'failed'];
+            const isFinal = state.task && finalStates.includes(state.task.status.state);
+            const newStatus = isFinal ? 'completed' : 'idle';
+            return {
+                ...state,
+                status: newStatus,
+                question: null,
+            };
         }
+        case 'UPDATE_SUMMARY': // Handle the new action
+            return {
+                ...state,
+                summary: action.payload,
+            };
+        // Actions handled by middleware or optimistic updates
+        case 'RESUME_TASK':
+            return { ...state, agentUrl: action.payload.agentUrl, taskId: action.payload.id };
+        case 'START_TASK':
+            return { ...state, agentUrl: action.payload.agentUrl, taskId: action.payload.id };
+        case 'SEND_INPUT':
+            return { ...state, status: 'running', question: null }; // Optimistic
+        case 'CANCEL_TASK':
+            return { ...state, status: 'running', question: null }; // Optimistic
+        default:
+            return state;
+    }
+}
 
-        console.log("useTaskLiaison: Starting new task via startTask action...");
-        // Reset state before starting
-        if (isMountedRef.current) {
-            setInternalClientState('initializing');
-            setTask(null);
-            setError(null);
-            setLastCloseReason(null);
-            setQuestionForUser(null);
-            setManagedTaskId(null);
-            setAgentCard(null);
+// --- Middleware to wire A2AClient events ---
+
+// Define a type for the dispatch function the middleware receives
+type MiddlewareDispatch = Dispatch<A2AAction>;
+
+function createA2AMiddleware(getAuthHeaders?: () => Record<string, string> | Promise<Record<string, string>>) {
+    let client: A2AClient | null = null;
+
+    const closeExistingClient = () => {
+        if (client) {
+            console.log("Middleware: Closing existing client...");
+            client.removeAllListeners(); // Remove listeners before closing
+            client.close();
+            client = null;
         }
+    };
 
-        const finalGetAuth = getAuthHeaders ?? (async () => ({}));
-        const a2aConfig: A2AClientConfig = {
-            agentEndpointUrl: agentUrl,
-            getAuthHeaders: finalGetAuth,
-            ...clientConfigOptions,
-        };
+    // The middleware takes dispatch and returns a function that takes an action
+    return (dispatch: MiddlewareDispatch) => (action: A2AAction) => {
+        if (action.type === 'RESUME_TASK' || action.type === 'START_TASK') {
+            closeExistingClient(); // Ensure any old client is closed first
+            const { agentUrl } = action.payload; // Get agentUrl from payload
+            dispatch({ type: 'STARTING', payload: { agentUrl } }); // Dispatch STARTING with agentUrl
 
-        try {
-             // Explicitly create client *here* instead of relying on useEffect trigger
-             // This makes startTask more imperative
-            const newClient = await A2AClient.create(agentUrl, params, a2aConfig);
-            if (!isMountedRef.current) {
-                newClient.close('closed-by-restart');
-                return undefined;
+            // Construct the correct URL for the agent card
+            let cardUrl: string;
+            try {
+                cardUrl = new URL('.well-known/agent.json', agentUrl).href;
+            } catch (e) {
+                console.error("Middleware: Invalid agentUrl provided:", agentUrl, e);
+                dispatch({ type: 'ERROR', payload: new Error(`Invalid agentUrl: ${agentUrl}`) });
+                return; // Stop processing if URL is invalid
             }
 
-            clientRef.current = newClient;
-            const newTaskId = newClient.taskId;
-            const fetchedCard = newClient.agentCard;
-            if (isMountedRef.current) {
-                 setManagedTaskId(newTaskId);
-                 setAgentCard(fetchedCard ?? null);
-            }
+            // Fetch agent card (optional, but good practice)
+            // You might want to store the card in state if needed
+            fetch(cardUrl)
+                .then(res => {
+                    if (!res.ok) throw new Error(`Failed to fetch agent card: ${res.statusText}`);
+                    return res.json() as Promise<AgentCard>;
+                })
+                .then(card => {
+                    console.log("Middleware: Fetched agent card:", card.name);
+                    const clientOptions = {
+                        getAuthHeaders: getAuthHeaders ?? (async () => ({})),
+                    }; // Add other options like forcePoll if needed
 
-            // Re-register listeners for the new client instance
-            newClient.on('task-update', (payload: TaskUpdatePayload) => { if (isMountedRef.current) setTask(payload.task); });
-            newClient.on('status-update', (payload: StatusUpdatePayload) => {
-                 if (!isMountedRef.current) return;
-                 setInternalClientState(newClient.getCurrentState());
-                 setTask(payload.task);
-                 // Pass the raw message if input is required
-                 if (payload.status.state === 'input-required') {
-                    setQuestionForUser(payload.task.status.message ?? null);
-                 } else { setQuestionForUser(null); }
-            });
-            newClient.on('artifact-update', (payload: ArtifactUpdatePayload) => { if (isMountedRef.current) setTask(payload.task); });
-            newClient.on('error', (payload: ErrorPayload) => { if (isMountedRef.current) { setError(payload.error); setInternalClientState(newClient.getCurrentState()); }});
-            newClient.on('close', (payload: ClosePayload) => { if (isMountedRef.current) { setInternalClientState(newClient.getCurrentState()); setLastCloseReason(payload.reason); setQuestionForUser(null); clientRef.current = null; }});
+                    if (action.type === 'START_TASK') {
+                        const { id, message } = action.payload;
+                        console.log(`Middleware: Starting task ${id}...`);
+                        client = A2AClient.start(agentUrl, { id, message }, clientOptions);
+                    } else { // RESUME_TASK
+                        const { id } = action.payload;
+                        console.log(`Middleware: Resuming task ${id}...`);
+                        client = A2AClient.resume(agentUrl, id, clientOptions);
+                    }
 
 
-            // Set initial state from new client
-            if (isMountedRef.current) {
-                 setInternalClientState(newClient.getCurrentState());
-                 setTask(newClient.getCurrentTask());
-                 // Check initial state immediately
-                 if (newClient.getCurrentState() === 'input-required') {
-                    // Pass the raw message
-                    setQuestionForUser(newClient.getCurrentTask()?.status.message ?? null);
-                 }
-            }
+                    // --- Attach Event Listeners ---
+                    client.on('task-update', (task: Task) => { // V2 often passes the object directly
+                         console.log("Middleware: task-update event", task.status.state);
+                        dispatch({ type: 'TASK_UPDATED', payload: task });
+                     });
 
-            return newTaskId;
+                    // Use 'status-update' for more granular state tracking if needed,
+                    // but 'task-update' usually covers the necessary task object changes.
+                    // client.on('status-update', ({ status, task }: { status: TaskStatus, task: Task }) => {
+                    //     console.log("Middleware: status-update event", status.state);
+                    //     // You might dispatch a different action or handle status specially
+                    //     // For now, TASK_UPDATED driven by task-update handles state transitions
+                    //     dispatch({ type: 'TASK_UPDATED', payload: task });
+                    // });
 
-        } catch (err: any) {
-            console.error("useTaskLiaison: Error in startTask action:", err);
-             if (isMountedRef.current) {
-                 setError(err);
-                 setInternalClientState('error');
+                    client.on('error', (error: unknown) => { // V2 often passes error directly
+                         console.error("Middleware: error event", error);
+                        dispatch({ type: 'ERROR', payload: error as Error | JsonRpcError });
+                     });
+
+                     client.on('close', () => {
+                         console.log("Middleware: close event");
+                         dispatch({ type: 'CLOSED' });
+                         client = null; // Clear client ref on close
+                     });
+
+                    // Get initial snapshot after listeners are attached
+                     const initialTask = client.getCurrentTask();
+                     if (initialTask) {
+                         console.log("Middleware: Got initial task snapshot", initialTask.status.state);
+                         dispatch({ type: 'TASK_UPDATED', payload: initialTask });
+                } else {
+                         console.warn("Middleware: No initial task snapshot available after connect.");
+                         // Could indicate an issue or just that the task hasn't been created yet.
+                     }
+                 })
+                 .catch(err => {
+                     console.error("Middleware: Error during client setup:", err);
+                     dispatch({ type: 'ERROR', payload: err });
+                     closeExistingClient(); // Ensure cleanup on error
+                 });
+
+        } else if (action.type === 'SEND_INPUT') {
+            if (client && client.getCurrentState() === 'input-required') {
+                console.log("Middleware: Sending input...", action.payload);
+                client.send(action.payload)
+                 .catch((err: any) => {
+                     console.error("Middleware: Error sending input:", err);
+                     dispatch({ type: 'ERROR', payload: err as Error | JsonRpcError });
+                 }); // Handle potential error on send
+             } else if (client) {
+                console.warn("Middleware: Attempted to send input, but client not awaiting input. State:", client.getCurrentState());
+             } else {
+                 console.error("Middleware: Cannot send input, client not initialized.");
              }
-             return undefined;
+        } else if (action.type === 'CANCEL_TASK') {
+            if (client) {
+                console.log("Middleware: Canceling task...");
+                client.cancel()
+                 .catch((err: any) => {
+                     console.error("Middleware: Error canceling task:", err);
+                     dispatch({ type: 'ERROR', payload: err as Error | JsonRpcError });
+                 }); // Handle potential error on cancel
+                } else {
+                 console.warn("Middleware: Cannot cancel task, client not initialized.");
+             }
         }
-    }, [agentUrl, clientConfigOptions, handleInputRequired]); // Dependencies for startTask - removed getAuthHeaders
-
-    // This function now becomes the exported sendInput
-    const sendInput = useCallback(async (message: Message) => {
-        // Check message structure minimally (optional)
-        if (!message || typeof message !== 'object' || !message.role || !Array.isArray(message.parts)) {
-             console.error("useTaskLiaison: Invalid message object passed to sendInput.", message);
-             throw new Error("Invalid message format provided to sendInput.");
-         }
-
-        if (!clientRef.current) {
-            throw new Error("Cannot send input, client not active.");
-        }
-        const currentClientLibState = clientRef.current?.getCurrentState();
-        if (currentClientLibState !== 'input-required') {
-             console.warn(`useTaskLiaison: Sending input while client state is ${currentClientLibState}`);
-        }
-        console.log("useTaskLiaison: Sending input message...");
-        if (isMountedRef.current) {
-            setError(null);
-            setQuestionForUser(null);
-        }
-        try {
-            await clientRef.current.send(message);
-            console.log("useTaskLiaison: Send input successful.");
-            if (isMountedRef.current) {
-                 setInternalClientState(clientRef.current?.getCurrentState() ?? internalClientState);
-            }
-        } catch (err: any) {
-            console.error("useTaskLiaison: Error sending input:", err);
-            if (isMountedRef.current) {
-                setError(err);
-                setInternalClientState(clientRef.current?.getCurrentState() ?? 'error');
-            }
-            // Re-throw or handle as needed - maybe just let error state reflect it
-        }
-    }, [internalClientState]); // Dependency remains internal state for now
-
-    const cancelTask = useCallback(async () => {
-        if (!clientRef.current) {
-            console.warn("useTaskLiaison: Cannot cancel, client not active.");
-            return;
-        }
-        console.log("useTaskLiaison: Canceling task...");
-        if (isMountedRef.current) {
-             // Optionally set 'canceling' state? A2AClient handles internal state.
-             setQuestionForUser(null);
-        }
-        try {
-            // A2AClient handles state transitions internally (will emit 'close')
-            await clientRef.current.cancel();
-            console.log("useTaskLiaison: Cancel request sent (client managing state).");
-            // State update handled by the 'close' event listener
-        } catch (err: any) {
-            console.error("useTaskLiaison: Error canceling task:", err);
-            if (isMountedRef.current) {
-                 setError(err);
-                 setInternalClientState(clientRef.current?.getCurrentState() ?? 'error'); // Reflect potential error state
-            }
-        }
-    }, []);
-
-    // --- Derived State ---
-
-    const clientStatus = useMemo((): LiaisonClientStatus => {
-        // Map internal A2AClient state to simplified hook status
-        switch (internalClientState) {
-            case 'idle': return 'idle';
-            case 'initializing':
-            case 'fetching-card':
-            case 'determining-strategy':
-                 return 'initializing';
-            case 'starting-sse':
-            case 'starting-poll':
-                 return 'connecting';
-            case 'connecting-sse': return 'connecting'; // Maybe map to 'running'? or keep connecting?
-            case 'connected-sse':
-            case 'polling':
-                 return 'running';
-            case 'reconnecting-sse':
-            case 'retrying-poll': // Map retrying-poll to reconnecting?
-                 return 'reconnecting';
-            case 'sending': return 'sending';
-            case 'canceling': return 'canceling';
-            case 'input-required': return 'awaiting-input';
-            case 'closed':
-                 // If closed because task finished, return 'completed'
-                 if (lastCloseReason === 'task-completed' || lastCloseReason === 'task-canceled-by-agent' || lastCloseReason === 'task-canceled-by-client' || lastCloseReason === 'task-failed') {
-                     return 'completed';
-                 }
-                 return 'idle'; // Otherwise, treat other closes like idle (e.g., closed-by-caller)
-            case 'error': return 'error';
-            default: return 'idle'; // Should not happen
-        }
-    }, [internalClientState, lastCloseReason]);
-
-    const summary = useMemo(() => {
-        // Use custom generator if provided, otherwise default
-        return summaryGenerator(task);
-    }, [task, summaryGenerator]);
-
-    // --- Return Value ---
-
-    return {
-        task,
-        agentCard,
-        summary,
-        questionForUser,
-        clientStatus,
-        error,
-        startTask,
-        sendInput, // Export sendInput again
-        cancelTask,
-        taskId: managedTaskId,
+        return dispatch(action); // Don't pass the original action to the reducer if middleware handles it
     };
 }
+
+// --- Hook ---
+
+export interface UseTaskLiaisonProps {
+    agentUrl: string;
+    initialTaskId?: string | null;
+    getAuthHeaders?: () => Record<string, string> | Promise<Record<string, string>>;
+    autoInputHandler?: (task: Task) => Promise<Message | null>;
+    summaryGenerator?: (task: Task | null) => TaskSummary;
+}
+
+export interface UseTaskLiaisonResult {
+    state: A2AState;
+    actions: {
+        startTask: (message: Message, taskId?: string) => void;
+        sendInput: (message: Message) => void;
+        cancelTask: () => void;
+        resumeTask: (taskId: string) => void;
+    };
+}
+
+export function useTaskLiaison({
+    agentUrl,
+    initialTaskId,
+    getAuthHeaders,
+    autoInputHandler,
+    summaryGenerator = defaultSummaryGenerator,
+}: UseTaskLiaisonProps): UseTaskLiaisonResult {
+    // Use the plain reducer now
+    const [state, rawDispatch] = useReducer(reducer, initialState);
+
+    // Memoize middleware (remains the same)
+    const middleware = useMemo(() => createA2AMiddleware(getAuthHeaders), [getAuthHeaders]);
+    const dispatch = useMemo(() => middleware(rawDispatch), [middleware]);
+
+    // Effect to handle resuming task on mount (remains the same)
+    useEffect(() => {
+        if (initialTaskId && state.status === 'idle') {
+            console.log(`useTaskLiaison Hook: Resuming task ${initialTaskId} on mount.`);
+            dispatch({ type: 'RESUME_TASK', payload: { agentUrl, id: initialTaskId } });
+        }
+    }, [agentUrl, initialTaskId, dispatch, state.status]);
+
+    // Effect to handle auto input (remains the same)
+    useEffect(() => {
+        if (state.status === 'awaiting-input' && state.task && autoInputHandler) {
+            console.log("useTaskLiaison Hook: Auto-input handler triggered for task:", state.task.id);
+            // Pass the full task object to the handler
+            autoInputHandler(state.task)
+                .then(responseMessage => {
+                    // Check if still awaiting input *and* the task ID hasn't changed
+                    // This prevents race conditions if the state changed rapidly or a new task started
+                    if (responseMessage && state.status === 'awaiting-input' && state.task && state.task.id === state.task.id) {
+                        console.log("useTaskLiaison Hook: Auto-input handler provided response.");
+                        dispatch({ type: 'SEND_INPUT', payload: responseMessage });
+                    } else if (!responseMessage) {
+                        console.log("useTaskLiaison Hook: Auto-input handler returned null, manual input required.");
+                    } else {
+                        console.log("useTaskLiaison Hook: Auto-input response received, but state is no longer awaiting-input. Ignoring response.")
+                    }
+                })
+                .catch((err) => {
+                    console.error("useTaskLiaison Hook: Error in autoInputHandler:", err);
+                    // Optionally dispatch an error action here if the handler fails critically
+                    // dispatch({ type: 'ERROR', payload: new Error("Auto-input handler failed") });
+                });
+        }
+    }, [state.status, state.task, autoInputHandler, dispatch]);
+
+    // --- NEW Effect for Summary Generation ---
+    useEffect(() => {
+        let newSummary: TaskSummary;
+            // If a task exists, use the provided summaryGenerator
+        newSummary = summaryGenerator(state.task);
+        dispatch({ type: 'UPDATE_SUMMARY', payload: newSummary });
+    }, [state.task, state.status, summaryGenerator, dispatch]); // Depend on task, status, generator, and dispatch
+
+    // --- Action Creators (remain the same) ---
+    const startTask = useCallback((message: Message, taskId?: string) => {
+        const id = taskId || uuid();
+        console.log(`useTaskLiaison Hook: Dispatching START_TASK action for ID ${id}`);
+        dispatch({ type: 'START_TASK', payload: { agentUrl, id, message } });
+    }, [dispatch, agentUrl]);
+
+    const sendInput = useCallback((message: Message) => {
+        console.log("useTaskLiaison Hook: Dispatching SEND_INPUT action.");
+        dispatch({ type: 'SEND_INPUT', payload: message });
+    }, [dispatch]);
+
+    const cancelTask = useCallback(() => {
+        console.log("useTaskLiaison Hook: Dispatching CANCEL_TASK action.");
+        dispatch({ type: 'CANCEL_TASK' });
+    }, [dispatch]);
+
+    const resumeTask = useCallback((taskId: string) => {
+         console.log(`useTaskLiaison Hook: Dispatching RESUME_TASK action for ID ${taskId}`);
+         dispatch({ type: 'RESUME_TASK', payload: { agentUrl, id: taskId } });
+     }, [dispatch, agentUrl]);
+
+
+    return {
+        state, // State still includes summary, now updated via useEffect
+        actions: { startTask, sendInput, cancelTask, resumeTask },
+    };
+}
+
+// Default export if this is the primary export of the file
+export default useTaskLiaison;

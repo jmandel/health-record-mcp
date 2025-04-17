@@ -149,6 +149,7 @@ export class SseConnectionManager implements NotificationService { // <-- Implem
             };
             const dataLine = `data: ${JSON.stringify(jsonRpcPayload)}\n\n`;
             const success = this.sendSseDataString(subInfo.res, dataLine);
+            console.log(`[SseManager] Sent SSE data to subscriber for task ${taskId}. Data: ${dataLine}. Success: ${success}`);
 
             if (!success || isFinalEvent) {
                  // If sending failed OR if this is the final event, prepare to close/remove.
@@ -204,6 +205,7 @@ export class SseConnectionManager implements NotificationService { // <-- Implem
         if (eventType && eventData) {
             if (this.hasSubscriptions(event.id)) {
                  console.log(`[SseManager] Received notify event for task ${event.id}, broadcasting '${eventType}'.`);
+                 console.log(`[SseManager] Event data:`, eventData);
                 // Use the existing broadcast logic
                 this.broadcast(event.id, eventType, eventData);
             } else {
