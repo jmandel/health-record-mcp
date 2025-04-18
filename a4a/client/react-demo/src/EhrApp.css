@@ -252,4 +252,39 @@ th {
     white-space: pre-wrap;
     word-break: break-word;
     margin-top: 0.5em;
+}
+
+/* PA Sidebar Styles */
+.pa-sidebar {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 280px; /* fixed width when expanded */
+    transition: flex 0.2s ease;
+    background: #fff;
+    border-left: 1px solid #ddd;
+}
+.pa-sidebar.collapsed {
+    flex: 0 0 40px; /* collapsed width */
+}
+
+/* Summary list styles */
+.pa-summary-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+.pa-summary-item {
+    margin-bottom: 0.75em;
+}
+.pa-summary-item .status-display {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* Evidence list */
+.pa-summary-evidence {
+    margin: 0.5em 0 0.5em 1.2em;
+    padding: 0;
+    list-style-type: circle;
 } 
