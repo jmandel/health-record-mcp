@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EHR Retriever Caller</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.6;
+            padding: 2rem;
+            background-color: #f0f4f8;
+            color: #333;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: #fff;
+            padding: 2rem;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+        }
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 1.5rem;
+            text-align: center;
+        }
+        button {
+            display: block;
+            margin: 1.5rem auto;
+            padding: 0.8rem 1.8rem;
+            font-size: 1rem;
+            color: white;
+            background-color: #3498db;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        button:disabled {
+            background-color: #bdc3c7;
+            cursor: not-allowed;
+        }
+        #ehr-data-container {
+            margin-top: 2rem;
+            border-top: 1px solid #eee;
+            padding-top: 1.5rem;
+        }
+        h2 {
+            color: #34495e;
+            margin-bottom: 1rem;
+        }
+        pre {
+            background-color: #ecf0f1;
+            padding: 1rem;
+            border-radius: 5px;
+            border: 1px solid #dce4ec;
+            overflow-x: auto;
+            white-space: pre-wrap; /* Allow wrapping */
+            word-wrap: break-word; /* Break long words */
+            font-size: 0.9em;
+            max-height: 500px; /* Limit height */
+            overflow-y: auto;
+        }
+        .status-message {
+            text-align: center;
+            margin-top: 1rem;
+            color: #7f8c8d;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>EHR Retriever Caller Demo</h1>
+        <p>This page demonstrates launching the EHR Retriever in a popup and receiving the data back via <code>window.opener.postMessage</code>.</p>
+
+        <button id="launchRetrieverBtn">Launch EHR Retriever</button>
+
+        <p class="status-message" id="statusMessage">Click the button to start.</p>
+
+        <div id="ehr-data-container" style="display: none;">
+            <h2>Received EHR Data:</h2>
+            <pre id="ehrDataOutput">Waiting for data...</pre>
+        </div>
+    </div>
+
+    <script>
+        const launchButton = document.getElementById('launchRetrieverBtn');
+        const statusMessage = document.getElementById('statusMessage');
+        const dataContainer = document.getElementById('ehr-data-container');
+        const dataOutput = document.getElementById('ehrDataOutput');
+
+        let retrieverWindow = null;
+
+        // Define the URL for the retriever page
+        // IMPORTANT: Adjust the path if this caller html is not in the same directory
+        const retrieverUrlBase = './ehretriever.html';
+
+        // Get this window's origin - this MUST be sent to the retriever
+        const callerOrigin = window.location.origin;
+
+        // Construct the final URL with the hash for opener delivery
+        const retrieverUrlWithHash = `${retrieverUrlBase}#deliver-to-opener:${callerOrigin}`;
+
+        launchButton.addEventListener('click', () => {
+            if (retrieverWindow && !retrieverWindow.closed) {
+                retrieverWindow.focus();
+                statusMessage.textContent = 'Popup already open. Focused existing window.';
+                return;
+            }
+
+            statusMessage.textContent = 'Launching popup... please follow instructions there.';
+            dataContainer.style.display = 'none'; // Hide previous results
+            dataOutput.textContent = 'Waiting for data...';
+            launchButton.disabled = true;
+
+            // Open the popup window
+            // CRITICAL: DO NOT use 'noopener' or 'noreferrer' if you need window.opener to work
+            retrieverWindow = window.open(retrieverUrlWithHash, 'ehrRetrieverPopup', 'width=800,height=700,resizable,scrollbars');
+
+            if (!retrieverWindow) {
+                statusMessage.textContent = 'Popup blocked? Please allow popups for this site.';
+                launchButton.disabled = false;
+            } else {
+                // Optional: Check periodically if the window was closed manually
+                const checkInterval = setInterval(() => {
+                    if (retrieverWindow && retrieverWindow.closed) {
+                        clearInterval(checkInterval);
+                        statusMessage.textContent = 'Popup window closed by user.';
+                        launchButton.disabled = false;
+                    }
+                }, 1000);
+            }
+        });
+
+        // Listen for messages from the popup window
+        window.addEventListener('message', (event) => {
+            // SECURITY: Always validate the origin of the message!
+            // For this demo, we expect it to come from the same origin as the caller,
+            // because the retriever redirects back before sending the message.
+            // If the retriever was hosted on a DIFFERENT origin, you'd check against THAT origin.
+            if (event.origin !== callerOrigin) {
+                console.warn(`Ignoring message from unexpected origin: ${event.origin}. Expected ${callerOrigin}.`);
+                statusMessage.textContent = `Warning: Ignored message from unexpected origin ${event.origin}.`;
+                return;
+            }
+
+            // Optional: Add further validation on event.source if needed
+            // if (event.source !== retrieverWindow) {
+            //     console.warn('Ignoring message not from the expected popup window.');
+            //     return;
+            // }
+
+            console.log('Message received from EHR Retriever:', event.data);
+
+            // Assuming the data is the ClientFullEHR object
+            const ehrData = event.data;
+
+            dataOutput.textContent = JSON.stringify(ehrData, null, 2);
+            dataContainer.style.display = 'block';
+            statusMessage.textContent = 'EHR data received successfully!';
+            launchButton.disabled = false; // Re-enable button
+
+            // We received the data, the popup should have closed itself,
+            // but clear our reference just in case.
+            retrieverWindow = null;
+
+        }, false);
+
+        // Initial status
+        statusMessage.textContent = `Ready to launch EHR Retriever (${retrieverUrlBase}). My origin is ${callerOrigin}.`;
+
+    </script>
+
+</body>
+</html> 

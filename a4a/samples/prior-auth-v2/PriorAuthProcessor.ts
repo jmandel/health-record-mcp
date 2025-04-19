@@ -10,6 +10,17 @@ import { GeminiEvaluator } from './GeminiEvaluator'; // Import the Gemini implem
 import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from '@google/genai'; // Add missing import for Gemini classes used by evaluator
 // Gemini Helper
 
+// Helper Function to extract text from all message parts
+function extractTextFromMessage(message: Message | undefined | null): string {
+    if (!message?.parts) {
+        return '';
+    }
+    return message.parts
+        .map(p => p.type === 'text' ? p.text : p.type === 'data' ? JSON.stringify(p.data) : '')
+        .filter(Boolean) // Remove empty strings from non-text/data parts
+        .join('\n')
+        .trim();
+}
 
 export class PriorAuthProcessor implements TaskProcessorV2 {
     private static PRIOR_AUTH_SKILL = 'priorAuthRequest';
@@ -37,7 +48,8 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
             yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Processing prior authorization request...' }] } };
 
             // --- 1. Extract Request Text --- 
-            let initialRequestText = initialParams.message.parts.find((p): p is TextPart => p.type === 'text')?.text;
+            let initialRequestText = extractTextFromMessage(initialParams.message);
+
             // Prompt user for request text until provided
             while (!initialRequestText) {
                 const inputPrompt: Message = {
@@ -53,9 +65,11 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                     yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text. Please describe the request.' }] } };
                     continue;
                 }
-                initialRequestText = textPart.text;
+                // Use helper again if reprocessing is needed based on user input
+                initialRequestText = extractTextFromMessage(userInput.message);
+                console.log(`[PriorAuthProc ${taskId}] Received request text parts:\n${initialRequestText}`);
             }
-            console.log(`[PriorAuthProc ${taskId}] Received request text: ${initialRequestText.substring(0, 100)}...`);
+            console.log(`[PriorAuthProc ${taskId}] Received request text: ${initialRequestText}...`);
 
 
             // --- 2. Parse Request Details using Evaluator --- 
@@ -81,7 +95,8 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                         yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text. Please provide additional details.' }] } };
                         continue;
                     }
-                    initialRequestText = textPart.text;
+                    // Use helper again if reprocessing is needed based on user input
+                    initialRequestText = extractTextFromMessage(userInput.message);
                 }
             }
 
@@ -188,14 +203,13 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                     console.log(`[PriorAuthProc ${taskId}] Received null or non-message input (${userInput?.type}) after input-required. Assuming cancellation.`);
                     throw new ProcessorCancellationError('User did not provide required input or signal received.');
                 }
-                const userMessage = userInput.message;
-                const userResponseTextPart = userMessage.parts.find((p): p is TextPart => p.type === 'text');
-                if (!userResponseTextPart?.text) {
+                const userResponseText = extractTextFromMessage(userInput.message);
+
+                if (!userResponseText) {
                     console.warn(`[PriorAuthProc ${taskId}] User response message did not contain text.`);
                     yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text in your response. Let me ask again...' }] } };
                     continue; 
                 }
-                const userResponseText = userResponseTextPart.text;
                 console.log(`[PriorAuthProc ${taskId}] Received user response: ${userResponseText.substring(0, 100)}...`);
                 yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Processing additional information...' }] } };
 
@@ -248,6 +262,7 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                     yield {
                         type: 'artifact',
                         artifactData: {
+                            index: 0,
                             name: 'prior-auth-approval', // Specific name
                             parts: [
                                 { type: 'data', data: approvalArtifactData }
@@ -260,6 +275,7 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
              yield {
                  type: 'artifact',
                  artifactData: {
+                             index: 0,
                              name: 'prior-auth-evaluation-final',
                      parts: [
                                  { type: 'data', data: evaluationResult } 

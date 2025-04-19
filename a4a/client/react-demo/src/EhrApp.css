@@ -6,44 +6,324 @@ body {
     font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
     background: #f4f6f8; /* Match original background */
     color: #333; /* Default text color */
+    font-size: 16px; /* Base font size */
   }
 
 
 .ehr-app { 
     /* Styles for the main container, if needed */
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
 }
 
-.ehr-header { 
-    background: #2c3e50; 
-    color: #ecf0f1; 
-    padding: 1em; 
+.ehr-header {
+    background: #2c3e50;
+    color: #ecf0f1;
+    padding: 0.5em 0; /* Reduced top/bottom padding */
+    flex-shrink: 0; /* Prevent header from shrinking */
+}
+
+/* Inner container constrained by max-width */
+.header-inner {
+    max-width: 1140px; /* Match main content width */
+    margin: 0 auto; /* Center horizontally */
+    padding: 0 1em; /* Add padding */
+    display: flex;
+    justify-content: space-between;
+    align-items: center; /* Changed from flex-start to center */
+}
+
+/* Removed .header-top-row */
+
+.header-actions {
+    margin-left: 1em; /* Add some space */
+    display: flex;
+    align-items: center; /* Align dropdown and button */
+    gap: 0.5em; /* Space between dropdown and button */
+}
+
+/* Style the dropdown component container */
+.patient-switcher-dropdown {
+    position: relative; /* Needed for absolute positioning of menu */
+    display: inline-block; /* Or block if it takes full width */
+}
+
+/* Style the dropdown toggle button */
+.dropdown-toggle-button {
+    display: inline-flex; /* Use flex to align items inside */
+    align-items: center;
+    justify-content: center;
+    padding: 0.25rem 0.5rem; /* Approx px-2 py-0.5 */
+    border: 1px solid #ccc; /* Approx border-gray-300 */
+    border-radius: 0.375rem; /* Approx rounded-md */
+    background-color: #fff; /* Approx bg-white */
+    font-size: 0.875rem; /* Approx text-sm */
+    font-weight: 500; /* Approx font-medium */
+    color: #374151; /* Approx text-gray-700 */
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+}
+
+.dropdown-toggle-button:hover {
+    background-color: #f9fafb; /* Approx hover:bg-gray-50 */
+}
+
+.dropdown-toggle-button:focus {
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 2px #fff, 0 0 0 4px #4f46e5; /* Approx focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 */
+}
+
+.dropdown-toggle-button:disabled,
+.dropdown-toggle-button.loading {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.dropdown-toggle-button .gear-icon {
+    margin-right: 0.375rem; /* Approx mr-1.5 */
+    height: 1rem; /* Approx h-4 */
+    width: 1rem; /* Approx w-4 */
+}
+
+.dropdown-toggle-button .active-patient-name {
+    font-size: 0.75rem; /* Approx text-xs */
+}
+
+.dropdown-toggle-button .dropdown-chevron {
+    margin-left: 0.375rem; /* Approx ml-1.5 */
+    margin-right: -0.125rem; /* Approx -mr-0.5 */
+    height: 1rem; /* Approx h-4 */
+    width: 1rem; /* Approx w-4 */
+    color: #9ca3af; /* Approx text-gray-400 */
+}
+
+/* Dropdown Menu */
+.dropdown-menu {
+    position: absolute;
+    right: 0;
+    margin-top: 0.5rem; /* Approx mt-2 */
+    width: max-content;
+    min-width: 100%;
+    border-radius: 0.375rem; /* Approx rounded-md */
+    background-color: #fff;
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05); /* Approx shadow-lg */
+    border: 1px solid rgba(0, 0, 0, 0.05); /* Approx ring-1 ring-black ring-opacity-5 */
+    z-index: 50;
+    overflow: visible;
+    padding-right: 0.5rem; /* Provide space so delete button isn't clipped */
+}
+
+.dropdown-section {
+    padding-top: 0.25rem; /* Approx py-1 */
+    padding-bottom: 0.25rem;
+}
+
+.dropdown-section.select-patient-section {
+    border-bottom: 1px solid #e5e7eb; /* Approx border-b border-gray-200 */
+}
+
+.dropdown-section-header {
+    padding: 0.5rem 1rem; /* Approx px-4 py-2 */
+    font-size: 0.75rem; /* Approx text-xs */
+    color: #6b7280; /* Approx text-gray-500 */
+    text-transform: uppercase;
+}
+
+.menu-item {
+    display: block;
+    width: 100%;
+    padding: 0.5rem 0; /* REMOVED horizontal padding (was 0.75rem) */
+    font-size: 0.875rem; /* Approx text-sm */
+    color: #374151; /* Approx text-gray-700 */
+    text-align: left;
+    background: none;
+    border: none;
+    cursor: pointer;
+}
+
+.menu-item:hover {
+    background-color: #f3f4f6; /* Approx hover:bg-gray-100 */
+    color: #111827; /* Approx hover:text-gray-900 */
+}
+
+.menu-item.patient-menu-item {
+    display: flex;
+    align-items: center;
+    padding-left: 0.75rem; /* Keep padding here for left side */
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
+    padding-right: 0.5rem; /* Add right padding to contain delete button */
+}
+
+.menu-item.patient-menu-item.active {
+    background-color: #e0e7ff; /* Approx bg-indigo-100 */
+    color: #3730a3; /* Approx text-indigo-900 */
+    font-weight: 600; /* Approx font-semibold */
+    padding-left: 0.75rem;
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
+    padding-right: 0.5rem; /* Add right padding for consistency */
+}
+
+.patient-name-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-grow: 1; /* Allow name to take available space */
+    flex-shrink: 1; /* Allow name to shrink if needed */
+    min-width: 0; /* Important for flex shrink and overflow to work together */
+}
+
+.delete-patient-button {
+    flex-shrink: 0; /* Prevent button from shrinking */
+    margin-left: 0.5rem; /* Keep space between name and button */
+    margin-right: 0; /* Remove overhang margin */
+    padding: 0.25rem; /* Keep button padding */
+    border: none;
+    background: none;
+    border-radius: 9999px; /* Approx rounded-full */
+    color: #9ca3af; /* Approx text-gray-400 */
+    cursor: pointer;
+}
+
+.delete-patient-button:hover {
+    background-color: #fee2e2; /* Approx hover:bg-red-100 */
+    color: #dc2626; /* Approx hover:text-red-600 */
+}
+
+.delete-patient-button:focus {
+    outline: 1px solid #ef4444; /* Approx focus:ring-1 focus:ring-red-500 */
+    outline-offset: 1px; /* Approx focus:ring-offset-1 */
+}
+
+.delete-patient-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.delete-patient-button .icon {
+    height: 1rem; /* Approx h-4 */
+    width: 1rem; /* Approx w-4 */
+    display: block; /* Ensure icon behaves like a block */
+}
+
+.menu-item-placeholder {
+    padding: 0.5rem 0.75rem; /* Match reduced horizontal padding */
+    font-size: 0.875rem; /* Approx text-sm */
+    color: #6b7280; /* Approx text-gray-500 */
+    font-style: italic;
+}
+
+.menu-item.action-menu-item {
+    display: flex;
+    align-items: center;
+    padding: 0.5rem 0.75rem; /* Match reduced horizontal padding */
+}
+
+.menu-item.action-menu-item:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.menu-item.action-menu-item .icon {
+    margin-right: 0.75rem; /* Approx mr-3 */
+    height: 1rem; /* Approx h-4 */
+    width: 1rem; /* Approx w-4 */
+    color: #9ca3af; /* Approx text-gray-400 */
+}
+
+/* Dropdown Status Section */
+.dropdown-section.status-section {
+    padding: 0.5rem 1rem; /* Approx px-4 py-2 */
+    border-top: 1px solid #f3f4f6; /* Approx border-t border-gray-100 */
+}
+
+.status-loading,
+.status-error {
+    font-size: 0.75rem; /* Approx text-xs */
+    display: flex;
+    align-items: center;
+}
+
+.status-loading {
+    color: #2563eb; /* Approx text-blue-600 */
+}
+
+.status-error {
+    color: #dc2626; /* Approx text-red-600 */
+    word-break: break-word;
+}
+
+.status-loading .spinner {
+    display: inline-block;
+    margin-right: 0.5rem; /* Approx mr-2 */
+    height: 0.75rem; /* Approx h-3 */
+    width: 0.75rem; /* Approx w-3 */
+    border-top: 2px solid #2563eb;
+    border-right: 2px solid #2563eb;
+    border-bottom: 2px solid transparent;
+    border-left: 2px solid transparent;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+}
+
+/* Load JSON Button */
+.btn-load-json {
+    /* Add specific styles or inherit from a generic .btn class */
+    padding: 0.4em 0.8em;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background-color: #fff;
+    cursor: pointer;
+    font-size: 0.9em;
+}
+.btn-load-json:hover {
+    background-color: #f0f0f0;
+}
+
+.patient-header-container {
+    flex-grow: 1; /* Allow patient header to take space */
 }
 
 .patient-info { 
-    max-width: 960px; 
-    margin: 0 auto; 
+    /* max-width: 960px; No longer needed with flex */
+    /* margin: 0 auto; Let flex handle */
+    /* flex-grow: 1; Moved to container */
+    /* padding-left: 1em; Added padding to header-inner */
 }
 
 .patient-info h1 {
-    margin: 0 0 0.25em 0;
+    margin: 0 0 0.1em 0; /* Reduced bottom margin */
+    font-size: 1.5em; /* Slightly smaller name */
 }
 
 .patient-info p {
     margin: 0;
-    font-size: 0.9em;
+    font-size: 0.85em; /* Slightly smaller subtext */
+}
+
+.main-content-container {
+    max-width: 1140px; /* Ensure this has the correct max-width */
+    margin: 0.5em auto 0 auto; /* Reduced top margin, center horizontally */
+    padding: 0 1em; /* Add padding */
+    flex-grow: 1; /* Allow content to fill remaining space */
+    display: flex;
+    flex-direction: column;
 }
 
 nav.tabs { 
     background: #34495e; 
+    flex-shrink: 0; /* Prevent tabs from shrinking */
 }
 
 nav.tabs ul { 
     list-style: none; 
-    margin: 0 auto; /* Center the ul itself */
-    padding: 0; 
-    display: flex; 
-    max-width: 960px; 
-    /* margin: 0 auto; Redundant if applied above */
+    margin: 0; /* Removed auto margin */
+    padding: 0; /* Keep ul centered and unpadded */
+    display: flex;
+    /* max-width: 960px; Removed - should fill container */
 }
 
 nav.tabs li { 
@@ -53,13 +333,13 @@ nav.tabs li {
 nav.tabs li button { /* Target button inside li */
     display: block; 
     width: 100%;
-    padding: 0.75em;
+    padding: 0.6em; /* Reduced tab padding */
     color: #bdc3c7; 
     background: none;
     border: none;
     text-decoration: none; 
     text-align: center; 
-    font-size: 1em; 
+    font-size: 0.95em; /* Slightly smaller tab font */
     font-family: inherit;
     cursor: pointer;
     transition: background-color 0.2s ease, color 0.2s ease;
@@ -77,41 +357,546 @@ nav.tabs li.active button {
 }
 
 .content { 
-    max-width: 960px; 
-    margin: 1em auto; /* Original was 1em auto */
-    padding: 1em; /* Match original padding */
+    /* max-width: 960px; Removed - should fill container */
+    margin: 1em 0; /* Original was 1em auto, removed auto */
+    padding: 1em; /* Keep internal padding */
     background: #ffffff; 
-    box-shadow: 0 0 5px rgba(0,0,0,0.1); /* Match original shadow */
-    border-radius: 0; /* Original didn't have border-radius */
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1); /* Reduced shadow */
+    flex-grow: 1; /* Allow content area to grow */
+    overflow-y: auto; /* Allow internal scrolling if needed */
 }
 
+/* Form Styles (General - can be overridden) */
 .form-group { 
-    margin-bottom: 1.2em; 
+    margin-bottom: 1rem; /* Approx mb-4 */
 }
 
-.form-group label { 
+.form-label {
     display: block; 
-    font-weight: bold; 
-    margin-bottom: 0.35em; 
-    color: #333;
+    margin-bottom: 0.25rem; /* Approx mb-1 */
+    font-size: 0.875rem; /* Approx text-sm */
+    font-weight: 500; /* Approx font-medium */
+    color: #374151; /* Approx text-gray-700 */
 }
 
-.form-group input[type="text"],
-.form-group input[type="date"], 
-.form-group select, 
-.form-group textarea {
+.form-input,
+.form-textarea {
     box-sizing: border-box; 
     width: 100%; 
-    padding: 0.6em 0.8em;
-    border: 1px solid #bdc3c7; 
-    border-radius: 4px; 
+    padding: 0.5rem; /* Approx p-2 */
+    border: 1px solid #d1d5db; /* Approx border-gray-300 */
+    border-radius: 0.375rem; /* Approx rounded */
     font-size: 1em;
 }
 
-.form-group textarea {
+.form-textarea {
+    resize: vertical;
+    min-height: 60px; /* From inline style */
+}
+
+.form-input-number {
+    /* Add specific number input styles if needed */
+}
+
+/* Radio Button Styles */
+.form-group-radio {
+    margin-bottom: 0.5rem; /* Approx mb-2 */
+}
+.form-group-radio:last-child {
+    margin-bottom: 0;
+}
+
+.radio-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem; /* Approx space-x-2 */
+    cursor: pointer;
+}
+
+.form-radio {
+    height: 1rem; /* Approx h-4 */
+    width: 1rem; /* Approx w-4 */
+    color: #4f46e5; /* Approx text-indigo-600 */
+    /* Use browser default radio or custom style */
+}
+
+.radio-option-label {
+    font-size: 0.875rem; /* Approx text-sm */
+}
+
+/* Snippet Container Styles */
+.snippet-container {
+    margin-top: 0.5rem; /* Approx mt-2 */
+    padding: 0.75rem; /* Approx p-3 */
+    background-color: #f9fafb; /* Approx bg-gray-50 */
+    border: 1px solid #e5e7eb; /* Approx border-gray-200 */
+    border-radius: 0.25rem; /* Approx rounded */
+    margin-left: 1.5rem; /* Approx ml-6, but maybe adjust */
+}
+
+/* Override margin for numeric/freetext where ml-0 was used */
+.form-group > .snippet-container {
+    margin-left: 0;
+}
+
+.snippet-title {
+    font-size: 0.75rem; /* Approx text-xs */
+    font-weight: 600; /* Approx font-semibold */
+    color: #4b5563; /* Approx text-gray-700 */
+    margin-bottom: 0.25rem; /* Approx mb-1 */
+}
+
+.snippet-title-detail {
+    font-weight: 400; /* Approx font-normal */
+    font-style: italic;
+}
+
+.snippet-textarea {
+    font-size: 0.75rem; /* Approx text-xs */
+    padding: 0.5rem; /* Approx p-2 */
+    min-height: 60px; /* Approx min-h-[60px] */
+    width: 100%;
+    border: 1px solid #d1d5db; /* Approx border-gray-300 */
+    border-radius: 0.25rem; /* Approx rounded */
     resize: vertical;
 }
 
+.snippet-suggestion {
+    font-size: 0.75rem; /* Approx text-xs */
+    color: #6b7280; /* Approx text-gray-500 */
+    margin-top: 0.25rem; /* Approx mt-1 */
+}
+
+/* Orders2Tab Specific Styles */
+.orders2-tab {
+    padding: 1rem; /* Approx p-4 */
+    /* space-y-4 -> use direct margins or gap */
+    display: flex;
+    flex-direction: column;
+    gap: 1rem; /* Replaces space-y-4 */
+    background-color: #f3f4f6; /* Approx bg-gray-100 */
+    /* min-height: screen; -> handled by flex layout */
+}
+
+.orders2-tab > h2 {
+    font-size: 1.25rem; /* Approx text-xl */
+    font-weight: 600; /* Approx font-semibold */
+    margin: 0; /* Remove default margin */
+}
+
+.order-form-section {
+    margin-bottom: 1rem; /* Approx mb-4 */
+    padding: 1rem; /* Approx p-4 */
+    border: 1px solid #e5e7eb; /* Approx border */
+    border-radius: 0.25rem; /* Approx rounded */
+    background-color: #fff; /* Approx bg-white */
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); /* Approx shadow */
+}
+
+.order-form-section .section-title,
+.questions-section .section-title {
+    font-size: 1.125rem; /* Approx text-lg */
+    font-weight: 500; /* Approx font-medium */
+    margin-bottom: 0.5rem; /* Approx mb-2 */
+}
+
+/* Button Styles */
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.5rem 1rem; /* Approx px-4 py-2 */
+    border-radius: 0.375rem; /* Approx rounded */
+    border: 1px solid transparent;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn-primary {
+    background-color: #2563eb; /* Approx bg-blue-600 */
+    color: #fff;
+    border-color: #2563eb;
+}
+.btn-primary:hover:not(:disabled) {
+    background-color: #1d4ed8; /* Approx hover:bg-blue-700 */
+    border-color: #1d4ed8;
+}
+
+.btn-success {
+    background-color: #16a34a; /* Approx bg-green-600 */
+    color: #fff;
+    border-color: #16a34a;
+}
+.btn-success:hover:not(:disabled) {
+    background-color: #15803d; /* Approx hover:bg-green-700 */
+    border-color: #15803d;
+}
+
+.btn-secondary {
+    background-color: #6b7280; /* Approx bg-gray-500 */
+    color: #fff;
+    border-color: #6b7280;
+}
+.btn-secondary:hover:not(:disabled) {
+    background-color: #4b5563; /* Approx hover:bg-gray-600 */
+    border-color: #4b5563;
+}
+
+.status-message {
+    font-size: 0.875rem; /* Approx text-sm */
+    margin-top: 0.5rem; /* Approx mt-2 */
+}
+.status-warning {
+    color: #ca8a04; /* Approx text-yellow-700 */
+}
+
+/* Loading Indicator */
+.loading-indicator {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem; /* Approx p-4 */
+    margin: 1rem 0; /* Approx my-4 */
+    background-color: #dbeafe; /* Approx bg-blue-100 */
+    border: 1px solid #bfdbfe; /* Approx border-blue-300 */
+    border-radius: 0.25rem; /* Approx rounded */
+    color: #1e40af; /* Approx text-blue-700 */
+}
+
+.loading-indicator .spinner-icon {
+    animation: spin 1s linear infinite;
+    margin-right: 0.75rem; /* Approx mr-3 */
+    margin-left: -0.25rem; /* Approx -ml-1 */
+    height: 1.25rem; /* Approx h-5 */
+    width: 1.25rem; /* Approx w-5 */
+    color: #1e40af; /* Approx text-blue-700 */
+}
+
+.loading-indicator .spinner-icon .opacity-25 {
+    opacity: 0.25;
+}
+.loading-indicator .spinner-icon .opacity-75 {
+    opacity: 0.75;
+}
+
+/* Error Message */
+.error-message {
+    color: #b91c1c; /* Approx text-red-700 */
+    border: 1px solid #fca5a5; /* Approx border-red-400 */
+    padding: 0.75rem; /* Approx p-3 */
+    border-radius: 0.25rem; /* Approx rounded */
+    background-color: #fee2e2; /* Approx bg-red-100 */
+    margin: 1rem 0; /* Approx my-4 */
+}
+
+/* History Section */
+.history-section {
+    margin-top: 1rem; /* Approx mt-4 */
+    border: 1px solid #e5e7eb; /* Approx border */
+    border-radius: 0.25rem; /* Approx rounded */
+    background-color: #fff; /* Approx bg-white */
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); /* Approx shadow */
+}
+
+.history-toggle-button {
+    width: 100%;
+    text-align: left;
+    padding: 0.5rem; /* Approx p-2 */
+    font-weight: 500; /* Approx font-medium */
+    font-size: 0.875rem; /* Approx text-sm */
+    color: #374151; /* Approx text-gray-700 */
+    background: none;
+    border: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+}
+
+.history-toggle-button:hover {
+    background-color: #f9fafb; /* Approx hover:bg-gray-50 */
+}
+
+.history-toggle-button .toggle-icon {
+    font-size: 1.25rem; /* Approx text-xl */
+    line-height: 1;
+}
+
+.history-content {
+    border-top: 1px solid #e5e7eb; /* Approx border-t */
+    padding: 0.75rem; /* Approx p-3 */
+    background-color: #f9fafb; /* Approx bg-gray-50 */
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.history-item {
+    margin-bottom: 0.75rem; /* Approx mb-3 */
+    padding-bottom: 0.75rem; /* Approx pb-3 */
+    border-bottom: 1px solid #e5e7eb; /* Approx border-b */
+}
+.history-item:last-child {
+    border-bottom: none; /* Approx last:border-b-0 */
+    margin-bottom: 0;
+    padding-bottom: 0;
+}
+
+.history-item-header {
+    font-weight: 600; /* Approx font-semibold */
+    font-size: 0.75rem; /* Approx text-xs */
+    color: #4b5563; /* Approx text-gray-600 */
+    margin-bottom: 0.25rem; /* Approx mb-1 */
+}
+
+.history-item-header .action-code {
+    color: #1d4ed8; /* Approx text-blue-700 */
+    background-color: #dbeafe; /* Approx bg-blue-100 */
+    padding: 0.125rem 0.25rem; /* Approx px-1 */
+    border-radius: 0.125rem; /* Approx rounded */
+    font-family: monospace;
+}
+
+.history-item-detail {
+    font-size: 0.75rem; /* Approx text-xs */
+    color: #1f2937; /* Approx text-gray-800 */
+}
+
+.history-item-detail .keyword-code {
+    background-color: #e5e7eb; /* Approx bg-gray-200 */
+    padding: 0.125rem 0.25rem; /* Approx px-1 */
+    border-radius: 0.125rem; /* Approx rounded */
+    font-family: monospace;
+}
+
+.history-list {
+    list-style: disc;
+    padding-left: 1rem; /* Approx ml-4 or list-inside ml-2 */
+    margin-top: 0.25rem;
+}
+
+.history-item-detail.success-detail {
+    color: #166534; /* Approx text-green-800 */
+}
+
+.history-item-detail.failure-detail {
+    color: #991b1b; /* Approx text-red-800 */
+}
+
+/* Questions Section */
+.questions-section {
+    margin-top: 1rem; /* Approx mt-4 */
+    /* space-y-4 -> handled by form-group margins */
+    padding: 1rem; /* Approx p-4 */
+    border: 1px solid #e5e7eb; /* Approx border */
+    border-radius: 0.25rem; /* Approx rounded */
+    background-color: #fff; /* Approx bg-white */
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); /* Approx shadow */
+}
+
+.question-card {
+    margin-bottom: 1.5rem; /* Approx mb-6 */
+    background-color: #fff; /* Approx bg-white */
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); /* Approx shadow-md */
+    border-radius: 0.5rem; /* Approx rounded-lg */
+    overflow: hidden; /* Contain box shadow */
+}
+
+.question-card .card-content {
+    padding: 1rem; /* Approx p-4 */
+}
+
+.question-label {
+    font-size: 1rem; /* Approx text-md */
+    font-weight: 600; /* Approx font-semibold */
+    margin-bottom: 0.25rem; /* Approx mb-1 */
+}
+
+.question-explanation {
+    font-size: 0.875rem; /* Approx text-sm */
+    color: #4b5563; /* Approx text-gray-600 */
+    margin-bottom: 0.75rem; /* Approx mb-3 */
+}
+
+.question-text {
+    font-size: 0.875rem; /* Approx text-sm */
+    font-weight: 500; /* Approx font-medium */
+    margin-bottom: 0.5rem; /* Approx mb-2 */
+}
+
+.btn-submit-answers {
+    /* Inherits .btn styles */
+}
+
+/* Conclusion Section */
+.conclusion-section {
+    margin-top: 1rem; /* Approx mt-4 */
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.result-card {
+    margin-bottom: 1rem; /* Less than QuestionCard's mb-6 */
+    background-color: #fff; /* Approx bg-white */
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); /* Approx shadow-md */
+    border-radius: 0.5rem; /* Approx rounded-lg */
+    overflow: hidden;
+}
+
+.result-card .card-content {
+    padding: 1rem; /* Approx p-4 */
+}
+
+.result-title {
+    font-size: 1.125rem; /* Approx text-lg */
+    font-weight: 600; /* Approx font-semibold */
+    margin-bottom: 0.75rem; /* Approx mb-3 */
+}
+
+.result-card p {
+    margin-bottom: 0.5rem; /* Approx mb-2 */
+}
+
+.subsection-title {
+    font-weight: 600; /* Approx font-semibold */
+    margin-top: 0.75rem; /* Approx mt-3 */
+    margin-bottom: 0.25rem; /* Approx mb-1 */
+}
+
+.criteria-tree-container {
+    padding: 0.5rem; /* Approx p-2 */
+    border: 1px solid #e5e7eb; /* Approx border */
+    border-radius: 0.25rem; /* Approx rounded */
+    background-color: #f9fafb; /* Approx bg-gray-50 */
+    font-size: 0.875rem; /* Approx text-sm */
+}
+
+.criteria-tree-failure {
+    background-color: #fee2e2; /* Approx bg-red-50 */
+}
+
+.criteria-tree-list {
+    margin-left: 1rem; /* Approx ml-4 */
+    list-style: disc;
+    /* space-y-1 -> use li margin */
+}
+.criteria-tree-list li {
+    margin-bottom: 0.25rem;
+}
+
+.criteria-label {
+    font-weight: 500; /* Approx font-medium */
+}
+
+.criteria-operator {
+    font-size: 0.75rem; /* Approx text-xs */
+    color: #6b7280; /* Approx text-gray-500 */
+    margin-left: 0.25rem; /* Approx ml-1 */
+}
+
+.evidence-list {
+    margin-left: 1.5rem; /* Approx ml-6 */
+    list-style: circle;
+    font-size: 0.75rem; /* Approx text-xs */
+    color: #4b5563; /* Approx text-gray-600 */
+    margin-top: 0.25rem; /* Approx mt-1 */
+    /* space-y-0.5 -> use li margin */
+}
+.evidence-list li {
+    margin-bottom: 0.125rem;
+}
+
+.signable-snippets {
+    margin-top: 1rem; /* Approx mt-4 */
+    padding-top: 0.75rem; /* Approx pt-3 */
+    border-top: 1px solid #e5e7eb; /* Approx border-t */
+}
+
+.signable-snippets .subsection-title {
+    /* font-semibold mb-2 */
+    margin-bottom: 0.5rem;
+}
+
+.snippet-item {
+    margin-bottom: 0.75rem; /* Approx mb-3 */
+    padding: 0.75rem; /* Approx p-3 */
+    border: 1px solid #e5e7eb; /* Approx border */
+    border-radius: 0.25rem; /* Approx rounded */
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); /* Approx shadow-sm */
+}
+
+.snippet-signable {
+    background-color: #eff6ff; /* Approx bg-blue-50 */
+}
+
+.snippet-reference {
+    background-color: #f9fafb; /* Approx bg-gray-100 */
+    opacity: 0.8; /* Approx opacity-80 */
+}
+
+.snippet-item-title {
+    font-size: 0.875rem; /* Approx text-sm */
+    font-weight: 500; /* Approx font-medium */
+    margin-bottom: 0.25rem; /* Approx mb-1 */
+}
+.snippet-reference .snippet-item-title {
+    color: #374151; /* Approx text-gray-700 */
+}
+
+.snippet-item-content {
+    font-size: 0.75rem; /* Approx text-xs */
+    margin-top: 0.25rem; /* Approx my-1 */
+    margin-bottom: 0.25rem;
+    padding: 0.5rem; /* Approx p-2 */
+    background-color: #fff; /* Approx bg-white */
+    border: 1px solid #e5e7eb; /* Approx border */
+    border-radius: 0.25rem; /* Approx rounded */
+    white-space: pre-wrap;
+}
+
+.btn-sign-snippet {
+    margin-top: 0.25rem; /* Approx mt-1 */
+    padding: 0.25rem 0.75rem; /* Approx px-3 py-1 */
+    font-size: 0.75rem; /* Approx text-xs */
+    /* Default state (unsigned) */
+    background-color: #10b981; /* Approx bg-emerald-500 */
+    color: #fff;
+    border-color: #10b981;
+}
+.btn-sign-snippet:hover:not(:disabled) {
+    background-color: #059669; /* Approx hover:bg-emerald-600 */
+    border-color: #059669;
+}
+
+.btn-sign-snippet.signed {
+    background-color: #9ca3af; /* Approx bg-gray-400 */
+    color: #1f2937; /* Approx text-gray-800 */
+    border-color: #9ca3af;
+    cursor: not-allowed;
+    opacity: 0.7; /* Approx disabled:opacity-70 */
+}
+
+.btn-start-new {
+    /* Inherits btn */
+    margin-top: 1rem; /* Approx mt-4 */
+}
+
+.snippets-for-reference .subsection-title {
+    color: #4b5563; /* Approx text-gray-600 */
+}
+
+
+/* ================= */
+/* Original CSS starts here - review and integrate/remove conflicts */
+/* ================= */
+
+/* Keep useful generic styles */
 .buttons { 
     margin-top: 1.5em; 
     padding-top: 1em;
@@ -121,21 +906,21 @@ nav.tabs li.active button {
 }
 
 .buttons button { 
-    padding: 0.75em 1.5em; 
-    /* margin-right: 0.5em; Removed for gap */
-    border: none; 
-    border-radius: 4px; 
-    cursor: pointer; 
-    font-size: 1em;
-    font-weight: 500;
-    transition: background-color 0.2s ease;
+    /* Let specific .btn classes handle this */
+    /* padding: 0.75em 1.5em;  */
+    /* border: none;  */
+    /* border-radius: 4px;  */
+    /* cursor: pointer;  */
+    /* font-size: 1em; */
+    /* font-weight: 500; */
+    /* transition: background-color 0.2s ease; */
 }
 
-.btn-primary { background: #3498db; color: #fff; }
-.btn-primary:hover { background: #2980b9; }
-
-.btn-secondary { background: #95a5a6; color: #fff; }
-.btn-secondary:hover { background: #7f8c8d; }
+/* Remove redundant btn-* colors if covered by new ones */
+/* .btn-primary { background: #3498db; color: #fff; } */
+/* .btn-primary:hover { background: #2980b9; } */
+/* .btn-secondary { background: #95a5a6; color: #fff; } */
+/* .btn-secondary:hover { background: #7f8c8d; } */
 
 .btn-danger { background: #e74c3c; color: #fff; }
 .btn-danger:hover { background: #c0392b; }
@@ -163,7 +948,7 @@ th {
     color: #333;
 }
 
-.tab-content h2 {
+.tab-content h2 { /* Applies to Demographics, Labs etc. */
     margin-top: 0;
     border-bottom: 2px solid #eee;
     padding-bottom: 0.4em;
@@ -171,7 +956,7 @@ th {
     color: #2c3e50;
 }
 
-.tab-content ul {
+.tab-content ul { /* Non-criteria tree lists */
     list-style: disc;
     padding-left: 20px;
 }
@@ -180,6 +965,7 @@ th {
     margin-bottom: 0.5em;
 }
 
+/* Order confirmation / Order in progress - Keep if used elsewhere */
 .order-confirmation {
     border: 1px solid #ddd;
     background: #f9f9f9;
@@ -201,10 +987,34 @@ th {
     color: #555;
 }
 
-/* Ensure the tab-content itself doesn't add extra padding if .content already has it */
-.tab-content {
-    padding: 0; /* Remove padding here if .content handles it */
+/* Remove redundant .tab-content padding rule */
+/* .tab-content { */
+/*     padding: 0; */
+/* } */
+
+/* Spinner animation */
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
+
+/* Focus outlines for accessibility */
+button:focus, input:focus, textarea:focus, select:focus {
+  outline: 2px solid #3498db;
+  outline-offset: 2px;
+}
+
+/* Ensure sidebar uses full viewport height in a flex layout */
+.conversation-panel.pa-sidebar {
+    display: flex;
+    flex-direction: column;
+    background: #fff;
+    padding: 8px;
+    overflow: hidden; /* Still prevent this container scrolling */
+}
+
+
+/* Other existing styles below seem related to a sidebar PA workflow */
+/* Keep them for now unless they directly conflict or are unused */
 
 /* Conversation Panel Styles */
 .conversation-panel {
@@ -241,12 +1051,12 @@ th {
     font-size: 1em;
 }
 
-.conversation-history {
+.conversation-history { /* Used in sidebar PA, different from Orders2 */
     background: #f5f5f5;
     padding: 1em;
     border-radius: 4px;
-    overflow-x: auto;
-    max-height: 200px;
+    overflow-x: auto; /* Keep */
+    max-height: 200px; /* Keep */
     font-family: monospace;
     font-size: 0.9em;
     white-space: pre-wrap;
@@ -258,13 +1068,20 @@ th {
 .pa-sidebar {
     display: flex;
     flex-direction: column;
-    flex: 0 0 280px; /* fixed width when expanded */
-    transition: flex 0.2s ease;
+    min-width: 280px;
+    max-width: 280px;
+    transition: max-width 0.2s ease;
     background: #fff;
     border-left: 1px solid #ddd;
+    padding: 8px;
+    height: 100vh;       /* full viewport height */
+    overflow-y: auto;    /* internal scroll if needed */
+    position: relative;  /* ensure correct positioning */
 }
 .pa-sidebar.collapsed {
-    flex: 0 0 40px; /* collapsed width */
+    min-width: 40px;
+    max-width: 40px;
+    overflow: hidden;
 }
 
 /* Summary list styles */
@@ -274,7 +1091,7 @@ th {
     list-style: none;
 }
 .pa-summary-item {
-    margin-bottom: 0.75em;
+    margin-bottom: 1em;
 }
 .pa-summary-item .status-display {
     display: flex;
@@ -287,4 +1104,319 @@ th {
     margin: 0.5em 0 0.5em 1.2em;
     padding: 0;
     list-style-type: circle;
+}
+
+/* Sidebar Tabs Styling - corrected selectors */
+.tabs.sidebar-tabs ul {
+    display: flex;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    border-bottom: 2px solid #ddd;
+}
+.tabs.sidebar-tabs ul li {
+    flex: 1;
+}
+.tabs.sidebar-tabs ul li button {
+    display: block;
+    width: 100%;
+    padding: 0.75em; /* equal height */
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    font-weight: 500;
+    color: #333;
+    transition: color 0.2s ease;
+}
+.tabs.sidebar-tabs ul li button:hover {
+    color: #2c3e50;
+}
+.tabs.sidebar-tabs ul li.active button {
+    border-bottom-color: #2c3e50;
+    color: #2c3e50;
+}
+
+/* Spinner for pending status (used in PA Sidebar) */
+.pa-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid #ccc;
+  border-top-color: #3498db;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+  margin-right: 4px;
+}
+
+/* Truncate clause labels with ellipsis */
+.pa-summary-item .detail {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.95em;
+  font-weight: 500;
+  color: #2c3e50;
+}
+
+/* Sticky footer for summary and chat inputs */
+.pa-sidebar .input-section {
+  position: sticky;
+  bottom: 0;
+  background: #fff;
+  padding: 8px;
+  border-top: 1px solid #eee;
+}
+
+/* Chat history message bubbles */
+.conversation-history > div { /* Applies to PA Sidebar Chat */
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  border-radius: 4px;
+}
+.conversation-history > div:nth-child(odd) {
+  background: #f0f4f8;
+}
+.conversation-history > div:nth-child(even) {
+  background: #fff;
+}
+
+/* Sidebar toggle button */
+.sidebar-toggle {
+  margin-left: auto;
+  background: none;
+  border: none;
+  padding: 4px;
+  cursor: pointer;
+}
+.sidebar-toggle:hover {
+  background: rgba(0,0,0,0.05);
+  border-radius: 4px;
+}
+
+/* Evidence typography */
+.pa-summary-evidence .pa-evidence-item {
+  font-size: 0.85em;
+  color: #555;
+  margin-left: 12px;
+}
+
+/* Increase spacing between summary items */
+.pa-summary-list .pa-summary-item {
+  margin-bottom: 1em;
+}
+
+/* Clickable summary header */
+.clickable {
+  cursor: pointer;
+}
+
+/* Status icon alignment in summary header */
+.status-icon {
+  margin-left: auto;
+  display: inline-flex;
+}
+
+/* Draft button padding normalization */
+.draft-btn {
+  padding: 0.75em 1.5em;
+}
+
+/* Sidebar sticky action styling */
+.pa-sidebar .input-section button {
+  width: 100%;
+  margin: 0;
+}
+.pa-sidebar .input-section input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Sidebar Tabs General Background */
+.tabs.sidebar-tabs {
+    background-color: #f9f9f9;
+}
+
+/* Tab buttons */
+.tabs.sidebar-tabs ul li button {
+    background-color: transparent;
+    color: #333;
+    font-size: 0.95em;
+    line-height: 1.2;
+}
+
+/* Active tab enhancement */
+.tabs.sidebar-tabs ul li.active button {
+    background-color: #fff;
+    color: #2c3e50; /* darker accent */
+    border-bottom-color: #3498db;
+}
+
+/* Improve header text readability */
+.pa-header h4 {
+    font-size: 1.2em;
+    margin-bottom: 0.25em;
+}
+.pa-header .status-display span {
+    font-size: 1em;
+    color: #444;
+}
+
+/* Sticky footer for Submit Responses */
+.submit-footer {
+  position: sticky;
+  bottom: 0;
+  background: #fff;
+  padding: 8px;
+  border-top: 1px solid #ddd;
+}
+.submit-footer .btn-primary {
+  width: 100%;
+  margin: 0;
+}
+
+/* Chat message styles */
+.chat-user, .chat-agent {
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  border-radius: 4px;
+}
+.chat-user {
+  background: #f0f4f8;
+  align-self: flex-end;
+}
+.chat-agent {
+  background: #fff;
+  margin-left: 8px;
+}
+
+/* Ensure conversation-history flex column */
+.conversation-history { /* This applies to PA sidebar */
+  display: flex;
+  flex-direction: column;
+}
+
+/* User prompt text */
+.user-prompt {
+  margin: 4px 0;
+  font-style: italic;
+  color: #555;
+}
+
+/* Tooltip effect for clause detail */
+.detail[title] {
+  position: relative;
+  cursor: help;
+}
+.detail[title]:hover::after {
+  content: attr(title);
+  position: absolute;
+  left: 0;
+  top: 100%;
+  background: rgba(0,0,0,0.75);
+  color: #fff;
+  padding: 4px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+  z-index: 10;
+  margin-top: 4px;
+}
+
+
+/* Header and tabs occupy only needed space */
+.pa-header,
+.tabs.sidebar-tabs {
+  flex: 0 0 auto;
+}
+
+/* Summary list and chat history should scroll internally */
+.pa-summary-list,
+.conversation-history { /* This applies to PA sidebar */
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding-right: 4px; /* accommodate scrollbar */
+}
+
+/* Ensure submit-footer and chat input remain visible */
+.submit-footer,
+.pa-sidebar .input-section { /* Includes chat input */
+  flex: 0 0 auto;
+}
+
+/* Layout for the Order Entry Tab content (form + sidebar) */
+.order-entry-content-wrapper {
+  display: flex;
+  /* Estimate header+tabs height; adjust 100px if needed */
+  /* Height calc might be tricky, let flex handle it */
+  /* height: calc(100vh - 100px); */ 
+  flex-grow: 1; /* Let this wrapper grow */
+  overflow: hidden; /* Prevent this container itself from scrolling */
+}
+
+/* Main content area (Order Form) */
+#order-entry.tab-content {
+  flex: 1; /* Take up remaining horizontal space */
+  overflow-y: auto; /* Scroll internally */
+  padding: 15px; /* Consistent padding */
+  /* REMOVED height: 100% from previous attempts */
+}
+
+/* PA Sidebar */
+.conversation-panel.pa-sidebar {
+  /* Keep existing width styles (min/max-width) */
+  /* display: flex; flex-direction: column; already set */
+  height: 100%; /* Fill the wrapper height */
+  overflow: hidden; /* Prevent sidebar itself scrolling */
+  /* REMOVED position:relative and height: 100vh from previous attempts */
+}
+
+/* Ensure sidebar internal content scrolls */
+.pa-summary-list,
+.conversation-history { /* This applies to PA sidebar */
+  flex: 1 1 auto;
+  overflow-y: auto;
+  /* padding-right: 4px; */ /* Removed padding, let scrollbar overlay */
+}
+
+/* Header, tabs, footer should not grow/shrink */
+.pa-header,
+.tabs.sidebar-tabs,
+.submit-footer,
+.pa-sidebar .input-section { /* Includes chat input */
+  flex: 0 0 auto;
+}
+
+/* Reset any previous height styles that might conflict */
+/* #order-entry.tab-content { */
+  /* NOTE: This rule overrides the previous height: 100% attempt. */
+  /* We want flexbox to control height, not an explicit percentage here. */
+/* } */
+
+
+/* Remove conflicting styles from previous CSS if needed */
+/* e.g., if .patient-switcher-dropdown had styles before */
+
+/* Error display styling from EhrApp */
+.error-display {
+    padding: 0.5em;
+    margin-bottom: 1em;
+    border: 1px solid;
+    border-radius: 4px;
+}
+.file-error {
+    border-color: #fca5a5;
+    background-color: #fee2e2;
+    color: #b91c1c;
+}
+.system-error {
+    border-color: #fca5a5;
+    background-color: #fee2e2;
+    color: #b91c1c;
+}
+
+.loading-message, .no-data-message {
+    padding: 1em;
+    text-align: center;
+    color: #555;
 } 

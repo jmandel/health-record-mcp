@@ -4,14 +4,14 @@ import type { PriorAuthEvaluator, PriorAuthRequestDetails, PolicyEvalResult } fr
  * A simple, deterministic evaluator based on keyword matching for testing purposes.
  */
 export class KeywordEvaluator implements PriorAuthEvaluator {
-    private readonly MAX_SUMMARY_LENGTH = 200; // Limit summary length
+    private readonly MAX_SUMMARY_LENGTH = 200000; // Limit summary length
 
     /**
      * Tries to extract details using simple patterns. Very basic.
      * Quick Fix: Treat entire input as summary and extract keywords directly.
      */
     async parseInitialRequest(requestText: string, taskId?: string): Promise<PriorAuthRequestDetails> {
-        console.log(`[KeywordEval${taskId ? ' Task ' + taskId : ''}] Parsing request: ${requestText.substring(0, 50)}...`);
+        console.log(`[KeywordEval${taskId ? ' Task ' + taskId : ''}] Parsing request: ${requestText}...`);
         // Quick Fix: No complex parsing, just use the text as summary
         const clinicalSummary = requestText.trim();
 
@@ -36,30 +36,25 @@ export class KeywordEvaluator implements PriorAuthEvaluator {
     async findRelevantPolicy(requestDetails: PriorAuthRequestDetails, availablePolicies: string[], taskId?: string): Promise<string | null> {
         console.log(`[KeywordEval${taskId ? ' Task ' + taskId : ''}] Finding policy for:`, requestDetails);
         
-        // Quick Fix: Extract keywords from summary (handle JSON and plain text)
-        let summaryKeywords: string[] = [];
-        try {
-            const parsed = JSON.parse(requestDetails.clinicalSummary);
-            summaryKeywords = Object.entries(parsed).flatMap(([key, value]) => [
-                key.toLowerCase(),
-                ...(typeof value === 'string'
-                    ? value.toLowerCase()
-                        .split(',')
-                        .flatMap(seg => seg.replace(/[()]/g, '').trim().split(/\s+/))
-                    : [])
-            ]);
-        } catch {
-            summaryKeywords = requestDetails.clinicalSummary
-                .toLowerCase()
-                .split(',')
-                .flatMap(seg => seg.replace(/[()]/g, '').trim().split(/\s+/));
-        }
-        const keywords = [
-            ...(requestDetails.procedure?.toLowerCase().split(/\s+/) || []),
-            ...(requestDetails.diagnosis?.toLowerCase().split(/\s+/) || []),
-            ...summaryKeywords
-        ].filter(kw => kw.length > 2); // Simple filtering
-        const uniqueKeywords = [...new Set(keywords)]; // Remove duplicates
+        // Improved Keyword Extraction:
+        // 1. Combine relevant text fields
+        const combinedText = [
+            requestDetails.procedure,
+            requestDetails.diagnosis,
+            requestDetails.clinicalSummary
+        ].filter(Boolean).join(' '); // Join with space to separate fields
+
+        // 2. Lowercase all
+        const lowerCaseText = combinedText.toLowerCase();
+
+        // 3. Split on any non-alphabetic sequence
+        const keywords = lowerCaseText.split(/[^a-z]+/);
+        console.log(`[KeywordEval${taskId ? ' Task ' + taskId : ''}] Found keywords: ${keywords.join(', ')}`);
+
+        // 4. Filter out empty strings and optionally short words (keeping > 2 length)
+        const filteredKeywords = keywords.filter(kw => kw && kw.length > 2);
+
+        const uniqueKeywords = [...new Set(filteredKeywords)]; // Remove duplicates
 
         if (uniqueKeywords.length === 0) {
             console.log(`[KeywordEval${taskId ? ' Task ' + taskId : ''}] No keywords found to select policy.`);
@@ -162,7 +157,11 @@ export class KeywordEvaluator implements PriorAuthEvaluator {
     async draftResponse(evaluation: PolicyEvalResult, requestDetails: PriorAuthRequestDetails, taskId?: string): Promise<string> {
         console.log(`[KeywordEval${taskId ? ' Task ' + taskId : ''}] Drafting response for decision: ${evaluation.decision}`);
         let response = `Prior Authorization Update:\nDecision: ${evaluation.decision}\nReason: ${evaluation.reason}`;
+
+        if (evaluation.missingInfo && evaluation.missingInfo.length > 0) {
+            response += `\n\nPlease provide information about: ${evaluation.missingInfo.join(', ')}`;
+        }
         // No extra detail needed for this simple evaluator
         return response;
     }
-} 
+}
