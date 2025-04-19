@@ -1,6 +1,7 @@
 # EHR Tools with MCP and FHIR
 ![EHR Tools Overview](static/overview.png)
 
+https://youtu.be/K0t6MRyIqZU?si=Mz4d65DcAD3i2YbO
 
 This project acts as a specialized server providing tools for Large Language Models (LLMs) and other AI agents to interact with Electronic Health Records (EHRs). It leverages the **SMART on FHIR** standard for secure data access and the **Model Context Protocol (MCP)** to expose the tools.
 
