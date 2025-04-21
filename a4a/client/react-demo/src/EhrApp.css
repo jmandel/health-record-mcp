@@ -1419,4 +1419,529 @@ button:focus, input:focus, textarea:focus, select:focus {
     padding: 1em;
     text-align: center;
     color: #555;
+}
+
+/* Layout for Asking State in OrdersTab */
+.asking-layout-container {
+  display: flex;
+  gap: 1rem; /* Space between columns */
+  align-items: flex-start; /* Align panes to the top */
+  margin-top: 1rem; /* Add some margin above the two-column layout */
+}
+
+.asking-layout-container > .left-pane {
+  flex: 2; /* Give questions pane more width */
+  min-width: 0; /* Prevent flex item overflow */
+}
+
+.asking-layout-container > .right-pane {
+  flex: 1; /* Give scratchpad pane less width */
+  min-width: 0; /* Prevent flex item overflow */
+  /* Removed sticky positioning and height limits */
+  /* position: sticky; */
+  /* top: 1rem; */
+  /* max-height: calc(100vh - 2rem); */
+  /* overflow-y: auto; */
+}
+
+/* Adjustments for sections when inside the two-column layout */
+.asking-layout-container .questions-section {
+  margin-top: 0; /* Remove margin from the top of the questions section */
+  /* Keep other questions-section styles if needed */
+}
+
+.asking-layout-container .scratchpad-section {
+  margin-top: 0; /* Remove margin from the top of the scratchpad section */
+  /* Add background/padding/border directly to the right-pane or keep on scratchpad-section */
+  background-color: #f9fafb; /* Light grey background */
+  padding: 1rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.25rem;
+}
+
+/* Scratchpad specific styles (if not already defined) */
+.scratchpad {
+  /* Add styles for the overall scratchpad container if needed */
+}
+
+.scratchpad-title {
+  font-size: 1rem; /* Example size */
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.pad-block {
+  margin-bottom: 1rem;
+}
+.pad-block:last-child {
+    margin-bottom: 0;
+}
+
+.pad-heading {
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin-top: 0;
+  margin-bottom: 0.3rem;
+  color: #374151; /* Darker grey */
+}
+
+.pad-list {
+  list-style: disc;
+  margin: 0 0 0 1.2rem; /* Indent list */
+  padding: 0;
+}
+.pad-list li {
+    margin-bottom: 0.25rem;
+    font-size: 0.85rem;
+    color: #4b5563;
+}
+
+.pad-quote {
+  border-left: 3px solid #d1d5db; /* Grey border */
+  margin: 0 0 1rem 0.5rem; /* Indent quote */
+  padding: 0.5rem 0.8rem;
+  background-color: #f8f9fa; /* Very light background */
+}
+.pad-quote p {
+    margin: 0 0 0.3rem 0;
+    font-size: 0.85rem;
+    color: #4b5563;
+}
+.pad-quote cite {
+    display: block;
+    font-size: 0.75rem;
+    color: #6b7280; /* Lighter grey */
+    font-style: normal;
+    text-align: right;
+}
+
+.pad-tree {
+    /* Add specific styles for criteria tree block if needed */
+    /* Maybe add a border or background */
+}
+
+.pad-note p {
+    font-size: 0.85rem;
+    color: #4b5563;
+    margin: 0;
+    line-height: 1.4;
+}
+
+.pad-unknown {
+    font-style: italic;
+    color: #ef4444; /* Red for errors/unknown */
+}
+
+/* History Turn Details */
+.history-turn-details {
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+    background-color: #fff;
+}
+.history-turn-summary {
+    padding: 0.4rem 0.6rem;
+    cursor: pointer;
+    font-weight: 500;
+    background-color: #f9fafb;
+}
+.history-turn-summary:hover {
+    background-color: #f3f4f6;
+}
+.history-turn-content {
+    padding: 0.8rem;
+    border-top: 1px solid #e5e7eb;
+}
+.history-subsection-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    margin-top: 0.8rem;
+    margin-bottom: 0.3rem;
+    color: #1f2937;
+}
+.history-subsection-title:first-child {
+    margin-top: 0;
+}
+
+/* Settings Modal Styles */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.5); /* Semi-transparent background */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100; /* Ensure it's above other content */
+}
+
+.modal-content {
+  background-color: #fff;
+  padding: 1.5rem;
+  border-radius: 0.5rem;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  width: 90%;
+  max-width: 500px; /* Max width */
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.modal-content h2 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.modal-status {
+    font-size: 0.9rem;
+    color: #4b5563; /* gray-600 */
+    background-color: #f3f4f6; /* gray-100 */
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.25rem;
+    margin-bottom: 0.5rem;
+}
+
+.modal-content .form-group {
+    margin-bottom: 0; /* Adjust if needed */
+}
+
+.input-hint {
+    font-size: 0.75rem;
+    color: #6b7280; /* gray-500 */
+    margin-top: 0.25rem;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  border-top: 1px solid #e5e7eb; /* gray-200 */
+  padding-top: 1rem;
+}
+
+/* Add a specific class for the clear button if needed */
+.btn-clear-key {
+    margin-right: auto; /* Push clear button to the left */
+    background-color: #d1d5db; /* gray-300 */
+    color: #1f2937; /* gray-800 */
+    border-color: #d1d5db;
+}
+.btn-clear-key:hover:not(:disabled) {
+    background-color: #9ca3af; /* gray-400 */
+}
+
+/* ==============================================
+   3-Column Layout for Active Orders2 Workflow
+   ============================================== */
+
+.active-workflow-layout {
+  display: flex;
+  gap: 1rem; /* Space between columns */
+  width: 100%;
+  margin-top: 1rem; /* Space above the columns */
+  /* Consider a max-height and overflow if content might get too long */
+  /* max-height: calc(100vh - 250px); */ /* Example: Adjust based on header/footer */
+}
+
+.workflow-column {
+  flex: 1; /* Each column takes equal width */
+  border: 1px solid #e0e0e0; /* Light border for separation */
+  border-radius: 8px;
+  padding: 1rem;
+  background-color: #ffffff;
+  display: flex;
+  flex-direction: column; /* Stack title and content vertically */
+  min-width: 0; /* Prevents flex items from overflowing */
+  max-height: 75vh; /* Limit column height */
+  overflow-y: auto; /* Allow columns to scroll independently */
+}
+
+.workflow-column .column-title {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #eee;
+  font-size: 1.1rem;
+  color: #333;
+}
+
+.workflow-column .placeholder-text {
+  color: #888;
+  font-style: italic;
+  text-align: center;
+  padding: 2rem 0;
+}
+
+/* Specific styling for column content if needed */
+.questions-column .questions-section {
+  /* Styles for the section containing QuestionCards */
+}
+
+.scratchpad-column .scratchpad-section {
+  /* Styles specific to the scratchpad container */
+}
+
+.a2a-history-column .a2a-history-display {
+  /* Removed inline styles, can add specific rules here */
+  flex-grow: 1; /* Allow history to take up space */
+  /* max-height is handled by workflow-column */
+}
+
+
+/* Adjustments for History items within the column */
+.a2a-history-column .conversation-history > div {
+    /* Existing styles for user/agent messages are likely fine */
+}
+
+
+/* ==============================================
+   End 3-Column Layout Styles
+   ============================================== */
+
+/* Ensure existing history styles don't conflict badly */
+/* (Review and adjust existing .history-section, .conversation-history if needed) */
+
+
+/* Remove conflicting styles from previous CSS if needed */
+/* e.g., if .patient-switcher-dropdown had styles before */
+
+/* Error display styling from EhrApp */
+.error-display {
+    padding: 0.5em;
+    margin-bottom: 1em;
+    border: 1px solid;
+    border-radius: 4px;
+}
+.file-error {
+    border-color: #fca5a5;
+    background-color: #fee2e2;
+    color: #b91c1c;
+}
+.system-error {
+    border-color: #fca5a5;
+    background-color: #fee2e2;
+    color: #b91c1c;
+}
+
+.loading-message, .no-data-message {
+    padding: 1em;
+    text-align: center;
+    color: #555;
+}
+
+/* Layout for Asking State in OrdersTab */
+.asking-layout-container {
+  display: flex;
+  gap: 1rem; /* Space between columns */
+  align-items: flex-start; /* Align panes to the top */
+  margin-top: 1rem; /* Add some margin above the two-column layout */
+}
+
+.asking-layout-container > .left-pane {
+  flex: 2; /* Give questions pane more width */
+  min-width: 0; /* Prevent flex item overflow */
+}
+
+.asking-layout-container > .right-pane {
+  flex: 1; /* Give scratchpad pane less width */
+  min-width: 0; /* Prevent flex item overflow */
+  /* Removed sticky positioning and height limits */
+  /* position: sticky; */
+  /* top: 1rem; */
+  /* max-height: calc(100vh - 2rem); */
+    /* overflow-y: auto; */
+}
+
+/* Adjustments for sections when inside the two-column layout */
+.asking-layout-container .questions-section {
+  margin-top: 0; /* Remove margin from the top of the questions section */
+  /* Keep other questions-section styles if needed */
+}
+
+.asking-layout-container .scratchpad-section {
+  margin-top: 0; /* Remove margin from the top of the scratchpad section */
+  /* Add background/padding/border directly to the right-pane or keep on scratchpad-section */
+  background-color: #f9fafb; /* Light grey background */
+  padding: 1rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.25rem;
+}
+
+/* Scratchpad specific styles (if not already defined) */
+.scratchpad {
+  /* Add styles for the overall scratchpad container if needed */
+}
+
+.scratchpad-title {
+  font-size: 1rem; /* Example size */
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.pad-block {
+  margin-bottom: 1rem;
+}
+.pad-block:last-child {
+    margin-bottom: 0;
+}
+
+.pad-heading {
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin-top: 0;
+  margin-bottom: 0.3rem;
+  color: #374151; /* Darker grey */
+}
+
+.pad-list {
+  list-style: disc;
+  margin: 0 0 0 1.2rem; /* Indent list */
+  padding: 0;
+}
+.pad-list li {
+    margin-bottom: 0.25rem;
+    font-size: 0.85rem;
+    color: #4b5563;
+}
+
+.pad-quote {
+  border-left: 3px solid #d1d5db; /* Grey border */
+  margin: 0 0 1rem 0.5rem; /* Indent quote */
+  padding: 0.5rem 0.8rem;
+  background-color: #f8f9fa; /* Very light background */
+}
+.pad-quote p {
+    margin: 0 0 0.3rem 0;
+    font-size: 0.85rem;
+    color: #4b5563;
+}
+.pad-quote cite {
+    display: block;
+    font-size: 0.75rem;
+    color: #6b7280; /* Lighter grey */
+    font-style: normal;
+    text-align: right;
+}
+
+.pad-tree {
+    /* Add specific styles for criteria tree block if needed */
+    /* Maybe add a border or background */
+}
+
+.pad-note p {
+    font-size: 0.85rem;
+    color: #4b5563;
+    margin: 0;
+    line-height: 1.4;
+}
+
+.pad-unknown {
+    font-style: italic;
+    color: #ef4444; /* Red for errors/unknown */
+}
+
+/* History Turn Details */
+.history-turn-details {
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+    background-color: #fff;
+}
+.history-turn-summary {
+    padding: 0.4rem 0.6rem;
+    cursor: pointer;
+    font-weight: 500;
+    background-color: #f9fafb;
+}
+.history-turn-summary:hover {
+    background-color: #f3f4f6;
+}
+.history-turn-content {
+    padding: 0.8rem;
+    border-top: 1px solid #e5e7eb;
+}
+.history-subsection-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    margin-top: 0.8rem;
+    margin-bottom: 0.3rem;
+    color: #1f2937;
+}
+.history-subsection-title:first-child {
+    margin-top: 0;
+}
+
+/* Settings Modal Styles */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.5); /* Semi-transparent background */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100; /* Ensure it's above other content */
+}
+
+.modal-content {
+  background-color: #fff;
+  padding: 1.5rem;
+  border-radius: 0.5rem;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  width: 90%;
+  max-width: 500px; /* Max width */
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.modal-content h2 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.modal-status {
+    font-size: 0.9rem;
+    color: #4b5563; /* gray-600 */
+    background-color: #f3f4f6; /* gray-100 */
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.25rem;
+    margin-bottom: 0.5rem;
+}
+
+.modal-content .form-group {
+    margin-bottom: 0; /* Adjust if needed */
+}
+
+.input-hint {
+    font-size: 0.75rem;
+    color: #6b7280; /* gray-500 */
+    margin-top: 0.25rem;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  border-top: 1px solid #e5e7eb; /* gray-200 */
+  padding-top: 1rem;
+}
+
+/* Add a specific class for the clear button if needed */
+.btn-clear-key {
+    margin-right: auto; /* Push clear button to the left */
+    background-color: #d1d5db; /* gray-300 */
+    color: #1f2937; /* gray-800 */
+    border-color: #d1d5db;
+}
+.btn-clear-key:hover:not(:disabled) {
+    background-color: #9ca3af; /* gray-400 */
 } 

@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useEhrContext } from '../context/EhrContext';
-import { GearIcon, TrashIcon, UploadIcon, Link2Icon } from '@radix-ui/react-icons'; // Added more icons
+import { GearIcon, TrashIcon, UploadIcon, Link2Icon, MixerHorizontalIcon } from '@radix-ui/react-icons';
+import SettingsModal from './SettingsModal'; // <-- Import the modal
 
 const MOCK_PATIENT_NAME = "Mock Patient"; // Consider getting this from context if it changes
 
@@ -16,6 +17,7 @@ export const PatientSwitcherDropdown: React.FC = () => {
     } = useEhrContext();
 
     const [isOpen, setIsOpen] = useState(false);
+    const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false); // <-- State for modal
     const dropdownRef = useRef<HTMLDivElement>(null);
 
     // Close dropdown if clicked outside
@@ -70,6 +72,10 @@ export const PatientSwitcherDropdown: React.FC = () => {
         // The actual data loading will happen when the main window receives the postMessage event
     };
 
+    const openSettingsModal = () => {
+        setIsOpen(false); // Close dropdown first
+        setIsSettingsModalOpen(true);
+    };
 
     // Sort names, keeping Mock Patient first if present
     const sortedNames = [...availablePatientNames].sort((a, b) => {
@@ -79,88 +85,108 @@ export const PatientSwitcherDropdown: React.FC = () => {
     });
 
     return (
-        <div className="patient-switcher-dropdown" ref={dropdownRef}>
-            <div>
-                <button
-                    type="button"
-                    onClick={() => setIsOpen(!isOpen)}
-                    disabled={isLoading && !isOpen} // Allow opening even if loading, but maybe not other actions
-                    className={`dropdown-toggle-button ${isLoading ? 'loading' : ''}`}
-                    aria-haspopup="true"
-                    aria-expanded={isOpen}
-                >
-                    <GearIcon className={`gear-icon ${isLoading ? 'animate-spin' : ''}`} aria-hidden="true" />
-                    <span className="active-patient-name">{activePatientName || 'No Patient Selected'}</span>
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="dropdown-chevron">
-                      <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 10.94l3.71-3.71a.75.75 0 1 1 1.06 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L5.23 8.29a.75.75 0 0 1 .02-1.06Z" clipRule="evenodd" />
-                    </svg>
-                </button>
-            </div>
+        <> {/* Use Fragment to return multiple elements */}
+            <div className="patient-switcher-dropdown" ref={dropdownRef}>
+                <div>
+                    <button
+                        type="button"
+                        onClick={() => setIsOpen(!isOpen)}
+                        disabled={isLoading && !isOpen} // Allow opening even if loading, but maybe not other actions
+                        className={`dropdown-toggle-button ${isLoading ? 'loading' : ''}`}
+                        aria-haspopup="true"
+                        aria-expanded={isOpen}
+                    >
+                        <GearIcon className={`gear-icon ${isLoading ? 'animate-spin' : ''}`} aria-hidden="true" />
+                        <span className="active-patient-name">{activePatientName || 'No Patient Selected'}</span>
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="dropdown-chevron">
+                          <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 10.94l3.71-3.71a.75.75 0 1 1 1.06 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L5.23 8.29a.75.75 0 0 1 .02-1.06Z" clipRule="evenodd" />
+                        </svg>
+                    </button>
+                </div>
 
-            {isOpen && (
-                <div
-                    className="dropdown-menu"
-                    role="menu"
-                    aria-orientation="vertical"
-                    aria-labelledby="menu-button"
-                >
-                    <div className="dropdown-section select-patient-section" role="none">
-                        <p className="dropdown-section-header">Select Patient</p>
-                        {sortedNames.length > 0 ? sortedNames.map((name) => (
-                            <div
-                                key={name}
-                                className={`menu-item patient-menu-item ${activePatientName === name ? 'active' : ''}`}
-                                onClick={() => handleSelectPatient(name)}
+                {isOpen && (
+                    <div
+                        className="dropdown-menu"
+                        role="menu"
+                        aria-orientation="vertical"
+                        aria-labelledby="menu-button"
+                    >
+                        <div className="dropdown-section select-patient-section" role="none">
+                            <p className="dropdown-section-header">Select Patient</p>
+                            {sortedNames.length > 0 ? sortedNames.map((name) => (
+                                <div
+                                    key={name}
+                                    className={`menu-item patient-menu-item ${activePatientName === name ? 'active' : ''}`}
+                                    onClick={() => handleSelectPatient(name)}
+                                    role="menuitem"
+                                >
+                                    <span className="patient-name-text">{name}</span>
+                                    {name !== MOCK_PATIENT_NAME && (
+                                        <button
+                                            onClick={(e) => handleDeletePatient(name, e)}
+                                            disabled={isLoading}
+                                            className="delete-patient-button"
+                                            title={`Delete ${name}`}
+                                            aria-label={`Delete ${name}`}
+                                        >
+                                            <TrashIcon className="icon" />
+                                        </button>
+                                    )}
+                                </div>
+                            )) : (
+                                <p className="menu-item-placeholder">No patients loaded.</p>
+                             )}
+                        </div>
+
+                        <div className="dropdown-section load-patient-section" role="none">
+                            <p className="dropdown-section-header">Load New Patient</p>
+                            <button
+                                onClick={handleLoadFromJsonClick}
+                                disabled={isLoading}
+                                className="menu-item action-menu-item"
                                 role="menuitem"
                             >
-                                <span className="patient-name-text">{name}</span>
-                                {name !== MOCK_PATIENT_NAME && (
-                                    <button
-                                        onClick={(e) => handleDeletePatient(name, e)}
-                                        disabled={isLoading}
-                                        className="delete-patient-button"
-                                        title={`Delete ${name}`}
-                                        aria-label={`Delete ${name}`}
-                                    >
-                                        <TrashIcon className="icon" />
-                                    </button>
-                                )}
-                            </div>
-                        )) : (
-                            <p className="menu-item-placeholder">No patients loaded.</p>
-                         )}
-                    </div>
-
-                    <div className="dropdown-section load-patient-section" role="none">
-                        <p className="dropdown-section-header">Load New Patient</p>
-                        <button
-                            onClick={handleLoadFromJsonClick}
-                            disabled={isLoading}
-                            className="menu-item action-menu-item"
-                            role="menuitem"
-                        >
-                            <UploadIcon className="icon" aria-hidden="true" />
-                            Load from JSON File...
-                        </button>
-                        <button
-                            onClick={handleLoadViaOAuth}
-                            disabled={isLoading}
-                            className="menu-item action-menu-item"
-                            role="menuitem"
-                        >
-                            <Link2Icon className="icon" aria-hidden="true" />
-                            Load from EHR Connect...
-                        </button>
-                    </div>
-
-                    {(isLoading || error) && (
-                        <div className="dropdown-section status-section">
-                            {isLoading && <p className="status-loading"><span className="spinner"></span>Loading...</p>}
-                            {error && <p className="status-error">Error: {error}</p>}
+                                <UploadIcon className="icon" aria-hidden="true" />
+                                Load from JSON File...
+                            </button>
+                            <button
+                                onClick={handleLoadViaOAuth}
+                                disabled={isLoading}
+                                className="menu-item action-menu-item"
+                                role="menuitem"
+                            >
+                                <Link2Icon className="icon" aria-hidden="true" />
+                                Load from EHR Connect...
+                            </button>
                         </div>
-                    )}
-                </div>
-            )}
-        </div>
+
+                        <div className="dropdown-section settings-section" role="none">
+                             <button
+                                onClick={openSettingsModal}
+                                disabled={isLoading} // Maybe allow opening settings even if loading? Adjust as needed.
+                                className="menu-item action-menu-item"
+                                role="menuitem"
+                            >
+                                <MixerHorizontalIcon className="icon" aria-hidden="true" />
+                                API Key Settings...
+                            </button>
+                        </div>
+
+                        {(isLoading || error) && (
+                            <div className="dropdown-section status-section">
+                                {isLoading && <p className="status-loading"><span className="spinner"></span>Loading...</p>}
+                                {error && <p className="status-error">Error: {error}</p>}
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+
+            {/* Render the Modal (conditionally) */}
+            <SettingsModal
+                isOpen={isSettingsModalOpen}
+                onClose={() => setIsSettingsModalOpen(false)}
+            />
+        </>
     );
 }; 

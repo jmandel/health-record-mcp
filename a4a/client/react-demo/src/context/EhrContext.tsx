@@ -8,6 +8,7 @@ import { mockEhrData, getPatientName } from '../mockEhrData';
 const LS_PATIENT_NAMES_KEY = 'ehrPatientNames';
 const LS_ACTIVE_PATIENT_KEY = 'ehrActivePatientName';
 const LS_PATIENT_DATA_PREFIX = 'ehrData_';
+const LS_USER_API_KEY = 'ehrUserApiKey'; // <-- New key for user API key
 const MOCK_PATIENT_NAME = "Mock Patient"; // Consistent name for the mock data
 
 // --- Helper Functions ---
@@ -36,6 +37,10 @@ export interface EhrContextValue {
     isFileLoadRequested: boolean;
     requestFileLoad: () => void;
     clearFileLoadRequest: () => void;
+    // --- New API Key related values ---
+    effectiveApiKey: string; // The key the app should use
+    userApiKey: string | null; // The key set by the user (or null)
+    setUserApiKey: (apiKey: string | null) => void; // Function to set/clear user key
 }
 
 const EhrContext = createContext<EhrContextValue | null>(null);
@@ -49,10 +54,15 @@ export const EhrProvider: React.FC<{ children?: ReactNode }> = ({ children }) =>
     const [error, setError] = useState<string | null>(null);
     const [isFileLoadRequested, setIsFileLoadRequested] = useState<boolean>(false);
 
+    // --- New State for API Key ---
+    const [userApiKey, setUserApiKeyState] = useState<string | null>(null);
+    const [effectiveApiKey, setEffectiveApiKey] = useState<string>('');
+
     // --- Initialization Effect (runs once on mount) ---
     useEffect(() => {
         setIsLoading(true);
         setError(null);
+        let initialEffectiveKey = import.meta.env.VITE_GEMINI_API_KEY || ''; // Start with env var
         try {
             // 1. Load available patient names (excluding Mock initially)
             const storedNamesJson = localStorage.getItem(LS_PATIENT_NAMES_KEY);
@@ -95,6 +105,20 @@ export const EhrProvider: React.FC<{ children?: ReactNode }> = ({ children }) =>
                      localStorage.setItem(LS_PATIENT_NAMES_KEY, JSON.stringify(updatedNames.filter(n => n !== MOCK_PATIENT_NAME))); // Store only non-mock names
                 }
             }
+
+            // 4. Load User API Key from localStorage
+            const storedUserKey = localStorage.getItem(LS_USER_API_KEY);
+            setUserApiKeyState(storedUserKey); // Set state for context
+
+            // 5. Determine initial effective API Key
+            if (storedUserKey) {
+                console.log("[EhrContext Init] Using user-provided API key.");
+                initialEffectiveKey = storedUserKey;
+            } else {
+                 console.log("[EhrContext Init] Using API key from environment variable.");
+            }
+            setEffectiveApiKey(initialEffectiveKey);
+
         } catch (err: any) {
             console.error("[EhrContext Init] Initialization error:", err);
             setError(`Initialization failed: ${err.message || 'Unknown error'}. Loading Mock Patient.`);
@@ -103,6 +127,8 @@ export const EhrProvider: React.FC<{ children?: ReactNode }> = ({ children }) =>
             setActivePatientName(MOCK_PATIENT_NAME);
             setAvailablePatientNames([MOCK_PATIENT_NAME]); // Only show Mock if init fails badly
             localStorage.setItem(LS_ACTIVE_PATIENT_KEY, MOCK_PATIENT_NAME);
+            // Also set default effective key on error
+            setEffectiveApiKey(import.meta.env.VITE_GEMINI_API_KEY || '');
         } finally {
             setIsLoading(false);
         }
@@ -329,6 +355,24 @@ export const EhrProvider: React.FC<{ children?: ReactNode }> = ({ children }) =>
         setIsFileLoadRequested(false);
     }, []);
 
+    // --- New Function to Set User API Key ---
+    const setUserApiKey = useCallback((apiKey: string | null) => {
+        const keyToSave = apiKey?.trim() || null; // Treat empty string as null
+        console.log(`[EhrContext] Setting user API key (null if clearing):`, keyToSave ? '******' : null);
+        setUserApiKeyState(keyToSave);
+
+        if (keyToSave) {
+            localStorage.setItem(LS_USER_API_KEY, keyToSave);
+            setEffectiveApiKey(keyToSave);
+             console.log("[EhrContext] Effective API key updated to user-provided key.");
+        } else {
+            localStorage.removeItem(LS_USER_API_KEY);
+            const envKey = import.meta.env.VITE_GEMINI_API_KEY || '';
+            setEffectiveApiKey(envKey);
+             console.log("[EhrContext] User API key cleared. Effective API key reverted to environment variable.");
+        }
+    }, []);
+
     // --- Context Value ---
     const value: EhrContextValue = useMemo(() => ({
         ehrData,
@@ -343,10 +387,16 @@ export const EhrProvider: React.FC<{ children?: ReactNode }> = ({ children }) =>
         isFileLoadRequested,
         requestFileLoad,
         clearFileLoadRequest,
+        // --- Add API Key values to context ---
+        effectiveApiKey,
+        userApiKey,
+        setUserApiKey,
     }), [
         ehrData, activePatientName, availablePatientNames, isLoading, error,
         loadAndStoreEhr, setActivePatient, deletePatient, saveOrUpdateResource,
-        isFileLoadRequested, requestFileLoad, clearFileLoadRequest
+        isFileLoadRequested, requestFileLoad, clearFileLoadRequest,
+        // --- Add API Key dependencies ---
+        effectiveApiKey, userApiKey, setUserApiKey
     ]);
 
     // --- Message Handler Effect ---

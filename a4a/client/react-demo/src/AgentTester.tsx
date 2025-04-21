@@ -136,13 +136,6 @@ function AgentTester() {
                 <div className="conversation-history" style={{ marginBottom: '15px', maxHeight: '300px', overflowY: 'auto', border: '1px solid #eee', padding: '10px', background: '#fdfdfd' }}>
                     {task?.history && task.history.length > 0 ? (
                         task.history.map((message: Message, index: number) => { // Add Message and number types
-                            // Concatenate text from all parts
-                            const messageText = message.parts
-                                .filter((part: Part) => part.type === 'text') // Add Part type
-                                .map((part: Part) => (part as TextPart).text) // Add Part type
-                                .join('\n'); // Join multiple text parts with newline
-
-                            // Basic styling based on role
                             const isUser = message.role === 'user';
                             const style: React.CSSProperties = {
                                 marginBottom: '5px',
@@ -154,9 +147,75 @@ function AgentTester() {
                                 wordBreak: 'break-word',
                             };
 
+                            // Function to handle opening file parts in new tab
+                            const handleViewFile = (part: Part) => {
+                                if (part.type !== 'file' || !part.file?.bytes || !part.file?.mimeType) {
+                                    console.error('Invalid file part for viewing:', part);
+                                    alert('Cannot view file: Missing data or mime type.');
+                                    return;
+                                }
+                                try {
+                                    // Decode base64
+                                    const byteCharacters = atob(part.file.bytes);
+                                    const byteNumbers = new Array(byteCharacters.length);
+                                    for (let i = 0; i < byteCharacters.length; i++) {
+                                        byteNumbers[i] = byteCharacters.charCodeAt(i);
+                                    }
+                                    const byteArray = new Uint8Array(byteNumbers);
+
+                                    // Create Blob
+                                    const blob = new Blob([byteArray], { type: part.file.mimeType });
+
+                                    // Create Object URL and open
+                                    const blobUrl = URL.createObjectURL(blob);
+                                    window.open(blobUrl, '_blank');
+                                    // Consider revoking URL later if needed, but simple open is usually fine for viewing
+                                    // URL.revokeObjectURL(blobUrl);
+                                } catch (error) {
+                                    console.error('Error decoding or opening file blob:', error);
+                                    alert('Error opening file. See console for details.');
+                                }
+                            };
+
                             return (
                                 <div key={`hist-${index}`} style={style}>
-                                    <strong>{isUser ? 'User:' : 'Agent:'}</strong> {messageText || '(No text content)'}
+                                    <strong>{isUser ? 'User:' : 'Agent:'}</strong>
+                                    {message.parts.map((part, partIndex) => {
+                                        if (part.type === 'text') {
+                                            // Render text directly
+                                            return <span key={partIndex}>{part.text}</span>;
+                                        } else if (part.type === 'file' && part.file) {
+                                            // Render file info with a view link
+                                            const fileName = part.file.name || 'untitled';
+                                            return (
+                                                <div key={partIndex} style={{ marginTop: '5px', fontSize: '0.9em' }}>
+                                                    <span style={{ fontStyle: 'italic' }}>File: {fileName}</span> (
+                                                    <button
+                                                        onClick={() => handleViewFile(part)}
+                                                        disabled={!part.file.bytes}
+                                                        style={{ 
+                                                            background: 'none', 
+                                                            border: 'none', 
+                                                            color: 'blue', 
+                                                            textDecoration: 'underline', 
+                                                            cursor: 'pointer', 
+                                                            padding: 0, 
+                                                            fontSize: 'inherit' 
+                                                        }}
+                                                        title={part.file.bytes ? `View ${fileName}` : 'File content not available'}
+                                                    >
+                                                        View
+                                                    </button>
+                                                    )
+                                                </div>
+                                            );
+                                        } else if (part.type === 'data') {
+                                            // Optionally display JSON data concisely
+                                             return <pre key={partIndex} style={{ fontSize: '0.8em', background: '#eee', padding: '3px', marginTop: '5px' }}>Data: {JSON.stringify(part.data)}</pre>;
+                                        }
+                                        return <span key={partIndex}> (Unsupported Part Type: {part.type})</span>;
+                                    })}
+                                    {message.parts.length === 0 && <span> (Empty message)</span>}
                                 </div>
                             );
                         })

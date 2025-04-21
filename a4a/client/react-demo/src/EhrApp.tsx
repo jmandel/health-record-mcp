@@ -14,7 +14,7 @@ import NotesTab from './components/ehr/NotesTab';
 import OrderEntryTab from './components/ehr/OrderEntryTab';
 import BillingTab from './components/ehr/BillingTab';
 import TasksTab from './components/ehr/TasksTab';
-import Orders2Tab from './components/ehr/Orders2Tab';
+import OrdersTab from './components/ehr/Orders2Tab';
 import { PatientSwitcherDropdown } from './components/PatientSwitcherDropdown';
 
 // Define and EXPORT types here (as planned before)
@@ -64,7 +64,7 @@ const tabContent: Record<TabName, React.ReactNode> = {
     "Order Entry": <OrderEntryTab />,
     Billing: <BillingTab />,
     Tasks: <TasksTab />,
-    Orders: <Orders2Tab />, // Updated key, keep component for now
+    Orders: <OrdersTab />, // Use the renamed OrdersTab component
 };
 
 // Main App Component that uses the context
@@ -74,7 +74,8 @@ function EhrAppContent() {
         ehrData, isLoading, error, loadAndStoreEhr, activePatientName,
         isFileLoadRequested, clearFileLoadRequest // NEW context values
     } = useEhrContext();
-    const [activeTab, setActiveTab] = useState<TabName>('Demographics');
+    // Set initial active tab to 'Orders'
+    const [activeTab, setActiveTab] = useState<TabName>('Orders'); 
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [fileLoadError, setFileLoadError] = useState<string | null>(null);
 

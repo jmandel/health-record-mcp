@@ -21,22 +21,14 @@ async function callGemini(
 
     try {
         const genAI = new GoogleGenAI({ apiKey });
-        const modelName = "gemini-1.5-flash-latest"; // Define model name
+        const modelName = "gemini-2.5-flash-preview-04-17"; // Define model name
+        // const modelName = "gemini-2.5-pro-exp-03-25"; // Define model name
         
         // Use 'config' key for generation settings
         const config = { 
-            temperature: 0.2, 
+            temperature: 0.8, 
             responseMimeType: expectedFormat === 'json' ? 'application/json' : 'text/plain',
         };
-        // Omit safetySettings for now to match the working example
-        /*
-        const safetySettings = [
-            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        ];
-        */
         
         const contents = [{ role: 'user', parts: [{ text: prompt }] }];
 
@@ -113,19 +105,43 @@ export class GeminiEvaluator implements PriorAuthEvaluator {
         return parsedDetails;
     }
 
-    async findRelevantPolicy(requestDetails: PriorAuthRequestDetails, availablePolicies: string[], taskId?: string): Promise<string | null> {
-        const policyListString = availablePolicies.join(", ");
-        const prompt = `Given the prior authorization request details (Procedure: ${requestDetails.procedure || 'Not specified'}, Diagnosis: ${requestDetails.diagnosis || 'Not specified'}, Summary: ${requestDetails.clinicalSummary}) and the list of available policy filenames (${policyListString}), which policy filename is the most relevant? Respond ONLY with the exact filename (e.g., 'policy_mri_back_pain.md') or the word 'None' if no policy seems applicable.`;
+    // Updated findRelevantPolicy to use policyIndexContent
+    async findRelevantPolicy(requestDetails: PriorAuthRequestDetails, policyIndexContent: string, taskId?: string): Promise<string | null> {
+        const logPrefix = `[GeminiEvaluator${taskId ? ' Task ' + taskId : ''}]`;
+        console.log(`${logPrefix} Finding relevant policy using Gemini.`);
         
-        const result = await callGemini(prompt, taskId, 'text');
-        if (!result || typeof result !== 'string' || result.toLowerCase() === 'none') {
+        const prompt = `Analyze the following prior authorization request details and the provided policy index content. Identify the single most relevant policy ID from the index that best matches the request. Respond ONLY with a JSON object containing a single key "policyId" whose value is the best matching policy ID string (e.g., "1.01.539"), or null if no suitable match is found.
+
+Request Details:
+Procedure: ${requestDetails.procedure || 'Not specified'}
+Diagnosis: ${requestDetails.diagnosis || 'Not specified'}
+Clinical Summary: ${requestDetails.clinicalSummary}
+
+Policy Index Content:
+---
+${policyIndexContent}
+---
+
+Respond ONLY with the JSON object described above.`;
+        
+        const result = await callGemini(prompt, taskId, 'json');
+        
+        // Define an expected type for the response
+        type GeminiPolicyResponse = { policyId: string | null };
+
+        if (!result || typeof result === 'string') {
+            console.error(`${logPrefix} Failed to get a valid response from Gemini for policy finding.`);
             return null;
         }
         
-        if (availablePolicies.includes(result)) {
-            return result;
+        // Cast to unknown first to satisfy TypeScript
+        const parsedResult = result as unknown as GeminiPolicyResponse;
+
+        if (typeof parsedResult.policyId === 'string' && parsedResult.policyId.trim() !== '') {
+            console.log(`${logPrefix} Gemini identified relevant policy ID: ${parsedResult.policyId}`);
+            return parsedResult.policyId;
         } else {
-             console.warn(`[GeminiEvaluator${taskId ? ' Task ' + taskId : ''}] Gemini suggested policy "${result}" which is not in the available list: ${policyListString}`);
+             console.log(`${logPrefix} Gemini did not identify a relevant policy ID (result: ${JSON.stringify(result)}).`);
              return null;
         }
     }
@@ -163,13 +179,30 @@ New Information Provided by User:
 ${userInputText}
 ---
 
-Evaluate ALL the information (original summary + new input) against the policy. Determine if the request now meets the criteria. Respond ONLY with a JSON object containing: "decision" ('Approved', 'Denied', or 'Needs More Info'), "reason" (a concise explanation for the new decision), and "missingInfo" (an array of specific criteria still lacking if decision remains 'Denied' or 'Needs More Info', otherwise an empty array).`;
+Evaluate ALL the information (original summary + new input) against the policy. Determine if the request now meets the criteria.
+Respond ONLY with a JSON object containing: 
+- "decision": 'Approved' (if ALL criteria met), 'CannotApprove' (if criteria definitively NOT met or exclusion applies), or 'Needs More Info' (if more info could lead to approval).
+- "reason": A concise explanation for the decision, referencing specific policy points.
+- "missingInfo": An array of specific criteria still lacking if decision is 'Needs More Info', otherwise an empty array.`;
         } else {
             // --- Initial Evaluation Scenario --- 
             console.log(`${logPrefix} Performing initial evaluation.`);
-            prompt = `Evaluate the following clinical summary against the provided prior authorization policy. Determine if the request meets the policy criteria. Respond ONLY with a JSON object containing: "decision" ('Approved', 'Denied', or 'Needs More Info'), "reason" (a concise explanation for the decision, referencing specific policy points), and "missingInfo" (an array of specific criteria/information lacking if decision is 'Denied' or 'Needs More Info', otherwise an empty array). Policy:\n---
-${policyText}\n---
-\nRequest Summary:\n${requestDetails.clinicalSummary}`;
+            prompt = `Evaluate the following clinical summary against the provided prior authorization policy. Determine if the request meets the policy criteria.
+Respond ONLY with a JSON object containing: 
+- "decision": 'Approved' (if ALL criteria met), 'CannotApprove' (if criteria definitively NOT met or an exclusion applies), or 'Needs More Info' (if more info could potentially lead to approval).
+- "reason": A concise explanation for the decision, referencing specific policy points.
+- "missingInfo": An array of specific criteria/information lacking if decision is 'Needs More Info', otherwise an empty array.
+
+Policy:
+---
+${policyText}
+---
+
+Request Summary:
+${requestDetails.clinicalSummary}
+
+Full Details:
+${userInputText}`;
         }
         
         const result = await callGemini(prompt, taskId, 'json');
@@ -178,20 +211,48 @@ ${policyText}\n---
         }
         // Validate the specific structure needed for PolicyEvalResult
         const parsedEval = result as GeminiEvalResponse;
-        if (typeof parsedEval.decision !== 'string' || typeof parsedEval.reason !== 'string' || !Array.isArray(parsedEval.missingInfo)) { 
+        // Add CannotApprove to validation
+        if (typeof parsedEval.decision !== 'string' || !['Approved', 'Needs More Info', 'CannotApprove'].includes(parsedEval.decision) || typeof parsedEval.reason !== 'string' || !Array.isArray(parsedEval.missingInfo)) { 
+            console.error("Invalid JSON structure received from Gemini evaluation:", result); // Log the invalid structure
             throw new Error('Invalid JSON structure received from Gemini evaluation.');
         }
         console.log(`${logPrefix} Evaluation complete. Decision: ${parsedEval.decision}`);
-        return parsedEval;
+        return parsedEval as PolicyEvalResult; // Cast as PolicyEvalResult for return
     }
 
     async draftResponse(evaluation: PolicyEvalResult, requestDetails: PriorAuthRequestDetails, taskId?: string): Promise<string> {
-         const prompt = `Based on the following prior authorization evaluation results for a request regarding procedure "${requestDetails.procedure || '[Not specified]'}" and diagnosis "${requestDetails.diagnosis || '[Not specified]'}", draft a clear, concise, and polite message for the requesting provider, suitable for direct display. Briefly explain the outcome and any next steps if applicable (especially if more info is needed). Evaluation: ${JSON.stringify(evaluation)}`;
+         const logPrefix = `[GeminiEvaluator${taskId ? ' Task ' + taskId : ''}]`;
+         let prompt: string;
+
+         switch (evaluation.decision) {
+            case 'Approved':
+                console.log(`${logPrefix} Drafting approval message.`);
+                 prompt = `Based on the following APPROVED prior authorization evaluation result for a request regarding procedure "${requestDetails.procedure || '[Not specified]'}" and diagnosis "${requestDetails.diagnosis || '[Not specified]'}", draft a clear, concise, and polite approval message for the requesting provider. Include the reason for approval briefly. Evaluation: ${JSON.stringify(evaluation)}`;
+                 break;
+            case 'CannotApprove':
+                 console.log(`${logPrefix} Drafting message for non-approval (human review).`);
+                 prompt = `Based on the following prior authorization evaluation result (Decision: CannotApprove) for a request regarding procedure "${requestDetails.procedure || '[Not specified]'}" and diagnosis "${requestDetails.diagnosis || '[Not specified]'}", draft a clear, concise, and polite message for the requesting provider. Explain that automated approval could not be completed based on the provided information (briefly reference the reason: ${evaluation.reason}). State clearly that the request is being forwarded for human review. DO NOT use the word "Denied". Evaluation: ${JSON.stringify(evaluation)}`;
+                 break;
+             case 'Needs More Info':
+             default:
+                 console.log(`${logPrefix} Drafting message requesting more info.`);
+                 prompt = `Based on the following prior authorization evaluation result (Decision: Needs More Info) for a request regarding procedure "${requestDetails.procedure || '[Not specified]'}" and diagnosis "${requestDetails.diagnosis || '[Not specified]'}", draft a clear, concise, and polite message for the requesting provider. Specifically ask for the missing information listed in the evaluation. Missing info: ${evaluation.missingInfo?.join(', ') || 'Details not specified'}. Evaluation: ${JSON.stringify(evaluation)}`;
+                 break;
+         }
+
+         prompt += `\nAlways refer to yourself as "Prior Auth Auto Approval Bot" and be concise.`;
         
         const result = await callGemini(prompt, taskId, 'text');
         if (!result || typeof result !== 'string') {
-            console.warn(`[GeminiEvaluator${taskId ? ' Task ' + taskId : ''}] Gemini failed to draft a response, returning generic message.`);
-            return `Prior auth decision: ${evaluation.decision}. Reason: ${evaluation.reason}${evaluation.missingInfo && evaluation.missingInfo.length > 0 ? ' Missing info: ' + evaluation.missingInfo.join(', ') : ''}`; 
+            console.warn(`${logPrefix} Gemini failed to draft a response, returning generic message for decision ${evaluation.decision}.`);
+            // Fallback message construction based on decision
+            if (evaluation.decision === 'Approved') {
+                 return `Prior auth decision: Approved. Reason: ${evaluation.reason}.`;
+            } else if (evaluation.decision === 'CannotApprove') {
+                 return `Automated prior authorization could not be completed based on the information provided (Reason: ${evaluation.reason}). The request is being forwarded for human review.`;
+            } else { // Needs More Info
+                 return `Prior auth requires more information: ${evaluation.missingInfo?.join(', ') || evaluation.reason || 'Please provide more details.'}`;
+            }
         }
         return result;
     }

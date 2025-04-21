@@ -1,13 +1,12 @@
+import crypto from 'node:crypto'; // Import crypto
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import crypto from 'node:crypto'; // Import crypto
 import type { ProcessorInputValue, ProcessorStepContext, ProcessorYieldValue, TaskProcessorV2 } from '../../src/interfaces/processorV2';
 import { ProcessorCancellationError } from '../../src/interfaces/processorV2';
-import type { TaskSendParams, Message, Part, TextPart } from '../../src/types';
+import type { Message, Part, TaskSendParams, TextPart } from '../../src/types';
 import type { PolicyEvalResult, PriorAuthEvaluator, PriorAuthRequestDetails } from './evaluators'; // Import interfaces
 import { KeywordEvaluator } from './KeywordEvaluator'; // Import it
-import { GeminiEvaluator } from './GeminiEvaluator'; // Import the Gemini implementation
-import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from '@google/genai'; // Add missing import for Gemini classes used by evaluator
+import { GeminiEvaluator } from './GeminiEvaluator';
 // Gemini Helper
 
 // Helper Function to extract text from all message parts
@@ -24,13 +23,13 @@ function extractTextFromMessage(message: Message | undefined | null): string {
 
 export class PriorAuthProcessor implements TaskProcessorV2 {
     private static PRIOR_AUTH_SKILL = 'priorAuthRequest';
-    private policiesDir = path.join(import.meta.dir, 'policies');
+    private policiesDir = path.join(import.meta.dir, '../../client/react-demo/public/premera_policies');
     private evaluator: PriorAuthEvaluator; // Use the interface
 
     constructor() {
         // Instantiate the desired evaluator implementation
-        // this.evaluator = new GeminiEvaluator();
-        this.evaluator = new KeywordEvaluator(); // Use the keyword evaluator
+        this.evaluator = new GeminiEvaluator();
+        // this.evaluator = new KeywordEvaluator(); // Use the keyword evaluator
     }
 
     async canHandle(_params: TaskSendParams): Promise<boolean> {
@@ -40,17 +39,16 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
     async *process(context: ProcessorStepContext, initialParams: TaskSendParams): AsyncGenerator<ProcessorYieldValue, void, ProcessorInputValue> {
         const taskId = context.task.id;
         console.log(`[PriorAuthProc ${taskId}] Starting task.`);
-        let evaluationResult: PolicyEvalResult | null = null;
+        let evaluationResult: PolicyEvalResult | undefined = undefined; // Use undefined initially
         let requestDetails: PriorAuthRequestDetails | null = null;
-        let policyText: string | null = null; // Store policy text for potential re-evaluation
+        let policyTextForEval: string | null = null; // Store policy text (MD or PDF) for evaluation
 
         try {
             yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Processing prior authorization request...' }] } };
 
             // --- 1. Extract Request Text --- 
             let initialRequestText = extractTextFromMessage(initialParams.message);
-
-            // Prompt user for request text until provided
+            // (Keep the loop for prompting if initial text is missing)
             while (!initialRequestText) {
                 const inputPrompt: Message = {
                     role: 'agent',
@@ -60,19 +58,16 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                 if (!userInput || userInput.type !== 'message') {
                     throw new ProcessorCancellationError('User did not provide the prior authorization request details.');
                 }
-                const textPart = userInput.message.parts.find((p): p is TextPart => p.type === 'text');
-                if (!textPart?.text) {
-                    yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text. Please describe the request.' }] } };
-                    continue;
-                }
-                // Use helper again if reprocessing is needed based on user input
                 initialRequestText = extractTextFromMessage(userInput.message);
-                console.log(`[PriorAuthProc ${taskId}] Received request text parts:\n${initialRequestText}`);
+                if (!initialRequestText) {
+                     yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text. Please describe the request.' }] } };
+                }
             }
             console.log(`[PriorAuthProc ${taskId}] Received request text: ${initialRequestText}...`);
 
 
             // --- 2. Parse Request Details using Evaluator --- 
+            // (Keep the loop for handling parsing errors)
             let parsed = false;
             while (!parsed) {
                 yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Parsing request details...' }] } };
@@ -87,177 +82,177 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                         parts: [{ type: 'text', text: `Failed to understand the request: ${parseError.message}. Please provide more details.` }]
                     };
                     const userInput = yield { type: 'statusUpdate', state: 'input-required', message: detailPrompt };
-                    if (!userInput || userInput.type !== 'message') {
+                     if (!userInput || userInput.type !== 'message') {
                         throw new ProcessorCancellationError('User did not provide additional details for the request.');
                     }
-                    const textPart = userInput.message.parts.find((p): p is TextPart => p.type === 'text');
-                    if (!textPart?.text) {
-                        yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text. Please provide additional details.' }] } };
-                        continue;
-                    }
-                    // Use helper again if reprocessing is needed based on user input
                     initialRequestText = extractTextFromMessage(userInput.message);
+                     if (!initialRequestText) {
+                        yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text. Please provide additional details.' }] } };
+                        // Stay in the parsing loop
+                     }
                 }
             }
 
-
-            // --- 3. List Available Policies --- 
+            // --- 3. Find Relevant Policy and Read Content --- 
             yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Identifying relevant policy...' }] } };
-            let policyFiles: string[] = [];
+            let policyIndexContent: string | null = null;
+            let selectedPolicyTitle: string | null = null;
+            let selectedPolicyId: string | null = null;
+            let policyFilename: string | null = null;
+            let policyPdfBase64: string | null = null;
+            let policyMdFilename: string | null = null;
+            let policyMdBase64: string | null = null;
+            let policyMdText: string | null = null;
+
             try {
-                policyFiles = await fs.readdir(this.policiesDir);
-                policyFiles = policyFiles.filter(f => f.endsWith('.md'));
-            } catch (e: any) {
-                console.error(`[PriorAuthProc ${taskId}] Could not read policies directory: ${this.policiesDir}`, e);
-                yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: 'Internal error: Could not access policy definitions.' }] } };
-                return;
-            }
-            if (policyFiles.length === 0) {
-                yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: 'Internal error: No policy definitions found.' }] } };
-                return;
-            }
+                const indexFilePath = path.join(this.policiesDir, 'index.txt');
+                const indexFile = Bun.file(indexFilePath);
+                if (!(await indexFile.exists())) throw new Error('Policy index file not found.');
+                policyIndexContent = await indexFile.text();
 
+                // Find policy ID using evaluator
+                selectedPolicyId = await this.evaluator.findRelevantPolicy(requestDetails!, policyIndexContent!, taskId);
+                if (!selectedPolicyId) throw new Error('No relevant prior authorization policy found for the request described.');
 
-            // --- 4. Find Relevant Policy using Evaluator --- 
-            const selectedPolicyFilename = await this.evaluator.findRelevantPolicy(requestDetails!, policyFiles, taskId);
+                // Extract title from index
+                const lines = policyIndexContent.split('\n');
+                for (const line of lines) {
+                    const trimmedLine = line.trim();
+                    if (trimmedLine.startsWith(selectedPolicyId + ' |')) {
+                        selectedPolicyTitle = trimmedLine.split('|', 2)[1]?.trim() || `Policy ${selectedPolicyId}`;
+                        break;
+                    }
+                }
+                selectedPolicyTitle = selectedPolicyTitle || `Policy ${selectedPolicyId}`; // Ensure title is set
 
-            if (!selectedPolicyFilename) {
-                console.log(`[PriorAuthProc ${taskId}] Evaluator did not find a relevant policy.`);
-                yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: `No relevant prior authorization policy found for the request described.` }] } };
-                return;
-            }
-            const policyFilePath = path.join(this.policiesDir, selectedPolicyFilename);
-            console.log(`[PriorAuthProc ${taskId}] Evaluator selected policy: ${selectedPolicyFilename}`);
-            yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: `Applying policy: ${selectedPolicyFilename}...` }] } };
-
-
-            // --- 5. Read Policy File --- 
-            const policyFile = Bun.file(policyFilePath);
-            if (!(await policyFile.exists())) {
-                yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: `Internal error: Selected policy file not found: ${selectedPolicyFilename}` }] } };
-                return;
-            }
-            policyText = await policyFile.text(); // Store policy text
-
-
-            // --- 6. Initial Evaluation ---
-            yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Evaluating clinical summary against policy criteria...' }] } };
-            try {
-                 evaluationResult = await this.evaluator.evaluateAgainstPolicy(policyText, requestDetails!, taskId);
-                 console.log(`[PriorAuthProc ${taskId}] Initial evaluation result:`, evaluationResult);
-            } catch (evalError: any) {
-                 console.error(`[PriorAuthProc ${taskId}] Error during initial evaluation:`, evalError);
-                 yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: `Failed initial evaluation: ${evalError.message}` }] } };
-                 return;
-            }
-            
-            // --- 7. Evaluation Loop (Handle 'Needs More Info') ---
-            let inputRequiredYieldedBefore = false; // Flag to track if we've asked for input before
-            while (evaluationResult?.decision === 'Needs More Info') {
-                console.log(`[PriorAuthProc ${taskId}] Evaluation requires more info. Reason: ${evaluationResult.reason}`);
-
-                // --- 7a. Draft Question (Evaluator determines the content) ---
-                yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Drafting question for more information...' }] } };
-                let questionText: string;
+                // Read PDF
+                policyFilename = `${selectedPolicyId}.pdf`;
+                const policyFilePath = path.join(this.policiesDir, policyFilename);
+                const policyFile = Bun.file(policyFilePath);
+                 if (!(await policyFile.exists())) throw new Error(`Selected policy file not found: ${policyFilename}`);
+                const policyTextPdf = await policyFile.text(); // Read text for potential fallback evaluation
                 try {
-                    questionText = await this.evaluator.draftResponse(evaluationResult, requestDetails!, taskId);
-                } catch (draftError: any) {
-                    console.error(`[PriorAuthProc ${taskId}] Error drafting question:`, draftError);
-                    questionText = `Decision: ${evaluationResult.decision}. Reason: ${evaluationResult.reason}. Failed to draft specific question (${draftError.message}). Please provide more details.`;
-                }
-
-                // --- 7b. Construct Message & Yield input-required ---
-                console.log(`[PriorAuthProc ${taskId}] Preparing input-required yield.`);
-                let messageParts: Part[] = [{ type: 'text', text: questionText }];
-
-                // Add policy text only on the *first* input-required yield in this loop
-                if (policyText && !inputRequiredYieldedBefore) {
-                     console.log(`[PriorAuthProc ${taskId}] Adding policy text to the message as this is the first input request.`);
-                    messageParts.push({ 
-                        type: 'text', 
-                        text: `\n\n--- Relevant Policy ---\n${policyText}`
-                    });
-                } else if (!policyText && !inputRequiredYieldedBefore) {
-                     console.warn(`[PriorAuthProc ${taskId}] First input request, but policyText is missing. Cannot include policy.`);
-                } else if (inputRequiredYieldedBefore) {
-                     console.log(`[PriorAuthProc ${taskId}] Not the first input request, policy text already sent or skipped.`);
-                }
+                    const policyBuffer = await policyFile.arrayBuffer();
+                    policyPdfBase64 = Buffer.from(policyBuffer).toString('base64');
+                } catch (readPdfErr) { console.error(`Error reading PDF buffer: ${readPdfErr}`); }
                 
-                const inputRequiredMessage: Message = {
-                    role: 'agent',
-                    parts: messageParts
-                };
+                // Read MD if exists
+                policyMdFilename = policyFilename.replace(/\.pdf$/i, '.md');
+                const policyMdFilePath = path.join(this.policiesDir, policyMdFilename);
+                const policyMdFile = Bun.file(policyMdFilePath);
+                if (await policyMdFile.exists()) {
+                     try {
+                        policyMdText = await policyMdFile.text(); // Read text for evaluation
+                        const policyMdBuffer = await policyMdFile.arrayBuffer();
+                        policyMdBase64 = Buffer.from(policyMdBuffer).toString('base64');
+                    } catch (readMdErr) { console.error(`Error reading MD file: ${readMdErr}`); policyMdFilename = null; }
+                } else {
+                    policyMdFilename = null; // Ensure null if not found
+                }
 
-                // Mark that we are about to yield input-required for the first time (or again)
-                inputRequiredYieldedBefore = true; 
+                // Determine policy text to use for evaluation (prefer MD)
+                policyTextForEval = policyMdText ?? policyTextPdf;
+                if (!policyTextForEval) throw new Error('Failed to load any policy text (MD or PDF) for evaluation.');
+                 console.log(`[PriorAuthProc ${taskId}] Using ${policyMdText ? 'Markdown' : 'PDF'} content for evaluation.`);
 
-                const userInput = yield {
+            } catch (e: any) {
+                console.error(`[PriorAuthProc ${taskId}] Error identifying or reading policy:`, e);
+                yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: `Internal error: Could not access policy definitions (${e.message}).` }] } };
+                return;
+            }
+
+            // --- 4. Prepare Initial Input Request Message --- 
+            const initialQuestionText = `The relevant policy is "${selectedPolicyTitle}" (ID: ${selectedPolicyId}). Based on this policy and your request (Procedure: ${requestDetails?.procedure || 'N/A'}, Diagnosis: ${requestDetails?.diagnosis || 'N/A'}), please provide any additional details required for approval. The policy document(s) are attached.`;
+            let messageParts: Part[] = [{ type: 'text', text: initialQuestionText }];
+            if (policyPdfBase64 && policyFilename) {
+                 messageParts.push({ type: 'file', file: { name: policyFilename, mimeType: 'application/pdf', bytes: policyPdfBase64 } });
+            }
+             if (policyMdBase64 && policyMdFilename) {
+                 messageParts.push({ type: 'file', file: { name: policyMdFilename, mimeType: 'text/markdown', bytes: policyMdBase64 } });
+            }
+            let currentInputRequiredMessage: Message = { role: 'agent', parts: messageParts };
+
+            yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Preparing initial request for clinician input...' }] } };
+
+            // --- 5. Unified Evaluation Loop --- 
+            while (true) {
+                // --- 5a. Yield for User Input --- 
+                 console.log(`[PriorAuthProc ${taskId}] Yielding input-required. Message:`, currentInputRequiredMessage.parts.find(p => p.type === 'text')?.text.substring(0,100));
+                 const userInput = yield {
                     type: 'statusUpdate',
                     state: 'input-required',
-                    message: inputRequiredMessage 
-                };
+                    message: currentInputRequiredMessage
+                 };
 
-                // --- 7c. Process User Input ---
+                 // --- 5b. Process User Input --- 
                 if (!userInput || userInput.type !== 'message') {
-                    // Handle cancellation or unexpected input type
-                    console.log(`[PriorAuthProc ${taskId}] Received null or non-message input (${userInput?.type}) after input-required. Assuming cancellation.`);
                     throw new ProcessorCancellationError('User did not provide required input or signal received.');
                 }
-                const userResponseText = extractTextFromMessage(userInput.message);
-
+                // Use helper to extract from all text/data parts
+                const userResponseText = extractTextFromMessage(userInput.message); 
                 if (!userResponseText) {
-                    console.warn(`[PriorAuthProc ${taskId}] User response message did not contain text.`);
-                    yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text in your response. Let me ask again...' }] } };
+                    console.warn(`[PriorAuthProc ${taskId}] User response message did not contain text or data.`);
+                    yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'I didn\'t receive text/data in your response. Asking again...' }] } };
+                    // Let currentInputRequiredMessage remain the same and loop again
                     continue; 
                 }
-                console.log(`[PriorAuthProc ${taskId}] Received user response: ${userResponseText.substring(0, 100)}...`);
-                yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Processing additional information...' }] } };
+                console.log(`[PriorAuthProc ${taskId}] Received user response: ${userResponseText}...`);
+                yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Evaluating your submission.' }] } };
 
-                // --- 7d. Re-evaluate with new input --- 
-                try {
+                // --- 5c. Evaluate --- 
+                 try {
                      evaluationResult = await this.evaluator.evaluateAgainstPolicy(
-                        policyText!,       
-                        requestDetails!,   
-                        taskId,            
-                        evaluationResult,  
-                        userResponseText   
-                    );
-                    console.log(`[PriorAuthProc ${taskId}] Re-evaluation result:`, evaluationResult);
-                } catch (reEvalError: any) {
-                    console.error(`[PriorAuthProc ${taskId}] Error during re-evaluation:`, reEvalError);
-                    yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: `Failed during re-evaluation: ${reEvalError.message}` }] } };
-                    return; 
-                }
-            } // End while loop
+                         policyTextForEval, // Use the text determined earlier
+                         requestDetails!,   
+                         taskId,            
+                         evaluationResult,  // Pass previous result (undefined first time)
+                         userResponseText   // Pass the new user input
+                     );
+                     console.log(`[PriorAuthProc ${taskId}] Evaluation result:`, evaluationResult);
+                 } catch (evalError: any) {
+                     console.error(`[PriorAuthProc ${taskId}] Error during evaluation:`, evalError);
+                     yield { type: 'statusUpdate', state: 'failed', message: { role: 'agent', parts: [{ type: 'text', text: `Failed evaluation: ${evalError.message}` }] } };
+                     return; // Exit processor on evaluation error
+                 }
+
+                // --- 5d. Check Decision and Loop/Break --- 
+                 if (evaluationResult?.decision === 'Needs More Info') {
+                     console.log(`[PriorAuthProc ${taskId}] Evaluation requires more info. Reason: ${evaluationResult.reason}`);
+                     yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Drafting follow-up question...' }] } };
+                     let nextQuestionText: string;
+                    try {
+                        nextQuestionText = await this.evaluator.draftResponse(evaluationResult, requestDetails!, taskId);
+                    } catch (draftError: any) {
+                        console.error(`[PriorAuthProc ${taskId}] Error drafting follow-up question:`, draftError);
+                        nextQuestionText = `Decision: ${evaluationResult.decision}. Reason: ${evaluationResult.reason}. Failed to draft specific question (${draftError.message}). Please provide more details.`;
+                    }
+                    // Update the message for the next iteration
+                     currentInputRequiredMessage = { role: 'agent', parts: [{ type: 'text', text: nextQuestionText }] };
+                     // Continue loop
+                 } else {
+                     // Decision is Approved, CannotApprove, or unexpected
+                     console.log(`[PriorAuthProc ${taskId}] Evaluation loop finished. Final Decision: ${evaluationResult?.decision}`);
+                     break; // Exit the loop
+                 }
+             } // End while loop
 
 
-            // --- 8. Final Evaluation Result Processing ---
-            console.log(`[PriorAuthProc ${taskId}] Loop finished. Final evaluation decision: ${evaluationResult?.decision}`);
+             // --- 6. Final Evaluation Result Processing --- 
+             console.log(`[PriorAuthProc ${taskId}] Processing final decision: ${evaluationResult?.decision}`);
 
-            // --- 8a. Yield Final Artifact --- 
+             // --- 6a. Yield Final Artifact --- 
             if (evaluationResult) { 
                 if (evaluationResult.decision === 'Approved') {
                     // --- Generate Enhanced Approval Artifact ---
                     const approvalTimestamp = new Date().toISOString();
                     const approvalReferenceNumber = crypto.randomUUID();
-                    const artifactContentToSign = {
-                        taskId: taskId,
-                        decision: evaluationResult.decision,
-                        reason: evaluationResult.reason,
-                        referenceNumber: approvalReferenceNumber,
-                        timestamp: approvalTimestamp,
-                    };
-                    // Placeholder for actual signing logic
-                    const digitalSignature = `placeholder-signature-for-${approvalReferenceNumber}`;
-
                     const approvalArtifactData = {
                         status: evaluationResult.decision, // Explicit status
                         reason: evaluationResult.reason,
                         approvalReferenceNumber: approvalReferenceNumber,
                         timestamp: approvalTimestamp,
-                        digitalSignature: digitalSignature,
+                        digitalSignature: `placeholder-signature-for-${approvalReferenceNumber}` // Placeholder
                     };
-
                     console.log(`[PriorAuthProc ${taskId}] Yielding enhanced approval artifact.`);
                     yield {
                         type: 'artifact',
@@ -269,41 +264,48 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                             ]
                         }
                     };
-                } else {
+                } else { // Includes 'CannotApprove' and potentially others
                     // --- Yield standard evaluation result for non-approved finals ---
                     console.log(`[PriorAuthProc ${taskId}] Yielding standard evaluation artifact (Decision: ${evaluationResult.decision}).`);
-             yield {
-                 type: 'artifact',
-                 artifactData: {
-                             index: 0,
-                             name: 'prior-auth-evaluation-final',
-                     parts: [
-                                 { type: 'data', data: evaluationResult } 
-                             ]
-                         }
-                     };
+                    yield {
+                        type: 'artifact',
+                        artifactData: {
+                            index: 0,
+                            name: 'prior-auth-evaluation-final',
+                            parts: [
+                                { type: 'data', data: evaluationResult } 
+                            ]
+                        }
+                    };
                 }
             } else {
-                 console.error(`[PriorAuthProc ${taskId}] Reached end of processing but evaluationResult is null. Cannot yield artifact.`);
-                 // Don't yield failed message here, let 8b/8c handle final status
+                 console.error(`[PriorAuthProc ${taskId}] Reached end of processing but evaluationResult is null/undefined. Cannot yield artifact.`);
+                 // Final status will be set below
             }
 
-
-            // --- 8b. Draft Final Response --- 
+            // --- 6b. Draft Final Response Message --- 
             yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Drafting final response...' }] } };
             let finalMessageText: string;
              try {
+                // Draft response based on the *final* evaluation result
                  finalMessageText = await this.evaluator.draftResponse(evaluationResult!, requestDetails!, taskId);
              } catch (draftError: any) {
-                console.error(`[PriorAuthProc ${taskId}] Error drafting final response:`, draftError);
-                 finalMessageText = `Decision: ${evaluationResult!.decision}. Reason: ${evaluationResult!.reason}. Failed to draft detailed response (${draftError.message}).`;
+                 console.error(`[PriorAuthProc ${taskId}] Error drafting final response:`, draftError);
+                 // Construct a fallback based on the final decision 
+                if (evaluationResult?.decision === 'Approved') {
+                     finalMessageText = `Decision: Approved. Reason: ${evaluationResult.reason}. (Failed to draft response: ${draftError.message})`;
+                 } else if (evaluationResult?.decision === 'CannotApprove') {
+                     finalMessageText = `Automated approval could not be completed (Reason: ${evaluationResult.reason}). Forwarding for human review. (Failed response draft: ${draftError.message})`;
+                 } else { // Handle null/undefined or other unexpected decision
+                    finalMessageText = `Processing completed, but final status unclear (${evaluationResult?.decision ?? 'No result'}). (Failed response draft: ${draftError.message})`;
+                 }
             }
 
-            // --- 8c. Signal Completion --- 
-            // Final state should be 'completed' as the loop only exits on non-'Needs More Info' decisions
-            yield { type: 'statusUpdate', state: 'completed', message: { role: 'agent', parts: [{ type: 'text', text: finalMessageText }] } };
-            console.log(`[PriorAuthProc ${taskId}] Task finished with final state: completed`);
-
+            // --- 6c. Signal Completion --- 
+            // Final state is always 'completed' because the loop exits only on 'Approved' or 'CannotApprove'
+            // (or an error would have terminated earlier)
+             yield { type: 'statusUpdate', state: 'completed', message: { role: 'agent', parts: [{ type: 'text', text: finalMessageText }] } };
+             console.log(`[PriorAuthProc ${taskId}] Task finished with final state: completed`);
 
         } catch (error: any) {
             console.error(`[PriorAuthProc ${taskId}] Unhandled error during processing:`, error);

@@ -27,6 +27,7 @@
     "lodash": "^4.17.21",
     "lucide-react": "^0.501.0",
     "pkce-challenge": "^3.1.0",
+    "porter-stemmer": "^0.9.1",
     "rtf.js": "^3.0.9",
     "uuid": "^10.0.0",
     "zod": "^3.23.8",

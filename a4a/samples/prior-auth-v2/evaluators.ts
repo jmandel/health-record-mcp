@@ -13,7 +13,7 @@ export interface PriorAuthRequestDetails {
  * Result of evaluating a request against a policy.
  */
 export interface PolicyEvalResult {
-    decision: 'Approved' | 'Denied' | 'Needs More Info';
+    decision: 'Approved' | 'Needs More Info' | 'CannotApprove';
     reason: string;
     missingInfo?: string[]; // List of specific missing criteria/information
 }
@@ -31,13 +31,13 @@ export interface PriorAuthEvaluator {
     parseInitialRequest(requestText: string, taskId?: string): Promise<PriorAuthRequestDetails>;
 
     /**
-     * Finds the most relevant policy file path based on request details.
+     * Finds the most relevant policy file path based on request details and policy index.
      * @param requestDetails The structured details parsed from the request.
-     * @param availablePolicies List of available policy filenames.
+     * @param policyIndexContent The string content of the policy index file.
      * @param taskId Optional task ID for logging.
-     * @returns The filename of the most relevant policy, or null if none found.
+     * @returns The filename/ID of the most relevant policy, or null if none found.
      */
-    findRelevantPolicy(requestDetails: PriorAuthRequestDetails, availablePolicies: string[], taskId?: string): Promise<string | null>;
+    findRelevantPolicy(requestDetails: PriorAuthRequestDetails, policyIndexContent: string, taskId?: string): Promise<string | null>;
 
     /**
      * Evaluates the clinical summary (and potentially subsequent user input) against the provided policy text.
