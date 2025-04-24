@@ -261,19 +261,20 @@ function createA2AMiddleware(getAuthHeaders?: () => Record<string, string> | Pro
 
         } else if (action.type === 'SEND_INPUT') {
             console.log("Middleware: SEND_INPUT action");
-            console.log("Middleware: client?.getCurrentState()", client?.getCurrentState())
-            if (client && client.getCurrentState() === 'input-required') {
-                console.log("Middleware: Sending input...", action.payload);
-                client.send(action.payload)
-                 .catch((err: any) => {
-                     console.error("Middleware: Error sending input:", err);
-                     dispatch({ type: 'ERROR', payload: err as Error | JsonRpcError });
-                 }); // Handle potential error on send
-             } else if (client) {
-                console.warn("Middleware: Attempted to send input, but client not awaiting input. State:", client.getCurrentState());
-             } else {
+            if (client) { 
+                console.log("Middleware: client?.getCurrentState()", client?.getCurrentState())
+                if (client.getCurrentState() === 'input-required') {
+                    console.log("Middleware: Sending input...", action.payload);
+                    client.send(action.payload)
+                    .catch((err: any) => {
+                        console.error("Middleware: Error sending input:", err);
+                        dispatch({ type: 'ERROR', payload: err as Error | JsonRpcError });
+                    }); // Handle potential error on send
+                } else { // Client exists but not awaiting input
+                    console.warn("Middleware: Attempted to send input, but client not awaiting input. State:", client.getCurrentState());
+                }
+            } else { // Client does not exist
                  console.error("Middleware: Cannot send input, client not initialized.");
-                 console.error(client, client?.getCurrentState())
              }
         } else if (action.type === 'CANCEL_TASK') {
             if (client) {

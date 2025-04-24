@@ -83,6 +83,12 @@ export type ScratchpadBlock =
   | { type: "policyQuote"; from: string; text: string }
   | { type: "note"; text: string };
 
+// Added based on MiniEngine usage
+export type Answer = { value: string; snippet?: string };
+
+// Added based on engineTypes usage, maps to ProposedSnippet for now
+export type Snippet = ProposedSnippet;
+
 // Top-level type for LLM communication
 export interface LlmTurn {
   scratchpad: ScratchpadBlock[];

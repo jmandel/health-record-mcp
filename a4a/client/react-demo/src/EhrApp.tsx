@@ -15,6 +15,7 @@ import NotesTab from './components/ehr/NotesTab';
 import BillingTab from './components/ehr/BillingTab';
 import TasksTab from './components/ehr/TasksTab';
 import OrdersTab from './components/ehr/Orders2Tab';
+import Orders3Tab from './components/ehr/Orders3Tab';
 import { PatientSwitcherDropdown } from './components/PatientSwitcherDropdown';
 
 // Define and EXPORT types here (as planned before)
@@ -37,7 +38,7 @@ export interface FullEHR {
 // --- Main App Component Structure ---
 
 // Define Tab Structure
-type TabName = 'Demographics' | 'Medications' | 'Labs' | 'Imaging' | 'Notes' | 'Order Entry' | 'Tasks' | 'Orders' | 'Billing';
+type TabName = 'Demographics' | 'Medications' | 'Labs' | 'Imaging' | 'Notes' | 'Orders' | 'Orders3' | 'Tasks' | 'Billing';
 interface TabConfig {
     id: TabName;
     label: string;
@@ -48,23 +49,23 @@ const TABS_CONFIG: TabConfig[] = [ // Use TABS_CONFIG consistently
     { id: 'Labs', label: 'Labs' },
     { id: 'Imaging', label: 'Imaging' },
     { id: 'Notes', label: 'Notes' },
-    // { id: 'Order Entry', label: 'Order Entry' }, // This likely needs context too
-    { id: 'Orders', label: 'Orders' }, // Renamed ID and Label
-    { id: 'Tasks', label: 'Tasks' }, // This likely needs context too
-    { id: 'Billing', label: 'Billing' }, // This likely needs context too
+    { id: 'Orders', label: 'Orders (v2)' },
+    { id: 'Orders3', label: 'Orders (v3)' },
+    { id: 'Tasks', label: 'Tasks' },
+    { id: 'Billing', label: 'Billing' },
 ];
 
-// Content mapping - no longer needs lazy
+// Content mapping - include Orders3Tab
 const tabContent: Record<TabName, React.ReactNode> = {
     Demographics: <DemographicsTab />,
     Medications: <MedicationsTab />,
-    "Lab Results": <LabsTab />,
+    Labs: <LabsTab />,
     Imaging: <ImagingTab />,
     Notes: <NotesTab />,
-    // "Order Entry": <OrderEntryTab />,
-    Billing: <BillingTab />,
+    Orders: <OrdersTab />,
+    Orders3: <Orders3Tab />,
     Tasks: <TasksTab />,
-    Orders: <OrdersTab />, // Use the renamed OrdersTab component
+    Billing: <BillingTab />,
 };
 
 // Main App Component that uses the context
@@ -74,8 +75,8 @@ function EhrAppContent() {
         ehrData, isLoading, error, loadAndStoreEhr, activePatientName,
         isFileLoadRequested, clearFileLoadRequest // NEW context values
     } = useEhrContext();
-    // Set initial active tab to 'Orders'
-    const [activeTab, setActiveTab] = useState<TabName>('Orders'); 
+    // Set initial active tab to 'Orders3' to default to the new one
+    const [activeTab, setActiveTab] = useState<TabName>('Orders3'); 
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [fileLoadError, setFileLoadError] = useState<string | null>(null);
 
@@ -96,7 +97,6 @@ function EhrAppContent() {
                     }
                     // Use context function to load/store
                     await loadAndStoreEhr(file.name, jsonData);
-                     setActiveTab('Demographics'); // Switch to demo tab on new patient load
                 } catch (err: any) {
                     console.error("Error processing file:", err);
                     setFileLoadError(`Error processing ${file.name}: ${err.message}`);
