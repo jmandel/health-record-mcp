@@ -158,23 +158,33 @@ function reducer(state: A2AState, action: A2AAction): A2AState {
 type MiddlewareDispatch = Dispatch<A2AAction>;
 
 function createA2AMiddleware(getAuthHeaders?: () => Record<string, string> | Promise<Record<string, string>>) {
-    let client: A2AClient | null = null;
+    // --- NEW: Generate ID and set up logging ---
+    const middlewareId = `a2a-mw-${Math.random().toString(36).substring(2, 8)}`;
+    console.log(`Middleware created: ${middlewareId}`);
+    let client: A2AClient | null = null; // Client instance managed by the middleware
 
-    const closeExistingClient = () => {
-        if (client) {
-            console.log("Middleware: Closing existing client...");
-            client.removeAllListeners(); // Remove listeners before closing
-            client.close();
-            client = null;
-        }
-    };
+    // const _logInterval = setInterval(() => {
+    //     // Log the current client object associated with this middleware instance
+    //     console.log(`[${middlewareId}] Interval Log - Current Client:`, client);
+    // }, 5000); // Log every 5 seconds
+
+    // Note: Standard Zustand/Redux middleware patterns don't have a built-in
+    // teardown hook directly within the middleware function itself.
+    // This interval will continue as long as the middleware exists in memory.
+    // If the store is destroyed or reconfigured, this interval might persist
+    // if not explicitly handled by the store's lifecycle management.
+    // For debugging purposes, this is often acceptable.
+    // --- END NEW ---
+
+    let storeApi: any = null; // Will be set by the store
 
     // The middleware takes dispatch and returns a function that takes an action
     return (dispatch: MiddlewareDispatch) => (action: A2AAction) => {
+        console.log("Middleware: createA2AMiddleware: action", middlewareId, action);
         if (action.type === 'RESUME_TASK' || action.type === 'START_TASK') {
-            closeExistingClient(); // Ensure any old client is closed first
             const { agentUrl } = action.payload; // Get agentUrl from payload
             dispatch({ type: 'STARTING', payload: { agentUrl } }); // Dispatch STARTING with agentUrl
+            console.log("Middleware: createA2AMiddleware: STARTING", agentUrl);
 
             // Construct the correct URL for the agent card
             let cardUrl: string;
@@ -226,14 +236,12 @@ function createA2AMiddleware(getAuthHeaders?: () => Record<string, string> | Pro
                     // });
 
                     client.on('error', (error: unknown) => { // V2 often passes error directly
-                         console.error("Middleware: error event", error);
+                        console.error("Middleware: error event", middlewareId, error);
                         dispatch({ type: 'ERROR', payload: error as Error | JsonRpcError });
                      });
 
                      client.on('close', () => {
-                         console.log("Middleware: close event");
-                         dispatch({ type: 'CLOSED' });
-                         client = null; // Clear client ref on close
+                         console.log("Middleware: client close event, ignoring", middlewareId, client);
                      });
 
                     // Get initial snapshot after listeners are attached
@@ -249,10 +257,11 @@ function createA2AMiddleware(getAuthHeaders?: () => Record<string, string> | Pro
                  .catch(err => {
                      console.error("Middleware: Error during client setup:", err);
                      dispatch({ type: 'ERROR', payload: err });
-                     closeExistingClient(); // Ensure cleanup on error
                  });
 
         } else if (action.type === 'SEND_INPUT') {
+            console.log("Middleware: SEND_INPUT action");
+            console.log("Middleware: client?.getCurrentState()", client?.getCurrentState())
             if (client && client.getCurrentState() === 'input-required') {
                 console.log("Middleware: Sending input...", action.payload);
                 client.send(action.payload)
@@ -264,6 +273,7 @@ function createA2AMiddleware(getAuthHeaders?: () => Record<string, string> | Pro
                 console.warn("Middleware: Attempted to send input, but client not awaiting input. State:", client.getCurrentState());
              } else {
                  console.error("Middleware: Cannot send input, client not initialized.");
+                 console.error(client, client?.getCurrentState())
              }
         } else if (action.type === 'CANCEL_TASK') {
             if (client) {
@@ -312,7 +322,7 @@ export function useTaskLiaison({
     const [state, rawDispatch] = useReducer(reducer, initialState);
 
     // Memoize middleware (remains the same)
-    const middleware = useMemo(() => createA2AMiddleware(getAuthHeaders), [getAuthHeaders]);
+    const middleware = useMemo(() => createA2AMiddleware(getAuthHeaders), []);
     const dispatch = useMemo(() => middleware(rawDispatch), [middleware]);
 
     // Effect to handle resuming task on mount (remains the same)

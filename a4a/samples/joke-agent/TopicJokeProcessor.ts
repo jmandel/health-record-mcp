@@ -21,14 +21,8 @@ async function generateJokeWithGemini(topic: string): Promise<string | null> {
     try {
         const genAI = new GoogleGenAI({ apiKey });
         
-        const modelName = "gemini-1.5-flash-latest";
+        const modelName = "gemini-2.5-flash-preview-04-17";
         const generationConfig = { temperature: 0.9 };
-        const safetySettings = [
-             { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-             { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-             { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-             { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-        ];
 
         const prompt = `Generate one genuinely funny and clever joke about "${topic}". Aim for smart wordplay or an unexpected punchline, avoiding overly simple or common puns for this topic "${topic}". Crucially, your output must consist *only* of the joke text itself, with absolutely no introductory or concluding phrases, commentary, or explanation.`;
         

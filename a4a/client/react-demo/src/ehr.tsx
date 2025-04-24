@@ -5,7 +5,7 @@ import EhrApp from './EhrApp';
 import './EhrApp.css'; // Import EHR-specific styles
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
+  // <React.StrictMode>
     <EhrApp />
-  </React.StrictMode>,
+  // </React.StrictMode>,
 ); 

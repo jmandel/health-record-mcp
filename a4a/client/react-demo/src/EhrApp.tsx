@@ -11,7 +11,7 @@ import MedicationsTab from './components/ehr/MedicationsTab';
 import LabsTab from './components/ehr/LabsTab';
 import ImagingTab from './components/ehr/ImagingTab';
 import NotesTab from './components/ehr/NotesTab';
-import OrderEntryTab from './components/ehr/OrderEntryTab';
+// import OrderEntryTab from './components/ehr/OrderEntryTab';
 import BillingTab from './components/ehr/BillingTab';
 import TasksTab from './components/ehr/TasksTab';
 import OrdersTab from './components/ehr/Orders2Tab';
@@ -37,7 +37,7 @@ export interface FullEHR {
 // --- Main App Component Structure ---
 
 // Define Tab Structure
-type TabName = 'Demographics' | 'Medications' | 'Lab Results' | 'Imaging' | 'Notes' | 'Order Entry' | 'Tasks' | 'Orders' | 'Billing';
+type TabName = 'Demographics' | 'Medications' | 'Labs' | 'Imaging' | 'Notes' | 'Order Entry' | 'Tasks' | 'Orders' | 'Billing';
 interface TabConfig {
     id: TabName;
     label: string;
@@ -45,11 +45,11 @@ interface TabConfig {
 const TABS_CONFIG: TabConfig[] = [ // Use TABS_CONFIG consistently
     { id: 'Demographics', label: 'Demographics' },
     { id: 'Medications', label: 'Medications' },
-    { id: 'Lab Results', label: 'Lab Results' },
+    { id: 'Labs', label: 'Labs' },
     { id: 'Imaging', label: 'Imaging' },
     { id: 'Notes', label: 'Notes' },
-    { id: 'Order Entry', label: 'Order Entry' }, // This likely needs context too
-    { id: 'Orders', label: 'Orders (AI)' }, // Renamed ID and Label
+    // { id: 'Order Entry', label: 'Order Entry' }, // This likely needs context too
+    { id: 'Orders', label: 'Orders' }, // Renamed ID and Label
     { id: 'Tasks', label: 'Tasks' }, // This likely needs context too
     { id: 'Billing', label: 'Billing' }, // This likely needs context too
 ];
@@ -61,7 +61,7 @@ const tabContent: Record<TabName, React.ReactNode> = {
     "Lab Results": <LabsTab />,
     Imaging: <ImagingTab />,
     Notes: <NotesTab />,
-    "Order Entry": <OrderEntryTab />,
+    // "Order Entry": <OrderEntryTab />,
     Billing: <BillingTab />,
     Tasks: <TasksTab />,
     Orders: <OrdersTab />, // Use the renamed OrdersTab component

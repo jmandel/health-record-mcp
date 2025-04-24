@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { ProcessorInputValue, ProcessorStepContext, ProcessorYieldValue, TaskProcessorV2 } from '../../src/interfaces/processorV2';
 import { ProcessorCancellationError } from '../../src/interfaces/processorV2';
 import type { Message, Part, TaskSendParams, TextPart } from '../../src/types';
-import type { PolicyEvalResult, PriorAuthEvaluator, PriorAuthRequestDetails } from './evaluators'; // Import interfaces
+import type { PolicyEvalResult, PriorAuthEvaluator, PriorAuthRequestDetails, MessageTurn } from './evaluators'; // Import interfaces + MessageTurn
 import { KeywordEvaluator } from './KeywordEvaluator'; // Import it
 import { GeminiEvaluator } from './GeminiEvaluator';
 // Gemini Helper
@@ -95,7 +95,7 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
 
             // --- 3. Find Relevant Policy and Read Content --- 
             yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Identifying relevant policy...' }] } };
-            let policyIndexContent: string | null = null;
+            let policyCompactContent: string | null = null;
             let selectedPolicyTitle: string | null = null;
             let selectedPolicyId: string | null = null;
             let policyFilename: string | null = null;
@@ -105,41 +105,51 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
             let policyMdText: string | null = null;
 
             try {
-                const indexFilePath = path.join(this.policiesDir, 'index.txt');
-                const indexFile = Bun.file(indexFilePath);
-                if (!(await indexFile.exists())) throw new Error('Policy index file not found.');
-                policyIndexContent = await indexFile.text();
+                // Read the compact policy content file
+                const compactFilePath = path.join(this.policiesDir, "..", 'policies_compact.txt');
+                const compactFile = Bun.file(compactFilePath);
+                if (!(await compactFile.exists())) throw new Error('Compact policy file (policies_compact.txt) not found.');
+                policyCompactContent = await compactFile.text();
 
-                // Find policy ID using evaluator
-                selectedPolicyId = await this.evaluator.findRelevantPolicy(requestDetails!, policyIndexContent!, taskId);
+                // Find policy ID using evaluator with compact content
+                selectedPolicyId = await this.evaluator.findRelevantPolicy(requestDetails!, policyCompactContent!, taskId);
                 if (!selectedPolicyId) throw new Error('No relevant prior authorization policy found for the request described.');
 
-                // Extract title from index
-                const lines = policyIndexContent.split('\n');
-                for (const line of lines) {
-                    const trimmedLine = line.trim();
-                    if (trimmedLine.startsWith(selectedPolicyId + ' |')) {
-                        selectedPolicyTitle = trimmedLine.split('|', 2)[1]?.trim() || `Policy ${selectedPolicyId}`;
-                        break;
+                // Determine potential MD filename early for title extraction
+                policyMdFilename = `${selectedPolicyId}.md`;
+                const policyMdFilePath = path.join(this.policiesDir, policyMdFilename);
+                const policyMdFile = Bun.file(policyMdFilePath);
+
+                // Attempt to get title from MD file's first line
+                if (await policyMdFile.exists()) {
+                    try {
+                        const mdContent = await policyMdFile.text();
+                        const firstLine = mdContent.split('\n', 1)[0]?.trim();
+                        if (firstLine) {
+                             selectedPolicyTitle = firstLine.startsWith('#') ? firstLine.substring(1).trim() : firstLine;
+                        }
+                    } catch (readMdErr) {
+                        console.warn(`[PriorAuthProc ${taskId}] Error reading MD file ${policyMdFilename} for title:`, readMdErr);
+                         // Fall through to use fallback title
                     }
                 }
-                selectedPolicyTitle = selectedPolicyTitle || `Policy ${selectedPolicyId}`; // Ensure title is set
+                
+                // Fallback title if MD read failed or file didn't exist
+                selectedPolicyTitle = selectedPolicyTitle || `Policy ${selectedPolicyId}`; 
+                console.log(`[PriorAuthProc ${taskId}] Determined Policy Title: "${selectedPolicyTitle}"`);
 
                 // Read PDF
                 policyFilename = `${selectedPolicyId}.pdf`;
                 const policyFilePath = path.join(this.policiesDir, policyFilename);
                 const policyFile = Bun.file(policyFilePath);
                  if (!(await policyFile.exists())) throw new Error(`Selected policy file not found: ${policyFilename}`);
-                const policyTextPdf = await policyFile.text(); // Read text for potential fallback evaluation
+                let policyTextPdf = await policyFile.text(); // Read text for potential fallback evaluation (use let)
                 try {
                     const policyBuffer = await policyFile.arrayBuffer();
                     policyPdfBase64 = Buffer.from(policyBuffer).toString('base64');
                 } catch (readPdfErr) { console.error(`Error reading PDF buffer: ${readPdfErr}`); }
                 
-                // Read MD if exists
-                policyMdFilename = policyFilename.replace(/\.pdf$/i, '.md');
-                const policyMdFilePath = path.join(this.policiesDir, policyMdFilename);
-                const policyMdFile = Bun.file(policyMdFilePath);
+                // Read MD if exists (reuse variables from title extraction)
                 if (await policyMdFile.exists()) {
                      try {
                         policyMdText = await policyMdFile.text(); // Read text for evaluation
@@ -172,6 +182,10 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
             }
             let currentInputRequiredMessage: Message = { role: 'agent', parts: messageParts };
 
+            // Initialize conversation history
+            let conversationHistory: MessageTurn[] = [];
+            conversationHistory.push({ role: 'agent', text: initialQuestionText }); // Add initial agent question
+
             yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Preparing initial request for clinician input...' }] } };
 
             // --- 5. Unified Evaluation Loop --- 
@@ -197,6 +211,8 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                     continue; 
                 }
                 console.log(`[PriorAuthProc ${taskId}] Received user response: ${userResponseText}...`);
+                // Add user response to history
+                conversationHistory.push({ role: 'user', text: userResponseText }); 
                 yield { type: 'statusUpdate', state: 'working', message: { role: 'agent', parts: [{ type: 'text', text: 'Evaluating your submission.' }] } };
 
                 // --- 5c. Evaluate --- 
@@ -204,9 +220,8 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                      evaluationResult = await this.evaluator.evaluateAgainstPolicy(
                          policyTextForEval, // Use the text determined earlier
                          requestDetails!,   
-                         taskId,            
-                         evaluationResult,  // Pass previous result (undefined first time)
-                         userResponseText   // Pass the new user input
+                         conversationHistory, // Pass the full history
+                         taskId
                      );
                      console.log(`[PriorAuthProc ${taskId}] Evaluation result:`, evaluationResult);
                  } catch (evalError: any) {
@@ -228,6 +243,8 @@ export class PriorAuthProcessor implements TaskProcessorV2 {
                     }
                     // Update the message for the next iteration
                      currentInputRequiredMessage = { role: 'agent', parts: [{ type: 'text', text: nextQuestionText }] };
+                     // Add agent's follow-up question to history
+                     conversationHistory.push({ role: 'agent', text: nextQuestionText }); 
                      // Continue loop
                  } else {
                      // Decision is Approved, CannotApprove, or unexpected

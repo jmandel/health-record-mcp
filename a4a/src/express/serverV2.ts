@@ -201,7 +201,7 @@ export function startA2AExpressServerV2(config: A2AServerConfigV2): http.Server 
     // --- Set up Express app --- 
     const app = express();
     app.use(cors()); 
-    app.use(express.json()); 
+    app.use(express.json({ limit: '5mb' })); // Set max body size to 5MB
 
     // --- Create Handlers using V2 Core --- 
     const { agentCardHandler, a2aRpcHandler } = createA2AExpressHandlersV2(a2aCore, config); 

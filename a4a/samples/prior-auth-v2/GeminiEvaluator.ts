@@ -1,7 +1,10 @@
-import type { PriorAuthEvaluator, PriorAuthRequestDetails, PolicyEvalResult } from './evaluators';
+import type { PriorAuthEvaluator, PriorAuthRequestDetails, PolicyEvalResult, MessageTurn } from './evaluators';
 import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from '@google/genai';
 
 // --- Gemini Helper (Corrected API Call Structure) --- //
+
+// Simple in-memory cache
+const geminiCache = new Map<string, string | GeminiEvalResponse | GeminiParseRequestResponse>();
 
 // Define specific response types for clarity
 interface GeminiParseRequestResponse extends PriorAuthRequestDetails {}
@@ -17,6 +20,12 @@ async function callGemini(
     if (!apiKey) {
         console.warn(`${logPrefix} GEMINI_API_KEY not set. Cannot call API.`);
         throw new Error("GEMINI_API_KEY not configured.");
+    }
+
+    // --- Check Cache --- 
+    if (geminiCache.has(prompt)) {
+        console.log(`${logPrefix} Using cached Gemini response.`);
+        return geminiCache.get(prompt)!; // Assert non-null as we checked with .has()
     }
 
     try {
@@ -58,6 +67,7 @@ async function callGemini(
             try {
                 const parsedJson = JSON.parse(responseText);
                 console.log(`${logPrefix} Parsed Gemini JSON response:`, parsedJson);
+                geminiCache.set(prompt, parsedJson); // Cache the PARSED OBJECT
                 return parsedJson; // Return raw parsed JSON
             } catch (e: any) {
                 console.error(`${logPrefix} Failed to parse Gemini JSON: ${e.message}`, responseText);
@@ -65,6 +75,8 @@ async function callGemini(
             }
         } else {
             console.log(`${logPrefix} Gemini text response: ${responseText.substring(0, 100)}...`);
+            const resultToCache = responseText.trim();
+            geminiCache.set(prompt, resultToCache); // Cache the text response
             return responseText.trim();
         }
 
@@ -105,27 +117,28 @@ export class GeminiEvaluator implements PriorAuthEvaluator {
         return parsedDetails;
     }
 
-    // Updated findRelevantPolicy to use policyIndexContent
-    async findRelevantPolicy(requestDetails: PriorAuthRequestDetails, policyIndexContent: string, taskId?: string): Promise<string | null> {
+    // Updated findRelevantPolicy to use policyCompactContent
+    async findRelevantPolicy(requestDetails: PriorAuthRequestDetails, policyCompactContent: string, taskId?: string): Promise<string | null> {
         const logPrefix = `[GeminiEvaluator${taskId ? ' Task ' + taskId : ''}]`;
-        console.log(`${logPrefix} Finding relevant policy using Gemini.`);
-        
-        const prompt = `Analyze the following prior authorization request details and the provided policy index content. Identify the single most relevant policy ID from the index that best matches the request. Respond ONLY with a JSON object containing a single key "policyId" whose value is the best matching policy ID string (e.g., "1.01.539"), or null if no suitable match is found.
+        console.log(`${logPrefix} Finding relevant policy using Gemini from compact policy content.`);
+
+        // Updated prompt to work with the compact format
+        const prompt = `Analyze the following prior authorization request details and the provided compact policy content. The policy content lists policies, each starting with an ID (e.g., "9.02.502:"), followed by the title, and then semicolon-separated sections like "Treatments:" and "Indications:". Identify the single most relevant policy ID (the part before the first colon ':') from the content that best matches the request based on procedure, diagnosis, and clinical summary. Respond ONLY with a JSON object containing a single key "policyId" whose value is the best matching policy ID string (e.g., "9.02.502"), or null if no suitable match is found.
 
 Request Details:
 Procedure: ${requestDetails.procedure || 'Not specified'}
 Diagnosis: ${requestDetails.diagnosis || 'Not specified'}
 Clinical Summary: ${requestDetails.clinicalSummary}
 
-Policy Index Content:
+Compact Policy Content:
 ---
-${policyIndexContent}
+${policyCompactContent}
 ---
 
-Respond ONLY with the JSON object described above.`;
-        
+Respond ONLY with the JSON object containing the best "policyId" or null.`;
+
         const result = await callGemini(prompt, taskId, 'json');
-        
+
         // Define an expected type for the response
         type GeminiPolicyResponse = { policyId: string | null };
 
@@ -133,78 +146,64 @@ Respond ONLY with the JSON object described above.`;
             console.error(`${logPrefix} Failed to get a valid response from Gemini for policy finding.`);
             return null;
         }
-        
+
         // Cast to unknown first to satisfy TypeScript
         const parsedResult = result as unknown as GeminiPolicyResponse;
 
-        if (typeof parsedResult.policyId === 'string' && parsedResult.policyId.trim() !== '') {
-            console.log(`${logPrefix} Gemini identified relevant policy ID: ${parsedResult.policyId}`);
-            return parsedResult.policyId;
-        } else {
-             console.log(`${logPrefix} Gemini did not identify a relevant policy ID (result: ${JSON.stringify(result)}).`);
-             return null;
+        // Validate that policyId exists and is a string or null
+        if (parsedResult && typeof parsedResult.policyId !== 'undefined') {
+             if (typeof parsedResult.policyId === 'string' && parsedResult.policyId.trim() !== '') {
+                 console.log(`${logPrefix} Gemini identified relevant policy ID: ${parsedResult.policyId}`);
+                 return parsedResult.policyId;
+             } else if (parsedResult.policyId === null) {
+                 console.log(`${logPrefix} Gemini explicitly determined no relevant policy ID found.`);
+                 return null;
+             }
         }
+        
+        // If structure is wrong or policyId is missing/invalid type
+        console.warn(`${logPrefix} Gemini did not return a valid policy ID structure (result: ${JSON.stringify(result)}).`);
+        return null; // Treat invalid structure as no match found
     }
 
     async evaluateAgainstPolicy(
-        policyText: string, 
-        requestDetails: PriorAuthRequestDetails, 
-        taskId?: string, 
-        previousResult?: PolicyEvalResult, // Optional param for re-evaluation context
-        userInputText?: string           // Optional param for user's new input
+        policyText: string,
+        requestDetails: PriorAuthRequestDetails,
+        conversationHistory: MessageTurn[],
+        taskId?: string
     ): Promise<PolicyEvalResult> {
         const logPrefix = `[GeminiEvaluator${taskId ? ' Task ' + taskId : ''}]`;
-        let prompt: string;
+        console.log(`${logPrefix} Evaluating request using conversation history.`);
 
-        if (previousResult && userInputText) {
-            // --- Re-evaluation Scenario --- 
-            console.log(`${logPrefix} Evaluating with new user input (re-evaluation).`);
-            prompt = `Re-evaluate a prior authorization request based on new information provided by the user.
+        // Format conversation history for the prompt
+        const formattedHistory = conversationHistory
+            .map(turn => `${turn.role === 'agent' ? 'AI Assistant' : 'User'}: ${turn.text}`)
+            .join('\n\n');
+
+        // Use the correct evaluation logic that includes conversation history
+        const prompt = `Evaluate a prior authorization request based on the provided policy, the initial request details, and the subsequent conversation between the AI assistant and the user.
 
 Policy:
 ---
 ${policyText}
 ---
 
-Original Request Details:
+Initial Request Details:
 Procedure: ${requestDetails.procedure || 'Not specified'}
 Diagnosis: ${requestDetails.diagnosis || 'Not specified'}
 Clinical Summary: ${requestDetails.clinicalSummary}
 
-Previous Evaluation Outcome: ${previousResult.decision}
-Reason/Missing Info: ${previousResult.reason} ${previousResult.missingInfo ? `(Specifically looking for: ${previousResult.missingInfo.join(', ')})` : ''}
-
-New Information Provided by User:
+Conversation History (Assistant requesting info, User responding):
 ---
-${userInputText}
+${formattedHistory}
 ---
 
-Evaluate ALL the information (original summary + new input) against the policy. Determine if the request now meets the criteria.
-Respond ONLY with a JSON object containing: 
+Evaluate ALL the information (initial summary + conversation) against the policy. Determine if the request now meets the criteria.
+Respond ONLY with a JSON object containing:
 - "decision": 'Approved' (if ALL criteria met), 'CannotApprove' (if criteria definitively NOT met or exclusion applies), or 'Needs More Info' (if more info could lead to approval).
 - "reason": A concise explanation for the decision, referencing specific policy points.
 - "missingInfo": An array of specific criteria still lacking if decision is 'Needs More Info', otherwise an empty array.`;
-        } else {
-            // --- Initial Evaluation Scenario --- 
-            console.log(`${logPrefix} Performing initial evaluation.`);
-            prompt = `Evaluate the following clinical summary against the provided prior authorization policy. Determine if the request meets the policy criteria.
-Respond ONLY with a JSON object containing: 
-- "decision": 'Approved' (if ALL criteria met), 'CannotApprove' (if criteria definitively NOT met or an exclusion applies), or 'Needs More Info' (if more info could potentially lead to approval).
-- "reason": A concise explanation for the decision, referencing specific policy points.
-- "missingInfo": An array of specific criteria/information lacking if decision is 'Needs More Info', otherwise an empty array.
 
-Policy:
----
-${policyText}
----
-
-Request Summary:
-${requestDetails.clinicalSummary}
-
-Full Details:
-${userInputText}`;
-        }
-        
         const result = await callGemini(prompt, taskId, 'json');
         if (!result || typeof result === 'string') {
             throw new Error('Failed to get policy evaluation result from Gemini.');

@@ -1,6 +1,14 @@
 // prior-auth-v2/evaluators.ts
 
 /**
+ * Represents a single turn in the conversation history.
+ */
+export type MessageTurn = {
+    role: 'agent' | 'user';
+    text: string;
+};
+
+/**
  * Structured details extracted from a prior authorization request text.
  */
 export interface PriorAuthRequestDetails {
@@ -31,29 +39,27 @@ export interface PriorAuthEvaluator {
     parseInitialRequest(requestText: string, taskId?: string): Promise<PriorAuthRequestDetails>;
 
     /**
-     * Finds the most relevant policy file path based on request details and policy index.
+     * Finds the most relevant policy ID based on request details and compact policy content.
      * @param requestDetails The structured details parsed from the request.
-     * @param policyIndexContent The string content of the policy index file.
+     * @param policyCompactContent The string content of the policies_compact.txt file.
      * @param taskId Optional task ID for logging.
-     * @returns The filename/ID of the most relevant policy, or null if none found.
+     * @returns The ID (e.g., "9.02.502") of the most relevant policy, or null if none found.
      */
-    findRelevantPolicy(requestDetails: PriorAuthRequestDetails, policyIndexContent: string, taskId?: string): Promise<string | null>;
+    findRelevantPolicy(requestDetails: PriorAuthRequestDetails, policyCompactContent: string, taskId?: string): Promise<string | null>;
 
     /**
-     * Evaluates the clinical summary (and potentially subsequent user input) against the provided policy text.
+     * Evaluates the clinical summary and subsequent conversation against the provided policy text.
      * @param policyText The full text of the relevant policy.
-     * @param requestDetails The structured details parsed from the request (includes initial summary).
+     * @param requestDetails The structured details parsed from the *initial* request.
+     * @param conversationHistory An array containing the conversation turns (agent questions, user responses) since the policy was identified.
      * @param taskId Optional task ID for logging.
-     * @param previousResult Optional: The result of the previous evaluation, if re-evaluating after 'Needs More Info'.
-     * @param userInputText Optional: The text provided by the user in response to the request for more information.
      * @returns A structured evaluation result.
      */
     evaluateAgainstPolicy(
-        policyText: string, 
-        requestDetails: PriorAuthRequestDetails, 
-        taskId?: string, 
-        previousResult?: PolicyEvalResult, // Optional param for re-evaluation context
-        userInputText?: string           // Optional param for user's new input
+        policyText: string,
+        requestDetails: PriorAuthRequestDetails,
+        conversationHistory: MessageTurn[], // Changed parameter
+        taskId?: string
     ): Promise<PolicyEvalResult>;
 
     /**

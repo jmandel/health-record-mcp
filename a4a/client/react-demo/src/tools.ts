@@ -241,6 +241,11 @@ interface GrepAttachmentHit {
     date: string | null; // Date extracted from the owning resource
 }
 
+// --- Define the NEW richer return type ---
+export interface GrepResult {
+    markdown: string;
+    filteredEhr: FullEHR;
+}
 
 export async function grepRecordLogic(
     fullEhr: FullEHR,
@@ -249,7 +254,7 @@ export async function grepRecordLogic(
     resourceFormat: 'plaintext' | 'json' = 'plaintext', // New parameter
     pageSize: number = DEFAULT_PAGE_SIZE,
     page: number = DEFAULT_PAGE
-): Promise<string> { // Returns Markdown string
+): Promise<GrepResult> { // Changed return type
 
     // --- Instantiate Renderer ---
     let renderResource: (resource: any) => string;
@@ -257,7 +262,11 @@ export async function grepRecordLogic(
         renderResource = createFhirRenderer(fullEhr);
     } catch (rendererError: any) {
         console.error(`[GREP Logic] Failed to create FHIR renderer:`, rendererError);
-        return `**Error:** Failed to initialize resource renderer. Cannot proceed. ${rendererError.message}`;
+        // Return error within the new structure
+        return {
+            markdown: `**Error:** Failed to initialize resource renderer. Cannot proceed. ${rendererError.message}`,
+            filteredEhr: { fhir: {}, attachments: [] }
+        };
     }
     // --- End Renderer Instantiation ---
 
@@ -271,17 +280,25 @@ export async function grepRecordLogic(
         console.error(`[GREP Logic] Using regex: ${regex}`);
     } catch (e: any) {
         console.error(`[GREP Logic] Invalid regex: "${originalQuery}"`, e);
-        return `**Error:** Invalid regular expression provided: \`${originalQuery}\`. ${e.message}`; // Return Markdown error
+        // Return error within the new structure
+        return {
+            markdown: `**Error:** Invalid regular expression provided: \`${originalQuery}\`. ${e.message}`,
+            filteredEhr: { fhir: {}, attachments: [] }
+        };
     }
 
     // Store hits before pagination
     const allResourceHits: GrepResourceHit[] = [];
     const allAttachmentHits: GrepAttachmentHit[] = [];
 
+    // --- NEW: Store matched EHR data ---
+    const matchedFhirResources: { [type: string]: { [id: string]: any } } = {};
+    const matchedAttachments = new Map<string, FullEHR['attachments'][0]>(); // Use Map for uniqueness based on ref#path
+
     let resourcesSearched = 0;
     let attachmentsSearched = 0;
-    const matchedResourceRefs = new Set<string>(); // Track ResourceRefs with hits
-    const matchedAttachmentRefs = new Set<string>(); // Track AttachmentRefs with hits
+    // const matchedResourceRefs = new Set<string>(); // Still useful? Maybe not if we collect objects directly
+    // const matchedAttachmentRefs = new Set<string>(); // Still useful? Maybe not if we collect objects directly
 
     const searchOnlyAttachments = inputResourceTypes?.length === 1 && inputResourceTypes[0] === "Attachment";
     let typesForResourceSearch: string[] = [];
@@ -319,7 +336,7 @@ export async function grepRecordLogic(
                 resourcesSearched++;
                 const resourceRef = `${resource.resourceType}/${resource.id}`;
                 // Don't search again if already found
-                if (matchedResourceRefs.has(resourceRef)) continue;
+                // if (matchedResourceRefs.has(resourceRef)) continue; // Check collection instead?
 
                 let matchFound = false;
                 let renderedContent: string | object = {};
@@ -338,7 +355,14 @@ export async function grepRecordLogic(
                 }
 
                 if (matchFound) {
-                    matchedResourceRefs.add(resourceRef);
+                    // --- Collect matching resource ---
+                    if (!matchedFhirResources[resourceType]) {
+                        matchedFhirResources[resourceType] = {};
+                    }
+                    // Store unique resource by ID within its type
+                    matchedFhirResources[resourceType][resource.id] = resource;
+                    // --- End collection ---
+
                     const date = extractResourceDate(resource);
 
                     // Render or get JSON based on format
@@ -388,7 +412,7 @@ export async function grepRecordLogic(
                 }
             }
         }
-        console.error(`[GREP Logic] Found matches in ${allResourceHits.length} resources after searching ${resourcesSearched}.`);
+        console.error(`[GREP Logic] Found matches in ${Object.values(matchedFhirResources).reduce((sum, typeMap) => sum + Object.keys(typeMap).length, 0)} unique resources after searching ${resourcesSearched}.`);
     } else {
         console.error("[GREP Logic] Skipping resource search based on scope.");
     }
@@ -440,15 +464,24 @@ export async function grepRecordLogic(
     // Now search *oney* the selected attachments for snippets
     let totalSnippetsFound = 0; // Reset snippet count for attachments only
     for (const { attachment, anchorResource } of selectedAttachmentsData) {
-        const attachmentRef = `${attachment.resourceType}/${attachment.resourceId}#${attachment.path}`;
+        const attachmentRefKey = `${attachment.resourceType}/${attachment.resourceId}#${attachment.path}`; // Key for uniqueness
 
-        // Don't search again if already found
-        if (matchedAttachmentRefs.has(attachmentRef)) continue;
+        // --- Skip if already processed (check the map) ---
+        if (matchedAttachments.has(attachmentRefKey)) continue;
 
         if (attachment.contentPlaintext && typeof attachment.contentPlaintext === 'string' && attachment.contentPlaintext.length > 0) {
             const snippets = findContextualMatches(attachment.contentPlaintext, regex, GREP_CONTEXT_LENGTH);
             if (snippets.length > 0) {
-                matchedAttachmentRefs.add(attachmentRef);
+                // --- Collect matching attachment ---
+                matchedAttachments.set(attachmentRefKey, attachment);
+                // Also ensure the *owning* resource is collected if not already
+                if (anchorResource && !matchedFhirResources[anchorResource.resourceType]?.[anchorResource.id]) {
+                    if (!matchedFhirResources[anchorResource.resourceType]) matchedFhirResources[anchorResource.resourceType] = {};
+                    matchedFhirResources[anchorResource.resourceType][anchorResource.id] = anchorResource;
+                    console.log(`[GREP Logic] Added owning resource ${anchorResource.resourceType}/${anchorResource.id} due to attachment match.`);
+                }
+                // --- End collection ---
+
                 totalSnippetsFound += snippets.length;
                 const date = extractResourceDate(anchorResource); // Extract date from anchor
                 allAttachmentHits.push({
@@ -464,7 +497,7 @@ export async function grepRecordLogic(
             }
         }
     }
-    console.error(`[GREP Logic] Found matches in ${allAttachmentHits.length} attachments (total ${totalSnippetsFound} snippets).`);
+    console.error(`[GREP Logic] Found matches in ${matchedAttachments.size} unique attachments (total ${totalSnippetsFound} snippets).`);
 
     // --- Pagination and Formatting ---
     const totalResources = allResourceHits.length;
@@ -492,7 +525,7 @@ export async function grepRecordLogic(
     const allCombinedHits: (GrepResourceHit | GrepAttachmentHit)[] = [...sortedResourceHits, ...sortedAttachmentHits];
     const paginatedHits = allCombinedHits.slice(startIndex, endIndex);
 
-    console.error(`[GREP Logic] Pagination: Page ${normalizedPage}/${totalPages}, showing ${paginatedHits.length} of ${totalResults} total matching resources/attachments`);
+    console.error(`[GREP Logic] Pagination: Page ${normalizedPage}/${totalPages}, showing markdown for ${paginatedHits.length} of ${totalResults} total matching resources/attachments`);
 
     // 3. Format results as Markdown
     let markdownOutput = `## Grep Results for \`${originalQuery.replace(/`/g, '\\`')}\`\n\n`;
@@ -571,6 +604,26 @@ export async function grepRecordLogic(
     }
 
     markdownOutput += "---";
-    return markdownOutput;
+
+    // --- Construct the filteredEhr object ---
+    const finalFilteredFhir: FullEHR['fhir'] = {};
+    for (const type in matchedFhirResources) {
+        finalFilteredFhir[type] = Object.values(matchedFhirResources[type]);
+    }
+
+    const finalFilteredAttachments = Array.from(matchedAttachments.values());
+
+    const filteredEhrResult: FullEHR = {
+        fhir: finalFilteredFhir,
+        attachments: finalFilteredAttachments
+    };
+
+    console.log(`[GREP Logic] Constructed filteredEhr with ${Object.keys(finalFilteredFhir).length} resource types and ${finalFilteredAttachments.length} attachments.`);
+
+    // --- Return the final result object ---
+    return {
+        markdown: markdownOutput,
+        filteredEhr: filteredEhrResult
+    };
 }
 
