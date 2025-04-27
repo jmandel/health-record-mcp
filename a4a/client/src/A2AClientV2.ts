@@ -258,8 +258,9 @@ export class A2AClient extends Emitter<ClientEvents> {
     cfg: ClientConfigParams
   ): A2AClient {
     const id = initialParams.id ?? uuid();
+    const processedInitialParams = { ...initialParams, id };
     const client = new A2AClient(id, { endpoint, ...cfg });
-    client.init(initialParams).catch(e => client.emit('error', e));
+    client.init(processedInitialParams).catch(e => client.emit('error', e));
     return client;
   }
 

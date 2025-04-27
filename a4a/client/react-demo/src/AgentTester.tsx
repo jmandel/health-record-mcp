@@ -1,260 +1,198 @@
-import React, { useState, useCallback, useMemo } from 'react';
-import { useTaskLiaison } from './hooks/useTaskLiaison';
-import { Message, Task, TextPart, Part } from '@jmandel/a2a-client/src/types'; // A2A types
-import './App.css'; // Reuse existing styles for now
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  A2AClient,
+  deepEqual
+} from '@jmandel/a2a-client/src/A2AClientV2';
+import type {
+  Task,
+  Message,
+  Part,
+  Artifact,
+  TaskSendParams
+} from '@jmandel/a2a-client/src/types';
+import './App.css';
 
-// Default to the prior auth agent, assuming it's running on 3001
-const DEFAULT_AGENT_URL = 'http://localhost:3001/a2a';
+const DEFAULT_AGENT_ENDPOINT = 'http://localhost:3001/a2a';
+
+type ClientState =
+  | { phase: 'idle' }
+  | { phase: 'connecting' }
+  | { phase: 'running'; task: Task }
+  | { phase: 'awaiting-input'; task: Task }
+  | { phase: 'completed'; task: Task }
+  | { phase: 'error'; error: any };
 
 function AgentTester() {
-    const [agentUrl, setAgentUrl] = useState(DEFAULT_AGENT_URL);
-    const [messageInput, setMessageInput] = useState('');
-    const [startMessage, setStartMessage] = useState('Start prior auth for MRI Lumbar Spine for low back pain'); // Example start message
-    const [currentAgentUrlForHook, setCurrentAgentUrlForHook] = useState(agentUrl);
+  // ——————————————————— configuration inputs
+  const [agentUrl, setAgentUrl] = useState(DEFAULT_AGENT_ENDPOINT);
+  const [validatedUrl, setValidatedUrl] = useState<string | null>(null);
+  const [agentCard, setAgentCard] = useState<any | null>(null);
 
-    // Remove summary generator - it's not part of the new hook
-    // const testerSummaryGenerator = useCallback((task: Task | null) => { ... });
+  // ——————————————————— dialog inputs
+  const [kickoffText, setKickoffText] = useState('Start prior auth for MRI Lumbar Spine for low back pain');
+  const [messageInput, setMessageInput] = useState('');
 
-    const {
-        state, // Contains: status, task, question, error, taskId, agentUrl, summary
-        actions // Contains: startTask, sendInput, cancelTask, resumeTask
-    } = useTaskLiaison({
-        // Key prop removed - hook already re-initializes on agentUrl change
-        agentUrl: currentAgentUrlForHook,
-        // summaryGenerator removed
-        // No initial task ID or params, start manually
-        // Add autoInputHandler if needed:
-        // autoInputHandler: async (task: Task): Promise<Message | null> => { ... }
+  // ——————————————————— A2A client
+  const [client, setClient] = useState<A2AClient | null>(null);
+  const [state, setState] = useState<ClientState>({ phase: 'idle' });
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+
+  // ---------------------- step 1: validate agent (fetch card)
+  const buildCardUrl = (endpoint: string): string => {
+    // Resolve the relative path ".well-known/agent.json"
+    // against the provided endpoint URL as the base.
+    return new URL('.well-known/agent.json', endpoint).toString();
+  };
+
+  const handleValidate = async () => {
+    setAgentCard(null);
+    setValidatedUrl(null);
+    try {
+      const cardUrl = buildCardUrl(agentUrl);
+      const res = await fetch(cardUrl);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const card = await res.json();
+      setAgentCard(card);
+      setValidatedUrl(agentUrl);
+    } catch (e) {
+      alert('Could not fetch agent card: ' + (e as any).message);
+    }
+  };
+
+  // ---------------------- step 2: kickoff task
+  const handleKickoff = () => {
+    if (!validatedUrl) return;
+    const params: TaskSendParams = {
+      message: { role: 'user', parts: [{ type: 'text', text: kickoffText }] }
+    };
+    const c = A2AClient.start(validatedUrl, params, {
+      getAuthHeaders: () => ({})
     });
 
-    // Destructure state for easier access in the component
-    const { status, task, question, error, taskId, summary } = state;
+    c.on('task-update', (t) => {
+      if (t.status.state === 'input-required') setState({ phase: 'awaiting-input', task: t });
+      else if (t.status.state === 'completed' || t.status.state === 'failed' || t.status.state === 'canceled')
+        setState({ phase: 'completed', task: t });
+      else setState({ phase: 'running', task: t });
+    });
+    c.on('artifact-update', ({ artifact }) => {
+      setArtifacts((prev) => {
+        const idx = prev.findIndex((a) => a.index === artifact.index);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = artifact;
+          return next;
+        }
+        return [...prev, artifact];
+      });
+    });
+    c.on('error', (e) => setState({ phase: 'error', error: e }));
+    c.on('close', () => setClient(null));
 
-    // Determine status label based on hook state
-    // const getStatusLabel = () => { ... };
+    setClient(c);
+    setArtifacts([]);
+    setState({ phase: 'connecting' });
+  };
 
-    const isRunning = status !== 'idle' && status !== 'completed' && status !== 'error';
+  // ---------------------- send follow-up message
+  const handleSend = () => {
+    if (!client || state.phase !== 'awaiting-input') return;
+    const msg: Message = { role: 'user', parts: [{ type: 'text', text: messageInput }] };
+    client.send(msg);
+    setMessageInput('');
+  };
 
-    // Handler to update the agent URL used by the hook, triggering re-init
-    const handleApplyAgentUrl = useCallback(() => {
-        setCurrentAgentUrlForHook(agentUrl);
-    }, [agentUrl]);
+  const handleCancel = () => {
+    client?.cancel();
+  };
 
-    // Start a new task with the initial message
-    const handleStartTask = useCallback(() => {
-        if (!startMessage || status !== 'idle') return;
-        console.log(`Starting task with message: ${startMessage}`);
-        // Use actions.startTask
-        actions.startTask({ role: 'user', parts: [{ type: 'text', text: startMessage }] });
-        // Error handling is now internal to the hook/middleware
-    }, [actions, startMessage, status]);
+  const currentTask = state.phase === 'running' || state.phase === 'awaiting-input' || state.phase === 'completed' ? state.task : null;
 
-    // Send the message currently in the input box
-    const handleSendMessage = useCallback(() => {
-        if (!messageInput || status !== 'awaiting-input') return;
-        console.log(`Sending message: ${messageInput}`);
-        const message: Message = {
-            role: 'user',
-            parts: [{ type: 'text', text: messageInput }]
-        };
-        // Use actions.sendInput
-        actions.sendInput(message);
-        setMessageInput(''); // Clear input optimistically
-        // Error handling is now internal to the hook/middleware
-    }, [actions, messageInput, status]);
+  // helper render artifact parts
+  const renderPart = (part: Part, idx: number) => {
+    if (part.type === 'text') return <p key={idx}>{part.text}</p>;
+    if (part.type === 'data') return <pre key={idx}>{JSON.stringify(part.data, null, 2)}</pre>;
+    if (part.type === 'file') return <p key={idx}>📎 File part ({part.file?.mimeType})</p>;
+    return <span key={idx}>Unknown part</span>;
+  };
 
-    // Cancel the current task
-    const handleCancelTask = useCallback(() => {
-        if (!isRunning) return;
-        // Use actions.cancelTask
-        actions.cancelTask();
-        // Error handling is now internal to the hook/middleware
-    }, [actions, isRunning]);
+  return (
+    <div className="App">
+      <h1>A2A Agent Tester (Raw Client)</h1>
 
-    // Extract text from the agent's question message (now from state.question)
-    const agentQuestionText = useMemo(() => {
-        if (status !== 'awaiting-input' || !question) return null;
-        // Add type Part to param p
-        return question.parts.find((p: Part) => p.type === 'text')?.text || '(Agent requires input, but sent no text)';
-    }, [status, question]);
+      {/* Agent selection */}
+      <div className="card">
+        <h2>1. Select Agent</h2>
+        <input style={{ width: '400px' }} value={agentUrl} onChange={(e) => setAgentUrl(e.target.value)} />
+        <button onClick={handleValidate}>Fetch Agent Card</button>
+        {agentCard && (
+          <p style={{ marginTop: '8px' }}>
+            ✅ {agentCard.name} (v{agentCard.version}) – streaming:{' '}
+            {agentCard.capabilities?.streaming ? 'yes' : 'no'}
+          </p>
+        )}
+      </div>
 
-    return (
-        <div className="App">
-            <h1>A2A Agent Tester</h1>
-
-            <div className="card config-card">
-                <h2>Configuration</h2>
-                 <label htmlFor="agentUrlInput">Agent URL:</label>
-                 <input
-                    id="agentUrlInput"
-                    type="text"
-                    value={agentUrl}
-                    onChange={(e) => setAgentUrl(e.target.value)}
-                    style={{ minWidth: '300px' }}
-                 />
-                 <button onClick={handleApplyAgentUrl} disabled={agentUrl === currentAgentUrlForHook}>
-                    Apply URL (Resets Hook)
-                 </button>
-                 <p><small>Current Hook URL: <code>{currentAgentUrlForHook}</code></small></p>
-            </div>
-
-            <div className="card">
-                <h2>Task Control & Status</h2>
-                <div className="status-display">
-                    <p>
-                        Client Status: <strong>{status}</strong> <br/>
-                        Task Status: <strong>{summary.friendlyLabel}</strong> {summary.emoji} <br/>
-                        {taskId && <small>Task ID: {taskId}</small>}
-                    </p>
-                     {error && <p className="error-message">Error: {error.message}</p>}
-                </div>
-
-                <div className="controls-area start-controls">
-                     <label htmlFor="startMessageInput">Start Message:</label>
-                     <input
-                        id="startMessageInput"
-                        type="text"
-                        value={startMessage}
-                        onChange={(e) => setStartMessage(e.target.value)}
-                        style={{ flexGrow: 1, marginRight: '10px' }}
-                        disabled={status !== 'idle'}
-                     />
-                    <button onClick={handleStartTask} disabled={status !== 'idle' || !startMessage}>
-                        Start Task
-                    </button>
-                </div>
-                 <div className="controls-area cancel-controls">
-                     <button onClick={handleCancelTask} disabled={!isRunning} className="cancel-button">
-                        Cancel Task
-                    </button>
-                </div>
-            </div>
-
-            <div className="card" style={{ display: 'flex', flexDirection: 'column' }}>
-                <h2>Conversation</h2>
-                {/* --- History Display --- */}
-                <div className="conversation-history" style={{ marginBottom: '15px', maxHeight: '300px', overflowY: 'auto', border: '1px solid #eee', padding: '10px', background: '#fdfdfd' }}>
-                    {task?.history && task.history.length > 0 ? (
-                        task.history.map((message: Message, index: number) => { // Add Message and number types
-                            const isUser = message.role === 'user';
-                            const style: React.CSSProperties = {
-                                marginBottom: '5px',
-                                padding: '5px 8px',
-                                borderRadius: '4px',
-                                backgroundColor: isUser ? '#e1f5fe' : '#f0f0f0',
-                                textAlign: 'left',
-                                whiteSpace: 'pre-wrap', // Preserve newlines within message
-                                wordBreak: 'break-word',
-                            };
-
-                            // Function to handle opening file parts in new tab
-                            const handleViewFile = (part: Part) => {
-                                if (part.type !== 'file' || !part.file?.bytes || !part.file?.mimeType) {
-                                    console.error('Invalid file part for viewing:', part);
-                                    alert('Cannot view file: Missing data or mime type.');
-                                    return;
-                                }
-                                try {
-                                    // Decode base64
-                                    const byteCharacters = atob(part.file.bytes);
-                                    const byteNumbers = new Array(byteCharacters.length);
-                                    for (let i = 0; i < byteCharacters.length; i++) {
-                                        byteNumbers[i] = byteCharacters.charCodeAt(i);
-                                    }
-                                    const byteArray = new Uint8Array(byteNumbers);
-
-                                    // Create Blob
-                                    const blob = new Blob([byteArray], { type: part.file.mimeType });
-
-                                    // Create Object URL and open
-                                    const blobUrl = URL.createObjectURL(blob);
-                                    window.open(blobUrl, '_blank');
-                                    // Consider revoking URL later if needed, but simple open is usually fine for viewing
-                                    // URL.revokeObjectURL(blobUrl);
-                                } catch (error) {
-                                    console.error('Error decoding or opening file blob:', error);
-                                    alert('Error opening file. See console for details.');
-                                }
-                            };
-
-                            return (
-                                <div key={`hist-${index}`} style={style}>
-                                    <strong>{isUser ? 'User:' : 'Agent:'}</strong>
-                                    {message.parts.map((part, partIndex) => {
-                                        if (part.type === 'text') {
-                                            // Render text directly
-                                            return <span key={partIndex}>{part.text}</span>;
-                                        } else if (part.type === 'file' && part.file) {
-                                            // Render file info with a view link
-                                            const fileName = part.file.name || 'untitled';
-                                            return (
-                                                <div key={partIndex} style={{ marginTop: '5px', fontSize: '0.9em' }}>
-                                                    <span style={{ fontStyle: 'italic' }}>File: {fileName}</span> (
-                                                    <button
-                                                        onClick={() => handleViewFile(part)}
-                                                        disabled={!part.file.bytes}
-                                                        style={{ 
-                                                            background: 'none', 
-                                                            border: 'none', 
-                                                            color: 'blue', 
-                                                            textDecoration: 'underline', 
-                                                            cursor: 'pointer', 
-                                                            padding: 0, 
-                                                            fontSize: 'inherit' 
-                                                        }}
-                                                        title={part.file.bytes ? `View ${fileName}` : 'File content not available'}
-                                                    >
-                                                        View
-                                                    </button>
-                                                    )
-                                                </div>
-                                            );
-                                        } else if (part.type === 'data') {
-                                            // Optionally display JSON data concisely
-                                             return <pre key={partIndex} style={{ fontSize: '0.8em', background: '#eee', padding: '3px', marginTop: '5px' }}>Data: {JSON.stringify(part.data)}</pre>;
-                                        }
-                                        return <span key={partIndex}> (Unsupported Part Type: {part.type})</span>;
-                                    })}
-                                    {message.parts.length === 0 && <span> (Empty message)</span>}
-                                </div>
-                            );
-                        })
-                    ) : (
-                        <p style={{ color: '#888' }}>No conversation history yet.</p>
-                    )}
-                </div>
-                {/* --- End History Display --- */}
-
-                {/* --- Input Area (Modified condition using state.status) --- */}
-                <div className={`input-section ${status === 'awaiting-input' ? 'active' : ''}`}>
-                     <label htmlFor="messageInput">Your Message:</label>
-                     <input
-                        id="messageInput"
-                        type="text"
-                        value={messageInput}
-                        onChange={(e) => setMessageInput(e.target.value)}
-                        placeholder={status === 'awaiting-input' ? "Enter your response..." : "Waiting for agent response..."} // Updated placeholder
-                        disabled={status !== 'awaiting-input'} // Use state.status for disabled
-                        style={{ flexGrow: 1, marginRight: '10px' }}
-                        onKeyDown={(e) => { if (e.key === 'Enter' && status === 'awaiting-input') handleSendMessage(); }} // Also check state.status here
-                    />
-                    <button
-                        onClick={handleSendMessage}
-                        disabled={status !== 'awaiting-input' || !messageInput} // Use state.status for disabled
-                    >
-                        Send
-                    </button>
-                </div>
-            </div>
-
-            <div className="card">
-                <h2>Raw Task State</h2>
-                <pre style={{ textAlign: 'left', background: '#f8f8f8', padding: '10px', borderRadius: '5px', maxHeight: '400px', overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-                    {task ? JSON.stringify(task, null, 2) : 'No task active.'}
-                </pre>
-            </div>
+      {/* Kickoff */}
+      {agentCard && (
+        <div className="card">
+          <h2>2. Kick-off Task</h2>
+          <input style={{ width: '600px' }} value={kickoffText} onChange={(e) => setKickoffText(e.target.value)} />
+          <button onClick={handleKickoff} disabled={!!client}>Start</button>
         </div>
-    );
+      )}
+
+      {/* Conversation */}
+      {currentTask && (
+        <div className="card">
+          <h2>Conversation</h2>
+          <div style={{ maxHeight: 300, overflowY: 'auto', border: '1px solid #ddd', padding: 8 }}>
+            {currentTask.history?.map((m, i) => (
+              <div key={i} style={{ marginBottom: 6 }}>
+                <strong>{m.role === 'user' ? '🧑‍💻' : '🤖'} </strong>
+                {m.parts.map((p, idx) => (
+                  <span key={idx}>{renderPart(p, idx)}</span>
+                ))}
+              </div>
+            ))}
+          </div>
+
+          {state.phase === 'awaiting-input' && (
+            <div style={{ marginTop: 10 }}>
+              <input
+                style={{ width: 400 }}
+                value={messageInput}
+                onChange={(e) => setMessageInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+              />
+              <button onClick={handleSend}>Send</button>
+            </div>
+          )}
+
+          <button style={{ marginTop: 10 }} onClick={handleCancel} disabled={!client}>
+            Cancel Task
+          </button>
+        </div>
+      )}
+
+      {/* Artifacts */}
+      {artifacts.length > 0 && (
+        <div className="card">
+          <h2>Artifacts</h2>
+          {artifacts.map((a) => (
+            <div key={a.index} style={{ borderBottom: '1px solid #eee', marginBottom: 6 }}>
+              <h4>
+                #{a.index} {a.name}
+              </h4>
+              {a.parts.map((p, idx) => renderPart(p, idx))}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {state.phase === 'error' && <pre style={{ color: 'red' }}>{JSON.stringify(state.error)}</pre>}
+    </div>
+  );
 }
 
 export default AgentTester; 
