@@ -2,7 +2,8 @@ import type {
     TaskProcessorV2, 
     ProcessorYieldValue, 
     ProcessorInputValue, 
-    ProcessorInputInternal // Import this specific type for checking
+    ProcessorInputInternal, 
+    ProcessorStepContext // Import context type
 } from '../../src/interfaces/processorV2'; 
 import { ProcessorCancellationError } from '../../src/interfaces/processorV2'; // Import the error class
 // Import common types from the main library entry
@@ -98,10 +99,11 @@ export class TopicJokeProcessorV2 implements TaskProcessorV2 {
 
     // The core logic moves into the process generator
     async * process(
-        task: Task,
+        context: ProcessorStepContext,
         params: TaskSendParams,
         authContext?: any
     ): AsyncGenerator<ProcessorYieldValue, void, ProcessorInputValue> {
+        const task = context.task;
         console.log(`[TopicJokeProcessorV2] Starting task ${task.id}`);
         let topic: string | undefined;
         let jokeText: string | null = null;
@@ -168,6 +170,7 @@ export class TopicJokeProcessorV2 implements TaskProcessorV2 {
             yield { 
                 type: 'artifact', 
                 artifactData: { 
+                    index: 0,
                     name: 'joke-result', 
                     parts: [{ type: 'text', text: jokeText }], 
                     metadata: { topic: topic } // Add original topic to artifact metadata

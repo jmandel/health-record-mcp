@@ -1,7 +1,8 @@
 import type { 
     TaskProcessorV2, 
     ProcessorYieldValue, 
-    ProcessorInputValue 
+    ProcessorInputValue,
+    ProcessorStepContext
 } from '../../src/interfaces/processorV2'; 
 import { ProcessorCancellationError } from '../../src/interfaces/processorV2';
 import type { 
@@ -31,10 +32,11 @@ export class RandomJokeProcessorV2 implements TaskProcessorV2 {
     }
 
     async * process(
-        task: Task,
+        context: ProcessorStepContext,
         params: TaskSendParams,
         authContext?: any
     ): AsyncGenerator<ProcessorYieldValue, void, ProcessorInputValue> {
+        const task = context.task;
         console.log(`[RandomJokeProcessorV2] Starting task ${task.id}`);
         try {
             // Signal working
@@ -50,6 +52,7 @@ export class RandomJokeProcessorV2 implements TaskProcessorV2 {
             yield { 
                 type: 'artifact', 
                 artifactData: { 
+                    index: 0,
                     name: 'random-joke-result', 
                     parts: [{ type: 'text', text: jokeText }]
                  } 
