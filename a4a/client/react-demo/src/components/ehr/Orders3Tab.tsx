@@ -6,7 +6,7 @@ import { PaSession, PaPhase, SearchHistoryEntry, ApprovalData } from '../../core
 import { sessions } from '../../core/registry';
 import type { Answer, ClinicianQuestion, ScratchpadBlock, ConditionNode } from '../../types/priorAuthTypes';
 import type { PackageBundle } from '../../engine/engineTypes';
-import type { Message, Part, FilePart, Artifact } from '@a2a/client/src/types';
+import type { Message, Part, FilePart, Artifact } from '@jmandel/a2a-client/src/types';
 import QuestionCard from './QuestionDisplay'; 
 import { useEhrSearch } from '../../hooks/useEhrSearch';
 import { extractPatientAdminDetails } from '../../utils/extractPatientAdminDetails';
@@ -349,8 +349,8 @@ const Orders3Tab: React.FC = () => {
     const session = usePaSession(currentTaskId);
 
     // State for initial form
-    const [treatment, setTreatment] = useState<string>("New rTMS Protocol");
-    const [indication, setIndication] = useState<string>("Refractory MDD");
+    const [treatment, setTreatment] = useState<string>("rTMS Protocol");
+    const [indication, setIndication] = useState<string>("Refractory Bipolar Depression");
     const [isStarting, setIsStarting] = useState<boolean>(false);
     // State to hold answers for the current set of questions
     const [currentAnswers, setCurrentAnswers] = useState<Record<string, Answer>>({});
@@ -456,7 +456,7 @@ const Orders3Tab: React.FC = () => {
 
     return (
         <div className="orders2-tab"> {/* Consider renaming class if needed */} 
-            <h2>Prior Auth Workflow (v3 - PaSession)</h2>
+            <h2>Prior Auth Workflow</h2>
 
             {/* --- NEW: Render Approval Display right below title if finalized & approved --- */} 
             {session && session.phase === 'finalized' && <ApprovalDisplay approvalData={session.approvalData} />}
@@ -470,6 +470,12 @@ const Orders3Tab: React.FC = () => {
                             type="text" id="treatment-v3" value={treatment}
                             onChange={(e) => setTreatment(e.target.value)} className="form-input"
                             disabled={isLoading}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter' && !isLoading && isEhrDataAvailable) {
+                                    e.preventDefault(); // Prevent default form submission/newline
+                                    handleStartPA();
+                                }
+                            }}
                          />
                       </div>
                       <div className="form-group">
@@ -478,13 +484,19 @@ const Orders3Tab: React.FC = () => {
                             type="text" id="indication-v3" value={indication}
                             onChange={(e) => setIndication(e.target.value)} className="form-input"
                             disabled={isLoading}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter' && !isLoading && isEhrDataAvailable) {
+                                    e.preventDefault(); // Prevent default form submission/newline
+                                    handleStartPA();
+                                }
+                            }}
                          />
                       </div>
                      <button 
                          onClick={handleStartPA} className="btn btn-primary btn-start-pa"
                          disabled={isLoading || !isEhrDataAvailable}
                      >
-                         {isLoading ? "Starting..." : `Request Prior Auth (v3)`}
+                         {isLoading ? "Starting..." : `Request Prior Auth`}
                      </button>
                      {!isEhrDataAvailable && <p className="status-message status-warning">Waiting for EHR data...</p>}
                  </div>
@@ -558,7 +570,6 @@ const Orders3Tab: React.FC = () => {
                             hasBundle={!!session.bundle}
                             lastError={session.lastError}
                         />
-                        {/* --- NEW: Render Scratchpad --- */} 
                         <ScratchpadDisplay blocks={session.scratchpad} />
 
                         <EndorsedSnippetsDebugInfo snippets={session.endorsedSnippets} />

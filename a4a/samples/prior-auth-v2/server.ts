@@ -1,16 +1,15 @@
-
-// Import V2 Core and relevant components from library source
-import {
-    InMemoryTaskStore
-} from '../../src';
-import { SseConnectionManager } from '../../src/core/SseConnectionManager';
 // Import only necessary types for config
 
 import { priorAuthAgentCardPartial } from './agentCard';
 import { PriorAuthProcessor } from './PriorAuthProcessor';
 
-// --- Import V2 Server Helper --- //
-import { A2AServerConfigV2, startA2AExpressServerV2 } from '../../src/express/serverV2';
+
+import {
+    InMemoryTaskStore,
+    A2AServerConfigV2,
+    startA2AExpressServerV2
+} from '@jmandel/a2a-bun-express-server'; 
+
 
 // --- Configuration --- //
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -21,7 +20,6 @@ const RPC_PATH = '/a2a';
 // --- Instantiate Core Components --- //
 
 const taskStore = new InMemoryTaskStore();
-const notificationService = new SseConnectionManager();
 const priorAuthProcessor = new PriorAuthProcessor();
 
 // --- Configure Server using V2 Helper --- //
@@ -29,12 +27,10 @@ const coreConfig: A2AServerConfigV2 = {
     agentCard: priorAuthAgentCardPartial, // OK: Partial Agent Card
     taskStore: taskStore,
     taskProcessors: [priorAuthProcessor], // OK: V2 Processor
-    notificationServices: [notificationService],
     port: PORT,
     baseUrl: BASE_URL, // Optional: Helper defaults to localhost:PORT
     rpcPath: RPC_PATH, // Optional: Helper defaults to /a2a
     // agentCardPath: AGENT_CARD_PATH, // Optional: Helper defaults
-    // serverCapabilities: { streaming: true }, // Optional: Let core derive from notificationServices
     // getAuthContext: myAuthFunction, // Optional: Add if auth is needed
     // configureApp: (app, core, completeAgentCard) => { // Optional: Add custom routes/middleware
     //    app.get('/custom-route', (req, res) => res.send('Hello!'));

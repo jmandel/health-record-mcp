@@ -20,10 +20,8 @@ export { ProcessorCancellationError } from './interfaces/processorV2';
 export * from './persistence/InMemoryTaskStore';
 
 // Export Core Logic
-export { A2AServerCore } from './core/A2AServerCore';
-export { A2AServerCoreV2 } from './core/A2AServerCoreV2';
+export { A2AServerCoreLite } from './core/A2AServerCoreLite';
 
 // Export Express Integration
-export * from './express/handlers';
-export * from './express/serverSetup';
 export * from './express/serverV2';
+export * from './core/SseConnectionManager'

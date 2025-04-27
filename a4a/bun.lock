@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "@a2a/bun-express",
+      "name": "@jmandel/a2a-bun-express-server",
       "dependencies": {
         "async-mutex": "^0.5.0",
         "cors": "^2.8.5",

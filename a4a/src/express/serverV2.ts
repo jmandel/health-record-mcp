@@ -176,8 +176,12 @@ export function startA2AExpressServerV2(config: A2AServerConfigV2): http.Server 
     agentDefinition.url = finalAgentUrl;
 
     // --- Determine Notification Services --- 
-    // Check capabilities defined in the partial card first
-    const streamingEnabled = agentDefinition.capabilities?.streaming ?? serverCapabilities?.streaming ?? false;
+    // Streaming is considered ENABLED by default.
+    // If either the partial AgentCard *or* the serverCapabilities object explicitly sets
+    // `streaming` to **false**, we disable it.  Any `undefined` (absent) value is treated
+    // the same as `true` (i.e. we assume streaming *is* desired).
+    const streamingConfigFlag = agentDefinition.capabilities?.streaming ?? serverCapabilities?.streaming;
+    const streamingEnabled = streamingConfigFlag !== false;
     let servicesToUse = configNotificationServices;
     if ((!servicesToUse || servicesToUse.length === 0) && streamingEnabled) {
         console.log("[A2A Setup V2] No notification services provided but streaming enabled; adding default SseConnectionManager.");

@@ -14,7 +14,7 @@ import NotesTab from './components/ehr/NotesTab';
 // import OrderEntryTab from './components/ehr/OrderEntryTab';
 import BillingTab from './components/ehr/BillingTab';
 import TasksTab from './components/ehr/TasksTab';
-import OrdersTab from './components/ehr/Orders2Tab';
+// import OrdersTab from './components/ehr/Orders2Tab';
 import Orders3Tab from './components/ehr/Orders3Tab';
 import { PatientSwitcherDropdown } from './components/PatientSwitcherDropdown';
 
@@ -38,7 +38,7 @@ export interface FullEHR {
 // --- Main App Component Structure ---
 
 // Define Tab Structure
-type TabName = 'Demographics' | 'Medications' | 'Labs' | 'Imaging' | 'Notes' | 'Orders' | 'Orders3' | 'Tasks' | 'Billing';
+type TabName = 'Demographics' | 'Medications' | 'Labs' | 'Imaging' | 'Notes' | 'Orders' | 'Tasks' | 'Billing';
 interface TabConfig {
     id: TabName;
     label: string;
@@ -49,8 +49,7 @@ const TABS_CONFIG: TabConfig[] = [ // Use TABS_CONFIG consistently
     { id: 'Labs', label: 'Labs' },
     { id: 'Imaging', label: 'Imaging' },
     { id: 'Notes', label: 'Notes' },
-    { id: 'Orders', label: 'Orders (v2)' },
-    { id: 'Orders3', label: 'Orders (v3)' },
+    { id: 'Orders', label: 'Orders' },
     { id: 'Tasks', label: 'Tasks' },
     { id: 'Billing', label: 'Billing' },
 ];
@@ -62,8 +61,7 @@ const tabContent: Record<TabName, React.ReactNode> = {
     Labs: <LabsTab />,
     Imaging: <ImagingTab />,
     Notes: <NotesTab />,
-    Orders: <OrdersTab />,
-    Orders3: <Orders3Tab />,
+    Orders: <Orders3Tab />,
     Tasks: <TasksTab />,
     Billing: <BillingTab />,
 };
@@ -76,7 +74,7 @@ function EhrAppContent() {
         isFileLoadRequested, clearFileLoadRequest // NEW context values
     } = useEhrContext();
     // Set initial active tab to 'Orders3' to default to the new one
-    const [activeTab, setActiveTab] = useState<TabName>('Orders3'); 
+    const [activeTab, setActiveTab] = useState<TabName>('Orders'); 
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [fileLoadError, setFileLoadError] = useState<string | null>(null);
 

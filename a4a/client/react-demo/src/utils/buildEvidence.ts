@@ -98,9 +98,16 @@ export const filterFhirDataBySources = (
     if (!fullFhirData) return filteredData;
 
     fhirSources.forEach(sourceString => {
+        // --- Skip non-FHIR sources --- 
+        if (sourceString.startsWith('QuestionnaireResponse/')) {
+            console.log(`[buildEvidence] Skipping QuestionnaireResponse source: ${sourceString}`);
+            return; // Ignore these pseudo-sources for FHIR filtering
+        }
+        // -------------------------
+
         const [resourceType, resourceId] = sourceString.split('/');
         if (!resourceType || !resourceId) {
-            console.warn(`Invalid fhirSource format encountered: ${sourceString}`);
+            console.warn(`[buildEvidence] Invalid fhirSource format encountered: ${sourceString}`);
             return; // Skip invalid formats
         }
 
@@ -116,10 +123,10 @@ export const filterFhirDataBySources = (
                     filteredData[resourceType].push(matchingResource);
                 }
             } else {
-                 console.warn(`FHIR resource not found in ehrData: ${sourceString}`);
+                 console.warn(`[buildEvidence] FHIR resource not found in ehrData: ${sourceString}`);
             }
         } else {
-             console.warn(`Resource type not found in ehrData for source: ${sourceString}`);
+             console.warn(`[buildEvidence] Resource type not found in ehrData for source: ${sourceString}`);
         }
     });
 
@@ -155,22 +162,21 @@ const mapClinicianSnippetsToAttachments = (
     localSnippets: Record<string, { title: string; content: string; endorsed: boolean }>
 ): ProcessedAttachment[] => {
     return Object.entries(localSnippets)
-        .filter(([key, snippet]) => snippet.content && snippet.content.trim() !== '')
-        .map(([key, snippet], index) => {
-             // Create a ProcessedAttachment-like object
+        // Ensure we only include endorsed snippets with actual content
+        .filter(([key, snippet]) => snippet.endorsed && snippet.content && snippet.content.trim() !== '')
+        .map(([key, snippet]) => { // Key is the questionId
+             // Create a ProcessedAttachment-like object using QuestionnaireResponse convention
              const attachment: ProcessedAttachment = {
-                 // Use placeholder values for FHIR source details
-                 resourceType: "ClinicianSnippet", // Placeholder type
-                 resourceId: `clinician-snippet-${key || index}`, // Generate an ID
-                 path: "content", // Placeholder path
+                 resourceType: "QuestionnaireResponse", 
+                 resourceId: key,                      
+                 path: "text.div", 
                  contentType: "text/plain",
                  contentPlaintext: snippet.content,
-                 // Create minimal JSON representing the snippet details
                  json: JSON.stringify({ 
                      title: snippet.title, 
                      endorsed: snippet.endorsed, 
                      originalKey: key 
-                 }) 
+                 })
              };
              return attachment;
         });

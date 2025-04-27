@@ -1,5 +1,5 @@
 {
-  "name": "@a2a/client",
+  "name": "@jmandel/a2a-client",
   "version": "0.1.1",
   "type": "module",
   "private": true,

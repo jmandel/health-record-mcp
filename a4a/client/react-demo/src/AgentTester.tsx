@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { useTaskLiaison } from './hooks/useTaskLiaison';
-import { Message, Task, TextPart, Part } from '@a2a/client/src/types'; // A2A types
+import { Message, Task, TextPart, Part } from '@jmandel/a2a-client/src/types'; // A2A types
 import './App.css'; // Reuse existing styles for now
 
 // Default to the prior auth agent, assuming it's running on 3001

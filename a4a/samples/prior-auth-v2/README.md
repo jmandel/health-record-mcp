@@ -17,7 +17,7 @@ This directory contains an example A2A agent that handles prior authorization re
 
 *   Bun runtime installed.
 *   Node.js environment (for dependencies if not using Bun exclusively).
-*   Access to the `@a2a/bun-express` library (likely linked locally from the parent `a4a` directory or published).
+*   Access to the `@jmandel/a2a-bun-express-server` library (likely linked locally from the parent `a4a` directory or published).
 *   A Google Gemini API Key.
 
 ## Setup
@@ -28,7 +28,7 @@ This directory contains an example A2A agent that handles prior authorization re
     bun install 
     # or npm install / yarn install
     ```
-2.  **Link Library (if necessary):** If `@a2a/bun-express` is developed locally in the parent `a4a` directory, ensure it's correctly linked or accessible via relative paths (as currently configured in the source files).
+2.  **Link Library (if necessary):** If `@jmandel/a2a-bun-express-server` is developed locally in the parent `a4a` directory, ensure it's correctly linked or accessible via relative paths (as currently configured in the source files).
 3.  **Set Environment Variable:** Set the `GEMINI_API_KEY` environment variable:
     ```bash
     export GEMINI_API_KEY="YOUR_API_KEY_HERE"

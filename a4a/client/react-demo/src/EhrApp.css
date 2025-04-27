@@ -311,6 +311,7 @@ body {
     flex-grow: 1; /* Allow content to fill remaining space */
     display: flex;
     flex-direction: column;
+    min-width: 1000px;
 }
 
 nav.tabs { 

@@ -1,16 +1,22 @@
-import type { Message } from "@a2a/client/src/types";
+import type { Message } from "@jmandel/a2a-client/src/types";
 import type { Content } from "@google/genai";
 import type { Answer, ClinicianQuestion, ProposedSnippet as Snippet, ScratchpadBlock } from "../types/priorAuthTypes";
 import type { PackageBundle } from "./engineTypes";
 import * as llmPipeline from "../utils/llmPipeline";
 import { SYSTEM_PROMPT, type LlmTurn } from "../utils/llmPipeline";
 import type { EhrSearchFn } from "../hooks/useEhrSearch";
+import mitt from 'mitt';
 
 // Define internal engine phases (distinct from PaSession phases)
 type EnginePhase = "idle" | "waitingUser" | "running" | "done" | "error";
 
-// --- Define the System Prompt directly in MiniEngine ---
-const MINI_ENGINE_SYSTEM_PROMPT = `...`; // Keep prompt definition (shortened for brevity)
+// Define event type for emitter
+export type EngineEvent =
+  | { type: 'ask'; questions: ClinicianQuestion[] }
+  | { type: 'pack'; bundle: PackageBundle }
+  | { type: 'error'; message: string; fatal: boolean }
+  | { type: 'search'; keywords: string[] }
+  | { type: 'scratchpad'; blocks: ScratchpadBlock[] };
 
 /** THREE-PHASE async engine — revised to manage history */
 export class MiniEngine {
@@ -24,6 +30,10 @@ export class MiniEngine {
   private patientDetails: string = "";
   private treatment: string = "";
   private indication: string = "";
+
+  // Inside class MiniEngine
+  // Modify the class definition to include emitter
+  private emitter = mitt<EngineEvent>();
 
   /* external observers plug these in during construction */
   constructor(

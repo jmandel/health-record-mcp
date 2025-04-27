@@ -1,4 +1,4 @@
-import { DataPart, Message, Task, TextPart } from '@a2a/client/src/types';
+import { DataPart, Message, Task, TextPart } from '@jmandel/a2a-client/src/types';
 import { FunctionCallingConfigMode, FunctionDeclaration, GoogleGenAI, Type } from '@google/genai';
 import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { useEhrContext } from '../../context/EhrContext';

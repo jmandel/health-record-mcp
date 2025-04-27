@@ -1,5 +1,5 @@
 {
-  "name": "@a2a/bun-express",
+  "name": "@jmandel/a2a-bun-express-server",
   "version": "0.1.1",
   "description": "Library for building A2A Agent Servers on Bun with Express (runs TS directly)",
   "main": "./src/index.ts",

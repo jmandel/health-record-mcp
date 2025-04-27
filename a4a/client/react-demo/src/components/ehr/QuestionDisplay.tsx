@@ -31,13 +31,16 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ // Added export
   );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Effect to initialize state (copied)
+  // Effect to initialize state based on currentAnswer prop and question type
+  // --- Run this effect primarily when the question ID changes --- 
   useEffect(() => {
+    console.log(`[QuestionCard ${question.id}] Initializing state from prop:`, currentAnswer);
     const answerValue = currentAnswer?.value;
     const answerSnippet = currentAnswer?.snippet || "";
     setSnippetContent(answerSnippet);
 
-    if (question.questionType === 'numeric') {
+    // Initialize value states based on question type and initial answer prop
+    if (question.questionType === 'numeric') { 
         setInputValue(answerValue || "");
         setSelectedLabel(undefined);
         setSelectedMultiValues(new Set()); 
@@ -50,40 +53,60 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ // Added export
                     const maxOk = sub.max === undefined || numValue <= sub.max;
                     return minOk && maxOk;
                 });
-                if (matchingSubRange?.proposedSnippet) { // Check if proposedSnippet exists
+                if (matchingSubRange?.proposedSnippet) {
                     initialSnippet = matchingSubRange.proposedSnippet.content.replace('{{value}}', answerValue);
                 }
             }
         }
-        setSnippetContent(initialSnippet);
+        setSnippetContent(initialSnippet); // Set initial snippet too
     } else if (question.questionType === 'freeText') {
         setInputValue(answerValue || "");
         setSelectedLabel(undefined);
         setSelectedMultiValues(new Set());
-        if (!answerSnippet) setSnippetContent("");
+        // No automatic snippet init for free text unless provided
     } else if (question.questionType === 'multipleSelect') {
         setInputValue("");
         setSelectedLabel(undefined);
+        // Initialize Set based on comma-separated value prop
         const initialMulti = new Set(answerValue ? answerValue.split(',').map(s => s.trim()).filter(Boolean) : []);
         setSelectedMultiValues(initialMulti);
-        if (!answerSnippet && question.multiSelectSnippet && initialMulti.size > 0) {
+        // Initialize snippet based on initial selection or saved snippet
+        let initialSnippet = answerSnippet;
+        if (!initialSnippet && question.multiSelectSnippet && initialMulti.size > 0 && !initialMulti.has("None of the above")) {
             const choicesString = Array.from(initialMulti).join(', ');
-            setSnippetContent(question.multiSelectSnippet.content.replace('$CHOICES', choicesString));
+            initialSnippet = question.multiSelectSnippet.content.replace('$CHOICES', choicesString);
+        } else if (!initialSnippet && initialMulti.has("None of the above") && initialMulti.size === 1) {
+             const noneOption = question.options?.find(o => o.label === "None of the above");
+             initialSnippet = noneOption?.proposedSnippet?.content || "";
         }
+        setSnippetContent(initialSnippet); // Set initial snippet
     } else { // boolean or multipleChoice
-        setSelectedLabel(answerValue);
         setInputValue("");
         setSelectedMultiValues(new Set());
-        if (answerValue) {
+        setSelectedLabel(answerValue); // Set initial radio selection
+        // Initialize snippet based on initial selection or saved snippet
+        let initialSnippet = answerSnippet;
+        if (answerValue && !initialSnippet) { // If selection exists and no snippet saved
             const opt = question.options?.find(o => o.label === answerValue);
-            if (!answerSnippet) {
-                setSnippetContent(opt?.proposedSnippet?.content || "");
-            }
-        } else {
-            if (!answerSnippet) setSnippetContent("");
+            initialSnippet = opt?.proposedSnippet?.content || "";
         }
+        setSnippetContent(initialSnippet); // Set initial snippet
     }
-  }, [currentAnswer, question]);
+  // --- Depend only on question.id to re-initialize when the question changes --- 
+  //}, [currentAnswer, question]);
+  }, [question.id]); // Re-run ONLY when the question itself changes
+
+  // --- Separate Effect to sync snippetContent IF prop changes independently --- 
+  // This handles cases where snippet might be updated externally (less common)
+  useEffect(() => {
+      const answerSnippet = currentAnswer?.snippet;
+      // Only update if the prop snippet is defined and different from current state
+      if (answerSnippet !== undefined && answerSnippet !== snippetContent) {
+          console.log(`[QuestionCard ${question.id}] Syncing snippet content from prop:`, answerSnippet);
+          setSnippetContent(answerSnippet);
+      }
+      // Depend on the snippet part of the prop and the question ID
+  }, [currentAnswer?.snippet, question.id, snippetContent]); 
 
   // handleRadioSelection (copied)
   const handleRadioSelection = (event: React.ChangeEvent<HTMLInputElement>) => {

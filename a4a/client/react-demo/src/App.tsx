@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { useTaskLiaison } from './hooks/useTaskLiaison';
-import { Message, TextPart, Task, DataPart } from '@a2a/client/src/types'; // A2A types
+import { Message, TextPart, Task, DataPart } from '@jmandel/a2a-client/src/types'; // A2A types
 import './App.css'; // Keep default styling for now
 
 const JOKE_AGENT_URL = 'http://localhost:3100/a2a'; // Make sure your sample agent runs here

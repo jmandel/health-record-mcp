@@ -1,4 +1,4 @@
-import type { AgentCard } from '@a2a/bun-express';
+import type { AgentCard } from '@jmandel/a2a-bun-express-server';
 
 // Define the agent card
 // Note: The server setup function will merge this with server-specific capabilities/URLs.

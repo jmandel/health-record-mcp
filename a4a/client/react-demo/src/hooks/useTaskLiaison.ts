@@ -2,16 +2,16 @@
 
 import { Dispatch, useCallback, useEffect, useMemo, useReducer } from 'react';
 // Assuming A2AClient resolves to the correct V2 client in your environment
-// import { A2AClient } from '@a2a/client';
+// import { A2AClient } from '@jmandel/a2a-client';
 // Use corrected imports for V2 client file
-import { A2AClient } from '@a2a/client/src/A2AClientV2';
+import { A2AClient } from '@jmandel/a2a-client/src/A2AClientV2';
 import {
     AgentCard, // Needed for start/resume
     JsonRpcError,
     Message,
     Task,
     TaskStatus
-} from '@a2a/client/src/types';
+} from '@jmandel/a2a-client/src/types';
 import { v4 as uuid } from 'uuid'; // Use uuid for ID generation
 
 // --- State & Action Types ---

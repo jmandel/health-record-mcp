@@ -13,7 +13,7 @@ import type {
     TextPart, 
     DataPart, 
     Artifact 
-} from '@a2a/bun-express'; 
+} from '@jmandel/a2a-bun-express-server'; 
 // Import the Google Generative AI library
 import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from '@google/genai';
 

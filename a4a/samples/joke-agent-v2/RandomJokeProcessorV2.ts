@@ -10,7 +10,7 @@ import type {
     Task, 
     TextPart, 
     Artifact 
-} from '@a2a/bun-express';
+} from '@jmandel/a2a-bun-express-server';
 
 const RANDOM_JOKES: string[] = [
     "Why don't scientists trust atoms? Because they make up everything!",

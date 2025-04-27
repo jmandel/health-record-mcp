@@ -1,6 +1,6 @@
 import mitt from "mitt";
-import { A2AClient } from "@a2a/client/src/A2AClientV2";
-import type { Message, Task, Artifact } from "@a2a/client/src/types";
+import { A2AClient } from "@jmandel/a2a-client/src/A2AClientV2";
+import type { Message, Task, Artifact } from "@jmandel/a2a-client/src/types";
 import type { Answer, ClinicianQuestion, ProposedSnippet, ScratchpadBlock } from "../types/priorAuthTypes";
 import { MiniEngine } from "../engine/MiniEngine";
 import type { PackageBundle } from "../engine/engineTypes";
@@ -174,7 +174,7 @@ export class PaSession {
       // --- NEW: onSearch callback implementation --- 
       (keywords: string[]) => {
           console.log(`[PaSession ${this.id}] Engine initiated search:`, keywords);
-          this.searchHistory.push({ keywords, timestamp: Date.now() });
+          this.searchHistory = [...this.searchHistory, { keywords, timestamp: Date.now() }];
           this.bump(); // Notify UI about the search history update
       },
       // --- NEW: onScratchpadUpdate implementation --- 
@@ -266,17 +266,8 @@ export class PaSession {
       if (lastAgentMsg && t.status.state === "input-required") {
           console.log(`[PaSession ${this.id}] Processing agent message while in phase: ${this.phase}`);
           this.eng.onAgent(lastAgentMsg);
-      } else if (t.status.state === 'input-required' && !lastAgentMsg) {
-          // This case might indicate an issue with the agent or history
-          console.warn(`[PaSession ${this.id}] Task requires input, but no agent message found in history.`);
-          // Consider setting an error state or handling differently
-          this.phase = 'error';
-          this.lastError = 'Task requires input, but no message provided.';
-          stateChanged = true; // Mark state as changed
-          this.bump();
       }
-      // Note: No explicit phase change here for non-terminal updates.
-      // The phase will change based on engine callbacks (onAsk, onPack, onErr).
+      this.bump();
     });
     
     this.client.on("error", (err: any) => {

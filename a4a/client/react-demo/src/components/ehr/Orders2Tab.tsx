@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEhrContext } from "../../context/EhrContext";
 // A2A Imports
-import type { Artifact, FilePart, Message, Part } from '@a2a/client/src/types'; // Keep Message, Part, TaskStatus
+import type { Artifact, FilePart, Message, Part } from '@jmandel/a2a-client/src/types'; // Keep Message, Part, TaskStatus
 import { useTaskLiaison } from "../../hooks/useTaskLiaison";
 // Import types from the new shared location
 import type {
