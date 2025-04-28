@@ -99,12 +99,14 @@
         // Define the URL for the retriever page
         // IMPORTANT: Adjust the path if this caller html is not in the same directory
         const retrieverUrlBase = './ehretriever.html';
+        // Optionally filter organizations by brand tag, e.g., "sandbox"
+        const desiredTag = 'sandbox';
 
         // Get this window's origin - this MUST be sent to the retriever
         const callerOrigin = window.location.origin;
 
-        // Construct the final URL with the hash for opener delivery
-        const retrieverUrlWithHash = `${retrieverUrlBase}#deliver-to-opener:${callerOrigin}`;
+        // Construct the final URL with the hash for opener delivery and desired tag filter
+        const retrieverUrlWithHash = `${retrieverUrlBase}?brandTags=${encodeURIComponent(desiredTag)}#deliver-to-opener:${callerOrigin}`;
 
         launchButton.addEventListener('click', () => {
             if (retrieverWindow && !retrieverWindow.closed) {

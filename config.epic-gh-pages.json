@@ -1,11 +1,25 @@
 {
   "retrieverConfig": {
-    "vendorConfig": {
-      "epic": {
-        "clientId": "012662a7-8a52-4b22-8252-f58b9b52e8c9",
-        "scopes": "patient/*.rs",
-        "redirectUrl": "https://mcp.fhir.me/ehr-callback"
+    "brandFiles": [
+      {
+        "url": "./brands/epic.json",
+        "tags": ["epic", "prod"],
+        "vendorConfig": {
+          "clientId": "012662a7-8a52-4b22-8252-f58b9b52e8c9",
+          "scopes": "patient/*.rs",
+          "redirectUrl": "https://mcp.fhir.me/ehr-callback"
+        }
+      },
+      {
+        "url": "./brands/epic-sandbox.json",
+        "tags": ["epic", "sandbox"],
+        "vendorConfig": {
+          "clientId": "6a424079-77de-418b-94c7-485d08ffc3f7",
+          "scopes": "patient/*.rs",
+          "redirectUrl": "https://mcp.fhir.me/ehr-callback",
+          "note": "Username 'fhircamila', Password 'epicepic1'"
+        }
       }
-    }
+    ]
   }
 } 

@@ -1,15 +1,22 @@
 {
-  "deliveryEndpoints": {
-    "mcp-callback": {
-      "postUrl": "/ehr-retriever-callback"
-    }
-  },
-  "ehr": {
-    "fhirBaseUrl": "https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4/",
-    "clientId": "45310fa2-e74c-4b3c-96e3-74202b700ea0",
-    "authUrl": null,
-    "tokenUrl": null,
-    "requiredScopes": [ "patient/*.rs" ]
+  "retrieverConfig": {
+    "deliveryEndpoints": {
+      "mcp-callback": {
+        "postUrl": "/ehr-retriever-callback"
+      }
+    },
+    "brandFiles": [
+      {
+        "url": "./brands/epic-sandbox.json",
+        "tags": ["epic", "prod"],
+        "vendorConfig": {
+          "clientId": "6a424079-77de-418b-94c7-485d08ffc3f7",
+          "scopes": "patient/*.rs",
+          "redirectUrl": "https://healthsearch.snarked.com:8443/ehr-callback",
+          "note": "Username 'fhircamila', Password 'epicepic1'"
+        }
+      }
+    ]
   },
   "server": {
     "host": "localhost",

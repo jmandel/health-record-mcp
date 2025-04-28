@@ -5,13 +5,17 @@
         "postUrl": "/ehr-retriever-callback"
       }
     },
-    "vendorConfig": {
-      "epic": {
-        "clientId": "012662a7-8a52-4b22-8252-f58b9b52e8c9",
-        "scopes": "patient/*.rs",
-        "redirectUrl": "https://healthsearch.snarked.com:8443/ehr-callback"
+    "brandFiles": [
+      {
+        "url": "./brands/epic.json",
+        "tags": ["epic", "prod"],
+        "vendorConfig": {
+          "clientId": "012662a7-8a52-4b22-8252-f58b9b52e8c9",
+          "scopes": "patient/*.rs",
+          "redirectUrl": "https://healthsearch.snarked.com:8443/ehr-callback"
+        }
       }
-    }
+    ]
   },
   "server": {
     "host": "localhost",

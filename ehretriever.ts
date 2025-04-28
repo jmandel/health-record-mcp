@@ -6,8 +6,9 @@ declare const __CONFIG_FHIR_BASE_URL__: string | undefined;
 declare const __CONFIG_CLIENT_ID__: string | undefined;
 declare const __CONFIG_SCOPES__: string | undefined;
 declare const __DELIVERY_ENDPOINTS__: Record<string, { postUrl: string}> | undefined;
-// NEW VENDOR CONFIG DECLARATION
-declare const __VENDOR_CONFIG__: Record<string, { clientId: string; scopes: string; redirectUrl?: string }> | undefined;
+// NEW BRAND INDEX CONSTANT (injected at build time)
+// Structure: Array of { url: string; tags: string[]; vendorConfig: { clientId: string; scopes: string; redirectUrl?: string } }
+declare const __BRAND_FILE_INDEX__: { url: string; tags: string[]; vendorConfig: { clientId: string; scopes: string; redirectUrl?: string } }[] | undefined;
 // ----------------------------------------------------------
 
 // Keys for sessionStorage
@@ -67,8 +68,7 @@ let brandDebounceTimer: number | null = null;
 let currentFilteredItems: any[] = [];
 let currentPage = 1;
 const ITEMS_PER_PAGE = 50;
-// NEW: Store the vendor name associated with the currently loaded brand file
-let currentVendorName: string | null = null;
+// Removed single currentVendorName; each brand item will now carry its own _vendorName property
 
 // NEW: Pagination DOM Elements
 let brandPaginationControls: HTMLElement | null;
@@ -330,6 +330,11 @@ function showBrandModal(item: any) {
      } else {
          detailsHTML += `<p><strong>Endpoints:</strong> None found</p>`;
      }
+    // Display sandbox login note if available
+    const vc: VendorAuthConfig | undefined = (item as any)._vendorConfig;
+    if (vc && vc.note) {
+        detailsHTML += `<p style="margin-top:0.8rem;"><em>Login Info:</em> ${vc.note}</p>`;
+    }
     brandModalDetails.innerHTML = detailsHTML;
     brandModalBackdrop.classList.add('visible');
 }
@@ -341,36 +346,27 @@ function hideBrandModal() {
     selectedBrandItem = null;
 }
 
-// *** UPDATED FUNCTION: Initiates the SMART Auth Flow ***
-async function initiateSmartAuth(fhirBaseUrl: string, vendorName: string) {
+interface VendorAuthConfig { clientId: string; scopes: string; redirectUrl?: string; note?: string }
+
+async function initiateSmartAuth(fhirBaseUrl: string, vendorAuthConfig: VendorAuthConfig, vendorLabel: string = 'vendor') {
     // Define the default redirect URI (this page) - Defined here as it's only needed here
     const defaultRedirectUri = window.location.origin + window.location.pathname;
 
-    console.log(`[initiateSmartAuth] Starting for FHIR Base URL: ${fhirBaseUrl}, Vendor: ${vendorName}`);
+    console.log(`[initiateSmartAuth] Starting for FHIR Base URL: ${fhirBaseUrl}, VendorLabel: ${vendorLabel}`);
     showStatusContainer(true);
     showProgressContainer(false);
     updateStatus('Preparing authorization request...');
 
-    // Get vendor-specific configuration
-    const vendorConfig = (typeof __VENDOR_CONFIG__ !== 'undefined' ? __VENDOR_CONFIG__?.[vendorName] : undefined);
-
-    if (!vendorConfig || !vendorConfig.clientId || !vendorConfig.scopes) {
-        updateStatus(`Error: Configuration missing or incomplete for vendor '${vendorName}'. Cannot proceed.`, true);
-        console.error(`Configuration missing or incomplete for vendor '${vendorName}' in __VENDOR_CONFIG__.`, __VENDOR_CONFIG__);
-        showStatusContainer(false); // Hide status
-        if (brandSelectorContainer) brandSelectorContainer.style.display = 'block'; // Show brand selector again
+    const { clientId, scopes, redirectUrl } = vendorAuthConfig;
+    if (!clientId || !scopes) {
+        updateStatus('Error: Missing SMART client configuration (clientId/scopes).', true);
+        console.error('VendorAuthConfig missing fields:', vendorAuthConfig);
         return;
     }
 
-    const clientId = vendorConfig.clientId;
-    const scopes = vendorConfig.scopes;
-    // Use vendor-specific redirectUrl if provided, otherwise default to current page
-    const redirectUri = vendorConfig.redirectUrl ? makeAbsoluteUrl(vendorConfig.redirectUrl) : defaultRedirectUri;
+    const redirectUri = redirectUrl ? makeAbsoluteUrl(redirectUrl) : defaultRedirectUri;
 
-    console.log(`[initiateSmartAuth] Using Vendor Config for '${vendorName}':`);
-    console.log(`  Client ID: ${clientId}`);
-    console.log(`  Scopes: ${scopes}`);
-    console.log(`  Redirect URI: ${redirectUri}`);
+    console.log('[initiateSmartAuth] Using VendorAuthConfig:', vendorAuthConfig);
 
     try {
         updateStatus('Performing SMART discovery...');
@@ -439,55 +435,55 @@ async function initiateSmartAuth(fhirBaseUrl: string, vendorName: string) {
 
 // *** UPDATED FUNCTION: Handles the click on the modal's "Connect" button ***
 function handleBrandConnect() {
-    // Use the globally stored currentVendorName
-    if (!selectedBrandItem || !brandSelectorContainer || !currentVendorName) {
-        console.error("Connect clicked but required elements, selection, or current vendor name missing.");
+    if (!selectedBrandItem || !brandSelectorContainer) {
+        console.error("Connect clicked but required elements or selection missing.");
         hideBrandModal();
         updateStatus("Error: Cannot proceed with connection. Missing information.", true);
-         // Show brand selector again if something is missing
         if (brandSelectorContainer) brandSelectorContainer.style.display = 'block';
+        return;
+    }
+
+    const vendorConfig: VendorAuthConfig | undefined = (selectedBrandItem as any)._vendorConfig;
+    if (!vendorConfig) {
+        console.error("Selected brand item is missing _vendorConfig property.");
+        updateStatus("Error: Selected organization is missing SMART client credentials.", true);
         return;
     }
 
     console.log("--- Brand Connect Button Clicked ---");
     console.log("Selected Item:", selectedBrandItem);
-    console.log(`Using Vendor Name (from source file): ${currentVendorName}`); // Log the vendor name being used
+    console.log('Using vendorConfig:', vendorConfig);
 
-
-    // Find a suitable FHIR endpoint URL (logic remains the same)
+    // Find a suitable FHIR endpoint URL (take the first endpoint)
     let fhirEndpointUrl: string | null = null;
-    if (selectedBrandItem.endpoints && Array.isArray(selectedBrandItem.endpoints)) {
-        const explicitFhirEndpoint = selectedBrandItem.endpoints[0];
-        fhirEndpointUrl = explicitFhirEndpoint.url;
+    if (selectedBrandItem.endpoints && Array.isArray(selectedBrandItem.endpoints) && selectedBrandItem.endpoints.length > 0) {
+        fhirEndpointUrl = selectedBrandItem.endpoints[0].url;
     }
 
-    // Close the modal immediately
+    // Capture label before we possibly clear selectedBrandItem
+    const brandLabel: string = (selectedBrandItem as any).brandName || 'vendor';
+
+    // Close the modal immediately (this will clear selectedBrandItem)
     hideBrandModal();
 
     if (fhirEndpointUrl) {
         console.log(`Found FHIR Endpoint: ${fhirEndpointUrl}`);
-
-        // Hide brand selector
         if (brandSelectorContainer) brandSelectorContainer.style.display = 'none';
-
-        // Initiate the auth flow using the found endpoint and the stored vendor name
-        initiateSmartAuth(fhirEndpointUrl, currentVendorName); // Pass the correct vendor name
-
+        initiateSmartAuth(fhirEndpointUrl, vendorConfig, brandLabel);
     } else {
         console.error("Could not find a suitable FHIR endpoint for the selected organization.");
         updateStatus("Error: Could not find a FHIR endpoint for the selected organization. Please try another.", true);
-        // Show brand selector again if endpoint not found
         if (brandSelectorContainer) brandSelectorContainer.style.display = 'block';
     }
 }
 
-// Fetches the brand data (epic.json) and initializes the selector UI
+// Fetches brand data files based on tag filtering and initializes selector UI
 async function fetchBrandsAndInitialize() {
     console.log("[fetchBrands] Function started.");
 
     if (!brandInitialLoadingMessage || !brandResultsContainer || !brandSearchInput || !brandSearchSpinner || !brandPaginationControls) {
-        console.error("[fetchBrands] Error: One or more required brand selector or pagination DOM elements not found!");
-        if(brandInitialLoadingMessage) {
+        console.error("[fetchBrands] Error: Required DOM elements not found!");
+        if (brandInitialLoadingMessage) {
             brandInitialLoadingMessage.textContent = 'Initialization Error: UI elements missing.';
             brandInitialLoadingMessage.style.color = 'red';
         }
@@ -495,84 +491,113 @@ async function fetchBrandsAndInitialize() {
     }
 
     brandInitialLoadingMessage.textContent = 'Loading organizations data...';
-    if (brandResultsContainer) brandResultsContainer.style.display = 'none';
-    if (brandPaginationControls) brandPaginationControls.style.display = 'none';
+    brandResultsContainer.style.display = 'none';
+    brandPaginationControls.style.display = 'none';
     brandSearchInput.disabled = true;
-    if (brandSearchSpinner) brandSearchSpinner.style.display = 'block';
-    console.log("[fetchBrands] Initial UI state set (loading).");
+    brandSearchSpinner.style.display = 'block';
 
     try {
-        // --- TODO: This needs to be dynamic if supporting multiple vendors ---
-        // For now, hardcoding 'epic' based on the file path
-        const fetchUrl = './brands/epic.json';
-        const vendorMatch = fetchUrl.match(/brands\/(\w+)\.json$/);
-        if (!vendorMatch || !vendorMatch[1]) {
-             throw new Error("Could not determine vendor name from brand data URL.");
-        }
-        currentVendorName = vendorMatch[1].toLowerCase(); // Store the extracted vendor name globally
-        console.log(`[fetchBrands] Determined vendor name: ${currentVendorName}`);
-        // --- End Vendor Determination ---
+        // Determine desired tags from URL (?brandTags=tag1,tag2) or default to ['prod']
+        const urlParams = new URLSearchParams(window.location.search);
+        const tagParam = urlParams.get('brandTags');
 
-        console.log(`[fetchBrands] Attempting to fetch: ${fetchUrl}`)
-        const response = await fetch(fetchUrl);
-        console.log(`[fetchBrands] Fetch response status: ${response.status}`);
-
-        if (!response.ok) {
-             const errorText = await response.text();
-             console.error(`[fetchBrands] Fetch failed! Status: ${response.status}. Response text: ${errorText}`);
-             throw new Error(`HTTP error loading brands! status: ${response.status}`);
-        }
-
-        console.log("[fetchBrands] Fetch successful. Attempting response.json()...");
-        const data = await response.json();
-        console.log("[fetchBrands] JSON parsed successfully.");
-
-        if (data && Array.isArray(data.items)) {
-            console.log(`[fetchBrands] Data structure valid. Found ${data.items.length} items for vendor '${currentVendorName}'.`);
-            allBrandItems = data.items;
-            currentFilteredItems = allBrandItems;
-
-            brandInitialLoadingMessage.style.display = 'none';
-            if (brandResultsContainer) brandResultsContainer.style.display = 'grid';
-            if (brandSearchInput) brandSearchInput.disabled = false;
-
-            currentPage = 1;
-            renderCurrentPage();
-
-            // *** Autofocus the search input ***
-            if (brandSearchInput) {
-                brandSearchInput.focus();
-                console.log("[fetchBrands] Autofocused search input.");
-            }
-
-            // Attach listeners (remains the same)
-            if (brandSearchInput) brandSearchInput.addEventListener('input', debouncedBrandSearchHandler);
-            if (brandModalCancel) brandModalCancel.addEventListener('click', hideBrandModal);
-            if (brandModalConnect) brandModalConnect.addEventListener('click', handleBrandConnect); // Connects to the UPDATED handler
-            if (brandModalBackdrop) brandModalBackdrop.addEventListener('click', (event) => { if (event.target === brandModalBackdrop) { hideBrandModal(); } });
-            if (brandPrevBtn) brandPrevBtn.addEventListener('click', () => { if (currentPage > 1) { currentPage--; renderCurrentPage(); } });
-            if (brandNextBtn) brandNextBtn.addEventListener('click', () => { const totalPages = Math.ceil(currentFilteredItems.length / ITEMS_PER_PAGE); if (currentPage < totalPages) { currentPage++; renderCurrentPage(); } });
-            console.log("[fetchBrands] Event listeners attached.");
-
+        let tagFilterGroups: string[][] = [];
+        if (tagParam) {
+            const orGroups = tagParam.split(',').map(g => g.trim()).filter(Boolean);
+            tagFilterGroups = orGroups.map(group =>
+                group.split('^').map(t => t.trim().toLowerCase()).filter(Boolean)
+            ).filter(group => group.length > 0); // Remove empty groups
+            console.log(`[fetchBrands] Applying tag filters (OR groups of AND tags):`, tagFilterGroups);
         } else {
-             console.error("[fetchBrands] Error: Invalid data structure received from epic.json. 'items' array not found.", data);
-             throw new Error("Invalid data structure in epic.json");
+            // Default behavior if no tags specified: require 'prod' tag
+            tagFilterGroups = [['prod']];
+            console.log(`[fetchBrands] No tags specified, defaulting to requiring 'prod' tag.`);
         }
+
+        // Validate brand file index constant
+        const brandIndex = (typeof __BRAND_FILE_INDEX__ !== 'undefined' && Array.isArray(__BRAND_FILE_INDEX__)) ? __BRAND_FILE_INDEX__ : [];
+        if (brandIndex.length === 0) {
+            throw new Error('No brand index entries provided');
+        }
+
+        // Filter brand files based on the parsed tag groups
+        const filesToLoad = brandIndex.filter(entry => {
+            if (tagFilterGroups.length === 0) {
+                // If tagParam was present but resulted in no valid groups, show nothing.
+                // If tagParam was absent, the default [[prod]] was used, so this case shouldn't be hit unless default changes.
+                return false;
+            }
+            const entryTagsLower = entry.tags.map(t => t.toLowerCase());
+            // Check if *any* OR group is satisfied
+            return tagFilterGroups.some(andGroup =>
+                // Check if *all* tags within the AND group are present in the entry's tags
+                andGroup.every(requiredTag => entryTagsLower.includes(requiredTag))
+            );
+        });
+        if (filesToLoad.length === 0) {
+            throw new Error(`No brand files matched desired tags: ${tagFilterGroups.map(group => group.join(', ')).join(', ')}`);
+        }
+
+        console.log(`[fetchBrands] Loading ${filesToLoad.length} brand files...`);
+
+        // Fetch all brand files in parallel
+        const filePromises = filesToLoad.map(async entry => {
+            try {
+                const response = await fetch(entry.url);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const json = await response.json();
+                if (!json || !Array.isArray(json.items)) throw new Error('Invalid structure: items array missing');
+                // Annotate each item with vendor name for later vendor config lookup
+                json.items.forEach((itm: any) => (itm._vendorConfig = entry.vendorConfig));
+                return json.items;
+            } catch (e: any) {
+                console.error(`[fetchBrands] Failed to load brand file '${entry.url}':`, e);
+                return [];
+            }
+        });
+
+        const brandItemsArrays = await Promise.all(filePromises);
+        console.log(`[fetchBrands] Loaded ${brandItemsArrays.length} brand files.`, brandItemsArrays);
+        const aggregatedItems: any[] = ([] as any[]).concat(...brandItemsArrays);
+
+        if (aggregatedItems.length === 0) {
+            throw new Error('No organization records loaded from brand files.');
+        }
+
+        console.log(`[fetchBrands] Loaded ${aggregatedItems.length} organization records from brand files.`);
+
+        allBrandItems = aggregatedItems;
+        currentFilteredItems = allBrandItems;
+
+        brandInitialLoadingMessage.style.display = 'none';
+        brandResultsContainer.style.display = 'grid';
+        brandSearchInput.disabled = false;
+
+        currentPage = 1;
+        renderCurrentPage();
+
+        // Autofocus search input
+        brandSearchInput.focus();
+
+        // Attach listeners
+        brandSearchInput.addEventListener('input', debouncedBrandSearchHandler);
+        if (brandModalCancel) brandModalCancel.addEventListener('click', hideBrandModal);
+        if (brandModalConnect) brandModalConnect.addEventListener('click', handleBrandConnect);
+        if (brandModalBackdrop) brandModalBackdrop.addEventListener('click', (event) => { if (event.target === brandModalBackdrop) hideBrandModal(); });
+        if (brandPrevBtn) brandPrevBtn.addEventListener('click', () => { if (currentPage > 1) { currentPage--; renderCurrentPage(); } });
+        if (brandNextBtn) brandNextBtn.addEventListener('click', () => { const totalPages = Math.ceil(currentFilteredItems.length / ITEMS_PER_PAGE); if (currentPage < totalPages) { currentPage++; renderCurrentPage(); } });
 
     } catch (error: any) {
-        console.error("[fetchBrands] Error during fetch or processing:", error);
-        if(brandInitialLoadingMessage) {
-            brandInitialLoadingMessage.textContent = `Error loading organizations. Please try again later. (${error.message})`;
+        console.error('[fetchBrands] Error:', error);
+        if (brandInitialLoadingMessage) {
+            brandInitialLoadingMessage.textContent = `Error loading organizations: ${error.message}`;
             brandInitialLoadingMessage.style.color = 'red';
         }
-        if (brandResultsContainer) brandResultsContainer.style.display = 'none';
-        if (brandSearchInput) brandSearchInput.disabled = true;
-         // Reset vendor name on error
-        currentVendorName = null;
+        brandResultsContainer.style.display = 'none';
+        brandSearchInput.disabled = true;
 
     } finally {
-         if (brandSearchSpinner) brandSearchSpinner.style.display = 'none';
-         console.log("[fetchBrands] Function finished (finally block).");
+        brandSearchSpinner.style.display = 'none';
     }
 }
 

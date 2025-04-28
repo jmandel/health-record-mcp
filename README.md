@@ -40,6 +40,13 @@ This project includes a self-contained web application that allows users to conn
 *   **Hosted Version:** You can use a publicly hosted version at: \
     [`https://mcp.fhir.me/ehr-connect#deliver-to-opener:$origin`](https://mcp.fhir.me/ehr-connect#deliver-to-opener:$origin) \
     (Replace `$origin` with the actual origin of the window that opens this link).
+*   **Filtering Brands (`?brandTags`):** You can filter the list of EHR providers shown on the connection page by adding the `brandTags` query parameter to the URL. Provide a comma-separated list of tags. Only brands matching *all* provided tags (from their configuration in `brandFiles`) will be displayed.
+    It supports both OR (comma-separated) and AND (caret `^` separated) logic, with AND taking precedence.
+    *   `?brandTags=epic,sandbox`: Shows brands tagged with `epic` OR `sandbox`.
+    *   `?brandTags=epic^dev`: Shows brands tagged with both `epic` AND `dev`.
+    *   `?brandTags=epic^dev,sandbox^prod`: Shows brands tagged with (`epic` AND `dev`) OR (`sandbox` AND `prod`).
+    *   If the parameter is omitted, it defaults to showing brands tagged with `prod`.
+    *   Example: `.../ehr-connect?brandTags=hospital^us`: Shows brands tagged with `hospital` AND `us`.
 *   **How it Works:** When opened, this page prompts the user to select their EHR provider. It then initiates the standard SMART App Launch flow, redirecting the user to their EHR's login page. After successful authentication and authorization, the client fetches a comprehensive set of FHIR resources (Patient, Conditions, Observations, Medications, Documents, etc.) and attempts to extract plaintext from any associated attachments (like PDFs, RTF, HTML found in `DocumentReference`).
 *   **Data Output (`ClientFullEHR`):** Once fetching is complete, the client gathers all the data into a `ClientFullEHR` JSON object. This object contains:
     *   `fhir`: A dictionary where keys are FHIR resource types (e.g., "Patient") and values are arrays of the corresponding FHIR resources.
@@ -62,6 +69,10 @@ This mode is ideal for running the MCP server locally, often used with tools lik
         # Example: Start the MCP server using the saved data
         bun run src/cli.ts --db ./data/my_record.sqlite
         ```
+    *   **Configuration (`config.*.json`):** This process relies on a configuration file (e.g., `config.epicsandbox.json`) which defines available EHR brands/endpoints in a `brandFiles` array. Each entry in this array specifies the brand's details, including:
+        *   `url`: Path/URL to the brand definition file (like `static/brands/epic-sandbox.json`).
+        *   `tags`: An array of strings (e.g., `["epic", "sandbox"]`) used for categorization or filtering.
+        *   `vendorConfig`: Contains SMART on FHIR client details (`clientId`, `scopes`).
 *   **Client Configuration (e.g., Cursor):** Configure your MCP client to execute this command. **Crucially, use absolute paths** for both `src/cli.ts` and the database file.
     ```json
     {

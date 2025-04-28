@@ -69,6 +69,54 @@ async function main() {
     // --- Now extract defines from the final merged config ---
     console.log('Extracting defines from final configuration...');
 
+    // --- Inject Brand File Index ---
+    type BrandFileEntry = {
+        url: string;
+        tags: string[];
+        vendorConfig: { clientId: string; scopes: string; redirectUrl?: string };
+    };
+
+    const finalBrandIndex: BrandFileEntry[] = [];
+    if (!Array.isArray(config.retrieverConfig.brandFiles)) {
+        console.error('Error: retrieverConfig.brandFiles must be an array.');
+        process.exit(1);
+    }
+
+    for (const entry of config.retrieverConfig.brandFiles) {
+        const valid = entry &&
+            typeof entry === 'object' &&
+            typeof entry.url === 'string' &&
+            Array.isArray(entry.tags) && entry.tags.every((t: any) => typeof t === 'string') &&
+            entry.vendorConfig && typeof entry.vendorConfig === 'object' &&
+            typeof entry.vendorConfig.clientId === 'string' &&
+            typeof entry.vendorConfig.scopes === 'string' &&
+            (typeof entry.vendorConfig.redirectUrl === 'undefined' || typeof entry.vendorConfig.redirectUrl === 'string') &&
+            (typeof entry.vendorConfig.note === 'undefined' || typeof entry.vendorConfig.note === 'string');
+
+        if (!valid) {
+            console.error('Error: Invalid brandFiles entry detected:', entry);
+            process.exit(1);
+        }
+
+        finalBrandIndex.push({
+            url: entry.url,
+            tags: entry.tags,
+            vendorConfig: {
+                clientId: entry.vendorConfig.clientId,
+                scopes: entry.vendorConfig.scopes,
+                ...(entry.vendorConfig.redirectUrl && { redirectUrl: entry.vendorConfig.redirectUrl }),
+                ...(entry.vendorConfig.note && { note: entry.vendorConfig.note })
+            }
+        });
+    }
+
+    if (finalBrandIndex.length === 0) {
+        console.error('Error: No valid brandFiles configured.');
+        process.exit(1);
+    }
+
+    defines['__BRAND_FILE_INDEX__'] = JSON.stringify(finalBrandIndex);
+
     // --- Inject Delivery Endpoints ---
     // Validate structure before stringifying
     const finalValidEndpoints: Record<string, { postUrl: string }> = {};
