@@ -67,7 +67,7 @@ let currentBrandRenderAbortController: AbortController | null = null;
 let brandDebounceTimer: number | null = null;
 let currentFilteredItems: any[] = [];
 let currentPage = 1;
-const ITEMS_PER_PAGE = 50;
+const ITEMS_PER_PAGE = 1200;
 // Removed single currentVendorName; each brand item will now carry its own _vendorName property
 
 // NEW: Pagination DOM Elements
@@ -176,15 +176,75 @@ function createBrandTileElement(item: any): HTMLDivElement {
     tile.className = 'brand-tile';
     let detailsHTML = `<h3>${item.displayName}</h3>`;
     detailsHTML += `<p class="provider-info">Data Provider: ${item.brandName}</p>`;
-    if (item.itemType === 'facility') {
+    const hasCollapseInfo = typeof item._matchedCount === 'number' && typeof item._totalCount === 'number';
+
+    // Don't show specific location if it's a collapsed rep
+    if (!hasCollapseInfo && item.itemType === 'facility') {
         const locationParts = [item.city, item.state, item.postalCode].filter(Boolean);
-        if (locationParts.length > 0) {
-             detailsHTML += `<p class="location-info">Location: ${locationParts.join(', ')}</p>`;
-        }
+        if (locationParts.length > 0) { detailsHTML += `<p class="location-info">Location: ${locationParts.join(', ')}</p>`; }
+    }
+
+    // Show the "Matched X of Y cards" info if applicable
+    if (hasCollapseInfo) {
+        detailsHTML += `<p class="collapse-info">Matched ${item._matchedCount} of ${item._totalCount} card${item._totalCount !== 1 ? 's' : ''}</p>`;
     }
     tile.innerHTML = detailsHTML;
     tile.addEventListener('click', () => showBrandModal(item));
     return tile;
+}
+
+// --- Helper: Collapse multiple items from the same brand into a single representative ---
+function collapseBrandItems(allItems: any[], matchedItems: any[], scoreMap: Map<any, number>): any[] {
+    const matchedSet = new Set(matchedItems);
+    const grouped: Record<string, any[]> = {};
+    allItems.forEach(itm => {
+        const key = itm.brandId || itm.brandName;
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(itm);
+    });
+
+    const collapsed: any[] = [];
+    for (const key in grouped) {
+        const group = grouped[key];
+        const matchedInGroup = group.filter(itm => matchedSet.has(itm));
+        const matchedCount = matchedInGroup.length; // Count of matched items
+        const totalCount = group.length; // Total items in this brand group
+
+        if (matchedCount === 0) continue; // Nothing matched in this group
+
+        if (matchedCount === 1) {
+            // Only one matched item – show it as-is (no collapsing)
+            const single = matchedInGroup[0];
+            // Ensure score is attached, but no collapse info
+            const repCloneSingle = { ...single, _score: scoreMap.get(single) ?? 0 };
+            delete repCloneSingle._matchedCount; // Remove potentially stale info
+            delete repCloneSingle._totalCount;
+            delete repCloneSingle._collapseCount; // Remove old property
+            collapsed.push(repCloneSingle);
+        } else {
+            // Multiple matched items – collapse the group
+            // Prefer brand-level item from the *original* group as representative
+            let representative = group.find(g => g.itemType === 'brand');
+            if (!representative) {
+                // Fallback: shortest displayName among matched items
+                representative = matchedInGroup.slice().sort((a, b) => a.displayName.length - b.displayName.length)[0];
+            }
+
+            // Use the best score from the *matched* items for sorting
+            const bestScore = Math.min(...matchedInGroup.map(it => scoreMap.get(it) ?? 0));
+
+            // Clone representative and add new collapse info
+            const repClone = {
+                ...representative,
+                _score: bestScore,
+                _matchedCount: matchedCount, // Store how many matched
+                _totalCount: totalCount     // Store total in group
+            };
+            delete repClone._collapseCount; // Explicitly remove old property
+            collapsed.push(repClone);
+        }
+    }
+    return collapsed;
 }
 
 // Renders a list of items into the results container in manageable chunks
@@ -271,11 +331,13 @@ function handleBrandSearch() {
 
     brandSearchSpinner.style.display = 'block';
 
-    // Filter all items based on the tokens
-    currentFilteredItems = searchTokens.length === 0 // Store result in currentFilteredItems
+    const scoreMap: Map<any, number> = new Map();
+
+    const searchFiltered = searchTokens.length === 0
         ? allBrandItems
         : allBrandItems.filter(item => {
-            return searchTokens.every(token => {
+            let cumulativeScore = 0;
+            const matched = searchTokens.every(token => {
                 const fieldsToSearch = [
                     safeLower(item.displayName),
                     safeLower(item.brandName),
@@ -283,9 +345,32 @@ function handleBrandSearch() {
                     safeLower(item.state),
                     safeLower(item.postalCode)
                 ];
-                return fieldsToSearch.some(fieldValue => fieldValue.includes(token));
+                let bestPos = Infinity;
+                for (const field of fieldsToSearch) {
+                    const idx = field.indexOf(token);
+                    if (idx !== -1 && idx < bestPos) bestPos = idx;
+                }
+                if (bestPos !== Infinity) {
+                    cumulativeScore += bestPos;
+                    return true;
+                }
+                return false; // token not matched in any field
             });
+            if (matched) {
+                // Add small tie-breaker based on displayName length
+                cumulativeScore += (safeLower(item.displayName).length / 100);
+                scoreMap.set(item, cumulativeScore);
+            }
+            return matched;
         });
+
+    const collapsed = collapseBrandItems(allBrandItems, searchFiltered, scoreMap);
+    if (searchTokens.length === 0) {
+        collapsed.sort((a, b) => safeLower(a.displayName).localeCompare(safeLower(b.displayName)));
+    } else {
+        collapsed.sort((a, b) => (a._score ?? Infinity) - (b._score ?? Infinity));
+    }
+    currentFilteredItems = collapsed;
 
     // Reset to page 1 and render
     currentPage = 1;
@@ -314,22 +399,31 @@ function showBrandModal(item: any) {
     brandModalTitle.textContent = `Connect to ${item.displayName}?`;
     let detailsHTML = `<p><strong>Display Name:</strong> ${item.displayName}</p>`;
     detailsHTML += `<p><strong>Data Provider:</strong> ${item.brandName}</p>`;
-    if (item.itemType === 'facility') {
-         const locationParts = [item.city, item.state, item.postalCode].filter(Boolean);
-         if (locationParts.length > 0) { detailsHTML += `<p><strong>Location:</strong> ${locationParts.join(', ')}</p>`; }
+    const hasCollapseInfo = typeof item._matchedCount === 'number' && typeof item._totalCount === 'number';
+
+    // Don't show specific location if it's a collapsed rep
+    if (!hasCollapseInfo && item.itemType === 'facility') {
+        const locationParts = [item.city, item.state, item.postalCode].filter(Boolean);
+        if (locationParts.length > 0) { detailsHTML += `<p><strong>Location:</strong> ${locationParts.join(', ')}</p>`; }
     }
-     // Display endpoints - **Crucially, we need a FHIR endpoint here**
-     if (item.endpoints && Array.isArray(item.endpoints) && item.endpoints.length > 0) {
-         detailsHTML += `<p><strong>Endpoints:</strong></p><ul>`;
-         item.endpoints.forEach((ep: { url: string, name?: string, type?: string }) => {
-             // Highlight potential FHIR endpoints
-             const isFhir = ep.type === 'FHIR_BASE_URL' || safeLower(ep.url).includes('fhir');
-             detailsHTML += `<li style="${isFhir ? 'font-weight: bold;' : ''}">${ep.url}${ep.name ? ` (${ep.name})` : ''}${ep.type ? ` [${ep.type}]` : ''}</li>`;
-         });
-         detailsHTML += `</ul>`;
-     } else {
-         detailsHTML += `<p><strong>Endpoints:</strong> None found</p>`;
-     }
+
+    // Show the "Matched X of Y cards" info if applicable
+    if (hasCollapseInfo) {
+        detailsHTML += `<p><strong>Matched:</strong> ${item._matchedCount} of ${item._totalCount} card${item._totalCount !== 1 ? 's' : ''}</p>`;
+    }
+
+    // Display endpoints - **Crucially, we need a FHIR endpoint here**
+    if (item.endpoints && Array.isArray(item.endpoints) && item.endpoints.length > 0) {
+        detailsHTML += `<p><strong>Endpoints:</strong></p><ul>`;
+        item.endpoints.forEach((ep: { url: string, name?: string, type?: string }) => {
+            // Highlight potential FHIR endpoints
+            const isFhir = ep.type === 'FHIR_BASE_URL' || safeLower(ep.url).includes('fhir');
+            detailsHTML += `<li style="${isFhir ? 'font-weight: bold;' : ''}">${ep.url}${ep.name ? ` (${ep.name})` : ''}${ep.type ? ` [${ep.type}]` : ''}</li>`;
+        });
+        detailsHTML += `</ul>`;
+    } else {
+        detailsHTML += `<p><strong>Endpoints:</strong> None found</p>`;
+    }
     // Display sandbox login note if available
     const vc: VendorAuthConfig | undefined = (item as any)._vendorConfig;
     if (vc && vc.note) {
@@ -567,7 +661,9 @@ async function fetchBrandsAndInitialize() {
         console.log(`[fetchBrands] Loaded ${aggregatedItems.length} organization records from brand files.`);
 
         allBrandItems = aggregatedItems;
-        currentFilteredItems = allBrandItems;
+        currentFilteredItems = collapseBrandItems(allBrandItems, aggregatedItems, new Map());
+        // Alphabetical order by brand displayName on initial load
+        currentFilteredItems.sort((a, b) => safeLower(a.displayName).localeCompare(safeLower(b.displayName)));
 
         brandInitialLoadingMessage.style.display = 'none';
         brandResultsContainer.style.display = 'grid';
@@ -586,6 +682,13 @@ async function fetchBrandsAndInitialize() {
         if (brandModalBackdrop) brandModalBackdrop.addEventListener('click', (event) => { if (event.target === brandModalBackdrop) hideBrandModal(); });
         if (brandPrevBtn) brandPrevBtn.addEventListener('click', () => { if (currentPage > 1) { currentPage--; renderCurrentPage(); } });
         if (brandNextBtn) brandNextBtn.addEventListener('click', () => { const totalPages = Math.ceil(currentFilteredItems.length / ITEMS_PER_PAGE); if (currentPage < totalPages) { currentPage++; renderCurrentPage(); } });
+
+        // Add listener to close modal with Escape key
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && brandModalBackdrop?.classList.contains('visible')) {
+                hideBrandModal();
+            }
+        });
 
     } catch (error: any) {
         console.error('[fetchBrands] Error:', error);
