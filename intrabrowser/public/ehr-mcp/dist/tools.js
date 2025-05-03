@@ -15,6 +15,13 @@ var __toESM = (mod, isNodeMode, target) => {
   return to;
 };
 var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
+  get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
+}) : x)(function(x) {
+  if (typeof require !== "undefined")
+    return require.apply(this, arguments);
+  throw Error('Dynamic require of "' + x + '" is not supported');
+});
 
 // node_modules/lodash/lodash.js
 var require_lodash = __commonJS((exports, module) => {
@@ -1959,7 +1966,7 @@ var require_lodash = __commonJS((exports, module) => {
         end = end === undefined2 ? length : end;
         return !start && end >= length ? array : baseSlice(array, start, end);
       }
-      var clearTimeout = ctxClearTimeout || function(id) {
+      var clearTimeout2 = ctxClearTimeout || function(id) {
         return root.clearTimeout(id);
       };
       function cloneBuffer(buffer, isDeep) {
@@ -3807,7 +3814,7 @@ var require_lodash = __commonJS((exports, module) => {
         }
         function cancel() {
           if (timerId !== undefined2) {
-            clearTimeout(timerId);
+            clearTimeout2(timerId);
           }
           lastInvokeTime = 0;
           lastArgs = lastCallTime = lastThis = timerId = undefined2;
@@ -3825,7 +3832,7 @@ var require_lodash = __commonJS((exports, module) => {
               return leadingEdge(lastCallTime);
             }
             if (maxing) {
-              clearTimeout(timerId);
+              clearTimeout2(timerId);
               timerId = setTimeout2(timerExpired, wait);
               return invokeFunc(lastCallTime);
             }
@@ -9441,6 +9448,11 @@ var z = /* @__PURE__ */ Object.freeze({
 var import_lodash = __toESM(require_lodash(), 1);
 
 // node_modules/@modelcontextprotocol/sdk/dist/esm/types.js
+var LATEST_PROTOCOL_VERSION = "2024-11-05";
+var SUPPORTED_PROTOCOL_VERSIONS = [
+  LATEST_PROTOCOL_VERSION,
+  "2024-10-07"
+];
 var JSONRPC_VERSION = "2.0";
 var ProgressTokenSchema = z.union([z.string(), z.number().int()]);
 var CursorSchema = z.string();
@@ -9867,6 +9879,15 @@ var ServerResultSchema = z.union([
   CallToolResultSchema,
   ListToolsResultSchema
 ]);
+
+class McpError extends Error {
+  constructor(code, message, data) {
+    super(`MCP error ${code}: ${message}`);
+    this.code = code;
+    this.data = data;
+    this.name = "McpError";
+  }
+}
 
 // src/fhirToPlaintext.ts
 function createFhirRenderer(fullEhr) {
@@ -11136,6 +11157,7 @@ ${participants}`);
 var MAX_GREP_JSON_LENGTH = 2 * 1024 * 1024;
 var MAX_QUERY_JSON_LENGTH = 500 * 1024;
 var MAX_EVAL_JSON_LENGTH = 1 * 1024 * 1024;
+var MAX_QUERY_ROWS = 500;
 var GREP_CONTEXT_LENGTH = 200;
 var DEFAULT_PAGE_SIZE = 50;
 var DEFAULT_PAGE = 1;
@@ -11334,6 +11356,72 @@ function extractResourceDate(resource) {
     }
   }
   return null;
+}
+function truncateQueryResults(results, limit) {
+  try {
+    const originalRowCount = results.length;
+    let potentiallyTruncatedResults = results;
+    let rowLimitWarning = null;
+    if (originalRowCount > MAX_QUERY_ROWS) {
+      potentiallyTruncatedResults = results.slice(0, MAX_QUERY_ROWS);
+      rowLimitWarning = `Result limited to first ${potentiallyTruncatedResults.length} of ${originalRowCount} rows.`;
+      console.warn(`[TRUNCATE QUERY] Row limit exceeded (${originalRowCount} > ${MAX_QUERY_ROWS}).`);
+    }
+    let jsonString = JSON.stringify(potentiallyTruncatedResults);
+    if (jsonString.length <= limit) {
+      if (rowLimitWarning) {
+        return { warning: rowLimitWarning, truncated_results: potentiallyTruncatedResults };
+      }
+      return potentiallyTruncatedResults;
+    }
+    console.warn(`[TRUNCATE QUERY] Size limit exceeded (${(jsonString.length / 1024).toFixed(0)} KB > ${(limit / 1024).toFixed(0)} KB).`);
+    const sizeLimitWarning = `Result truncated due to size limit (${(limit / 1024).toFixed(0)} KB).` + (rowLimitWarning ? ` (Already limited to ${potentiallyTruncatedResults.length} rows)` : ` Original query returned ${originalRowCount} rows.`);
+    const truncatedData = {
+      warning: sizeLimitWarning
+    };
+    let finalJsonString = JSON.stringify(truncatedData);
+    if (finalJsonString.length > limit) {
+      console.error(`[TRUNCATE QUERY] Result STILL too large after size truncation (warning object too big).`);
+      return { error: "Result too large to return, even after truncation." };
+    }
+    return truncatedData;
+  } catch (stringifyError) {
+    console.error(`[TRUNCATE QUERY] Error during stringification/truncation:`, stringifyError);
+    return { error: `Internal error during result processing/truncation: ${stringifyError.message}` };
+  }
+}
+function truncateEvalResult(output, limit) {
+  try {
+    let jsonString = JSON.stringify(output);
+    if (jsonString.length <= limit) {
+      return output;
+    }
+    console.warn(`[TRUNCATE EVAL] Result exceeds limit (${(jsonString.length / 1024).toFixed(0)} KB > ${(limit / 1024).toFixed(0)} KB), applying truncation.`);
+    let truncatedData;
+    let warningMessage = `Result truncated due to size limit (${(limit / 1024).toFixed(0)} KB).`;
+    const originalLogs = output.logs || [];
+    const originalErrors = output.errors || [];
+    truncatedData = {
+      result: "[Result omitted due to excessive size]",
+      logs: originalLogs.slice(0, 20),
+      errors: [...originalErrors]
+    };
+    warningMessage += " Result omitted, logs potentially truncated.";
+    if (truncatedData.logs.length < originalLogs.length) {
+      truncatedData.logs.push("... [Logs truncated due to size limit]");
+    }
+    truncatedData.errors.push(`Execution result (or combined output) was too large to return fully. ${warningMessage}`);
+    truncatedData.warning = warningMessage;
+    let finalJsonString = JSON.stringify(truncatedData);
+    if (finalJsonString.length > limit) {
+      console.error(`[TRUNCATE EVAL] Result STILL too large after truncation.`);
+      return { error: "Result too large to return, even after truncation.", logs: [], result: undefined, errors: ["Output exceeded size limit even after truncation."] };
+    }
+    return truncatedData;
+  } catch (stringifyError) {
+    console.error(`[TRUNCATE EVAL] Error during stringification/truncation:`, stringifyError);
+    return { error: `Internal error during result processing/truncation: ${stringifyError.message}` };
+  }
 }
 function findContextualMatches(text, regex, contextLen) {
   const snippets = [];
@@ -11648,6 +11736,106 @@ async function grepRecordLogic(fullEhr, query, inputResourceTypes, resourceForma
   markdownOutput += "---";
   return markdownOutput;
 }
+async function queryRecordLogic(db, sql) {
+  console.error(`[SQL Logic] Executing query: ${sql.substring(0, 100)}${sql.length > 100 ? "..." : ""}`);
+  const sqlLower = sql.trim().toLowerCase();
+  if (!sqlLower.startsWith("select")) {
+    console.error("[SQL Logic] Validation failed: Query does not start with SELECT.");
+    const errorResult = { error: "Only SELECT queries are allowed." };
+    return JSON.stringify(errorResult, null, 2);
+  }
+  const writeKeywords = ["insert ", "update ", "delete ", "drop ", "create ", "alter ", "attach ", "detach ", "replace ", "pragma "];
+  if (writeKeywords.some((keyword) => sqlLower.includes(keyword))) {
+    if (!sqlLower.startsWith("pragma table_info") && !sqlLower.startsWith("pragma user_version")) {
+      console.error(`[SQL Logic] Validation failed: Potentially harmful SQL keyword detected.`);
+      const errorResult = { error: "Potentially harmful SQL operation detected. Only SELECT statements and specific PRAGMAs are permitted." };
+      return JSON.stringify(errorResult, null, 2);
+    }
+  }
+  try {
+    const results = await db.query(sql).all();
+    console.error(`[SQL Logic] Query returned ${results.length} rows.`);
+    const finalData = truncateQueryResults(results, MAX_QUERY_JSON_LENGTH);
+    return JSON.stringify(finalData, null, 2);
+  } catch (err) {
+    console.error("[SQL Logic] Query execution error:", err);
+    const errorResult = { error: `SQL execution failed: ${err.message}` };
+    return JSON.stringify(errorResult, null, 2);
+  }
+}
+async function evalRecordLogic(fullEhr, userCode) {
+  let vm;
+  try {
+    vm = (await import("vm")).default;
+  } catch (e) {
+    console.error("[EVAL Logic] Failed to dynamically import 'vm'. This tool is likely running in an unsupported environment.", e);
+    return JSON.stringify({ error: "Internal server error: VM module not available." });
+  }
+  const logs = [];
+  const errors = [];
+  const MAX_LOG_MESSAGES = 100;
+  console.error(`[EVAL Logic] Preparing to execute sandboxed code...`);
+  const sandboxConsole = {
+    log: (...args) => {
+      if (logs.length < MAX_LOG_MESSAGES)
+        logs.push(args.map((arg) => typeof arg === "string" ? arg : JSON.stringify(arg)).join(" "));
+      else if (logs.length === MAX_LOG_MESSAGES)
+        logs.push("... [Max log messages reached]");
+    },
+    warn: (...args) => {
+      if (logs.length < MAX_LOG_MESSAGES)
+        logs.push(`WARN: ${args.map((arg) => typeof arg === "string" ? arg : JSON.stringify(arg)).join(" ")}`);
+      else if (logs.length === MAX_LOG_MESSAGES)
+        logs.push("... [Max log messages reached]");
+    },
+    error: (...args) => errors.push(`CONSOLE.ERROR: ${args.map((arg) => typeof arg === "string" ? arg : JSON.stringify(arg)).join(" ")}`)
+  };
+  const sandbox = { fullEhr, console: sandboxConsole, _: import_lodash.default, Buffer, __resultPromise__: undefined };
+  const scriptCode = `async function userFunction(fullEhr, console, _, Buffer) { "use strict"; ${userCode} }
+__resultPromise__ = userFunction(fullEhr, console, _, Buffer);`;
+  const context = vm.createContext(sandbox);
+  const script = new vm.Script(scriptCode, { filename: "userCode.vm" });
+  const timeoutMs = 5000;
+  let executionResult = undefined;
+  let executionError = null;
+  try {
+    console.error(`[EVAL Logic] Executing sandboxed code (Timeout: ${timeoutMs}ms)...`);
+    script.runInContext(context, { timeout: timeoutMs / 2, displayErrors: true });
+    executionResult = await Promise.race([
+      sandbox.__resultPromise__,
+      new Promise((_2, reject) => setTimeout(() => reject(new Error("Async operation timed out")), timeoutMs))
+    ]);
+    console.error(`[EVAL Logic] Sandboxed code finished successfully.`);
+  } catch (error) {
+    console.error("[EVAL Logic] Error executing sandboxed code:", error);
+    executionError = error;
+  }
+  const finalOutput = {
+    result: executionResult,
+    logs,
+    errors
+  };
+  if (executionError) {
+    let errorMessage;
+    if (executionError.message.includes("timed out"))
+      errorMessage = `Code execution timed out after ${timeoutMs / 1000} seconds.`;
+    else if (executionError instanceof SyntaxError)
+      errorMessage = `Syntax error in provided code: ${executionError.message}`;
+    else
+      errorMessage = `Error during code execution: ${executionError.message}`;
+    finalOutput.errors.push(`Execution Error: ${errorMessage}`);
+    finalOutput.result = undefined;
+  }
+  try {
+    JSON.stringify(finalOutput.result);
+  } catch (stringifyError) {
+    console.error("[EVAL Logic] Result is not JSON serializable:", stringifyError);
+    finalOutput.errors.push(`Execution Error: Result is not JSON-serializable: ${stringifyError.message}.`);
+    finalOutput.result = undefined;
+  }
+  const finalData = truncateEvalResult(finalOutput, MAX_EVAL_JSON_LENGTH);
+  return JSON.stringify(finalData, null, 2);
+}
 async function readResourceLogic(fullEhr, resourceType, resourceId) {
   console.error(`[READ Resource Logic] Attempting to read ${resourceType}/${resourceId}`);
   const resources = fullEhr.fhir[resourceType] || [];
@@ -11751,6 +11939,1007 @@ ${processedPlaintext}
   } else {
     console.error(`[READ Attachment Logic] Attachment at ${resourceType}/${resourceId}#${attachmentPath} not found.`);
     return `**Error:** Attachment at \`${resourceType}/${resourceId}#${attachmentPath.replace(/`/g, "\\`")}\` not found.`;
+  }
+}
+function registerEhrTools(mcpServer, getContext) {
+  mcpServer.tool("grep_record", GrepRecordInputSchema.shape, async (args, extra) => {
+    try {
+      const { fullEhr } = await getContext("grep_record", extra);
+      if (!fullEhr) {
+        throw new McpError(ErrorCode.InternalError, "EHR data context not found for this session/request.");
+      }
+      console.error(`[TOOL grep_record] Context retrieved. Query: "${args.query}", Types: ${args.resource_types?.join(",") || "All"}, Format: ${args.resource_format || "plaintext"}, Page: ${args.page || DEFAULT_PAGE}, PageSize: ${args.page_size || DEFAULT_PAGE_SIZE}`);
+      const resultString = await grepRecordLogic(fullEhr, args.query, args.resource_types, args.resource_format || "plaintext", args.page_size || DEFAULT_PAGE_SIZE, args.page || DEFAULT_PAGE);
+      const isError = resultString.startsWith("**Error:**");
+      return { content: [{ type: "text", text: resultString }], isError };
+    } catch (error) {
+      console.error(`[TOOL grep_record] Error during context retrieval or execution:`, error);
+      const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+      const errorMarkdown = `**Error:** ${errorMessage}`;
+      return { content: [{ type: "text", text: errorMarkdown }], isError: true };
+    }
+  });
+  mcpServer.tool("query_record", QueryRecordInputSchema.shape, async (args, extra) => {
+    try {
+      const { db } = await getContext("query_record", extra);
+      if (!db) {
+        throw new McpError(ErrorCode.InternalError, "Database context not found for this session/request.");
+      }
+      console.error(`[TOOL query_record] Context retrieved. SQL: ${args.sql.substring(0, 100)}...`);
+      const resultString = await queryRecordLogic(db, args.sql);
+      const isError = resultString.includes('"error":');
+      return { content: [{ type: "text", text: resultString }], isError };
+    } catch (error) {
+      console.error(`[TOOL query_record] Error during context retrieval or execution:`, error);
+      const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+      const errorResult = JSON.stringify({ error: errorMessage });
+      return { content: [{ type: "text", text: errorResult }], isError: true };
+    }
+  });
+  mcpServer.tool("eval_record", EvalRecordInputSchema.shape, async (args, extra) => {
+    try {
+      const { fullEhr } = await getContext("eval_record", extra);
+      if (!fullEhr) {
+        throw new McpError(ErrorCode.InternalError, "EHR data context not found for this session/request.");
+      }
+      console.error(`[TOOL eval_record] Context retrieved. Code length: ${args.code.length}`);
+      const resultString = await evalRecordLogic(fullEhr, args.code);
+      const isError = resultString.includes('"error":') || resultString.includes("Execution Error:");
+      return { content: [{ type: "text", text: resultString }], isError };
+    } catch (error) {
+      console.error(`[TOOL eval_record] Error during context retrieval or execution:`, error);
+      const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+      const errorResult = JSON.stringify({ error: errorMessage });
+      return { content: [{ type: "text", text: errorResult }], isError: true };
+    }
+  });
+  mcpServer.tool("read_resource", ReadResourceInputSchema.shape, async (args, extra) => {
+    try {
+      const { fullEhr } = await getContext("read_resource", extra);
+      if (!fullEhr) {
+        throw new McpError(ErrorCode.InternalError, "EHR data context not found for this session/request.");
+      }
+      console.error(`[TOOL read_resource] Context retrieved. Reading ${args.resourceType}/${args.resourceId}`);
+      const resultString = await readResourceLogic(fullEhr, args.resourceType, args.resourceId);
+      const isError = resultString.includes('"error":');
+      return { content: [{ type: "text", text: resultString }], isError };
+    } catch (error) {
+      console.error(`[TOOL read_resource] Error during context retrieval or execution:`, error);
+      const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+      const errorResult = JSON.stringify({ resource: null, error: errorMessage });
+      return { content: [{ type: "text", text: errorResult }], isError: true };
+    }
+  });
+  mcpServer.tool("read_attachment", ReadAttachmentInputSchema.shape, async (args, extra) => {
+    try {
+      const { fullEhr } = await getContext("read_attachment", extra);
+      if (!fullEhr) {
+        throw new McpError(ErrorCode.InternalError, "EHR data context not found for this session/request.");
+      }
+      console.error(`[TOOL read_attachment] Context retrieved. Reading ${args.resourceType}/${args.resourceId}#${args.attachmentPath}`);
+      const resultString = await readAttachmentLogic(fullEhr, args.resourceType, args.resourceId, args.attachmentPath, args.includeRawBase64);
+      const isError = resultString.startsWith("**Error:**");
+      return { content: [{ type: "text", text: resultString }], isError };
+    } catch (error) {
+      console.error(`[TOOL read_attachment] Error during context retrieval or execution:`, error);
+      const errorMessage = error instanceof McpError ? error.message : `Internal server error: ${error.message}`;
+      const errorMarkdown = `**Error:** ${errorMessage}`;
+      return { content: [{ type: "text", text: errorMarkdown }], isError: true };
+    }
+  });
+}
+
+// src/IntraBrowserTransport.ts
+var HANDSHAKE_INTERVAL_MS = 200;
+var HANDSHAKE_TIMEOUT_MS = 15000;
+function isJsonRpcRequest(obj) {
+  return typeof obj === "object" && obj !== null && obj.jsonrpc === "2.0" && typeof obj.method === "string" && (typeof obj.id === "string" || typeof obj.id === "number");
+}
+
+class IntraBrowserClientTransport {
+  iframeSrc;
+  serverOrigin;
+  clientOrigin;
+  iframeElement = null;
+  iframeWindow = null;
+  isConnected = false;
+  isStarting = false;
+  startPromise = null;
+  startResolve = null;
+  startReject = null;
+  handshakeIntervalId = null;
+  handshakeTimeoutId = null;
+  messageQueue = [];
+  sessionId = self.crypto.randomUUID();
+  onmessage;
+  onclose;
+  onerror;
+  constructor(iframeSrc, serverOrigin) {
+    console.log(`[ClientTransport ${this.sessionId}] Constructor`, { iframeSrc, serverOrigin });
+    if (!iframeSrc) {
+      throw new Error("iframeSrc must be provided");
+    }
+    if (!serverOrigin || serverOrigin === "*") {
+      throw new Error("Specific serverOrigin must be provided for security (cannot be '*')");
+    }
+    try {
+      const srcUrl = new URL(iframeSrc);
+      if (srcUrl.origin !== serverOrigin) {
+        console.warn(`[ClientTransport ${this.sessionId}] iframeSrc origin (${srcUrl.origin}) does not match provided serverOrigin (${serverOrigin}). This might cause issues.`);
+      }
+    } catch (e) {
+      throw new Error(`Invalid iframeSrc URL: ${iframeSrc}`);
+    }
+    this.iframeSrc = iframeSrc;
+    this.serverOrigin = serverOrigin;
+    this.clientOrigin = window.location.origin;
+  }
+  start() {
+    if (this.isStarting || this.isConnected) {
+      console.warn(`[ClientTransport ${this.sessionId}] start() called while already starting or connected.`);
+      return this.startPromise || Promise.resolve();
+    }
+    this.isStarting = true;
+    console.log(`[ClientTransport ${this.sessionId}] start() invoked.`);
+    window.removeEventListener("message", this.handleMessage);
+    window.addEventListener("message", this.handleMessage);
+    console.log(`[ClientTransport ${this.sessionId}] Global message listener added to parent window.`);
+    this.startPromise = new Promise((resolve, reject) => {
+      this.startResolve = resolve;
+      this.startReject = reject;
+      try {
+        this.iframeElement = document.createElement("iframe");
+        this.iframeElement.style.display = "none";
+        this.iframeElement.onload = () => {
+          console.log(`[ClientTransport ${this.sessionId}] Iframe loaded src: ${this.iframeSrc}`);
+          if (!this.iframeElement?.contentWindow) {
+            const err = new Error("Iframe loaded but contentWindow is null or inaccessible.");
+            console.error(`[ClientTransport ${this.sessionId}]`, err);
+            this.handleFatalError(err);
+            return;
+          }
+          try {
+            this.iframeElement.contentWindow;
+          } catch (crossOriginError) {
+            const err = new Error(`Iframe contentWindow exists but seems inaccessible. Error: ${crossOriginError}`);
+            console.error(`[ClientTransport ${this.sessionId}]`, err);
+            this.handleFatalError(err);
+            return;
+          }
+          this.iframeWindow = this.iframeElement.contentWindow;
+          console.log(`[ClientTransport ${this.sessionId}] Iframe contentWindow acquired.`);
+          this.initiateHandshake();
+        };
+        this.iframeElement.onerror = (event) => {
+          const err = new Error(`Iframe loading failed for src ${this.iframeSrc}. Event: ${event}`);
+          console.error(`[ClientTransport ${this.sessionId}] Iframe onerror triggered.`);
+          this.handleFatalError(err);
+        };
+        this.iframeElement.src = this.iframeSrc;
+        document.body.appendChild(this.iframeElement);
+        console.log(`[ClientTransport ${this.sessionId}] Iframe appended to DOM.`);
+      } catch (error) {
+        console.error(`[ClientTransport ${this.sessionId}] Error during iframe creation/setup:`, error);
+        this.handleFatalError(error);
+      }
+    });
+    return this.startPromise;
+  }
+  initiateHandshake() {
+    console.log(`[ClientTransport ${this.sessionId}] Starting handshake process.`);
+    this.cleanupHandshakeTimers();
+    this.handshakeIntervalId = window.setInterval(this.sendHandshakePing, HANDSHAKE_INTERVAL_MS);
+    this.handshakeTimeoutId = window.setTimeout(() => {
+      const errorMsg = `Timeout (${HANDSHAKE_TIMEOUT_MS}ms) waiting for handshake response (MCP_HANDSHAKE_SERVER) from origin ${this.serverOrigin}`;
+      console.error(`[ClientTransport ${this.sessionId}] ${errorMsg}`);
+      this.cleanupHandshakeTimers();
+      this.handleFatalError(new Error(errorMsg));
+    }, HANDSHAKE_TIMEOUT_MS);
+    this.sendHandshakePing();
+  }
+  sendHandshakePing = () => {
+    if (!this.iframeWindow || this.iframeWindow.closed) {
+      console.warn(`[ClientTransport ${this.sessionId}] Cannot send handshake ping, iframe window not available or closed.`);
+      if (this.iframeWindow?.closed)
+        this.handleClose();
+      return;
+    }
+    try {
+      const handshakePayload = {
+        type: "MCP_HANDSHAKE_CLIENT",
+        clientOrigin: this.clientOrigin,
+        sessionId: this.sessionId
+      };
+      this.iframeWindow.postMessage(handshakePayload, this.serverOrigin);
+    } catch (err) {
+      console.warn(`[ClientTransport ${this.sessionId}] Error sending handshake ping: ${err.message || err}`);
+      if (this.iframeWindow?.closed)
+        this.handleClose();
+    }
+  };
+  cleanupHandshakeTimers = () => {
+    if (this.handshakeIntervalId !== null)
+      clearInterval(this.handshakeIntervalId);
+    if (this.handshakeTimeoutId !== null)
+      clearTimeout(this.handshakeTimeoutId);
+    this.handshakeIntervalId = null;
+    this.handshakeTimeoutId = null;
+  };
+  handleMessage = (event) => {
+    if (event.origin !== this.serverOrigin)
+      return;
+    if (!this.iframeWindow || event.source !== this.iframeWindow)
+      return;
+    try {
+      const messageData = event.data;
+      if (typeof messageData === "object" && messageData !== null && messageData.type === "MCP_HANDSHAKE_SERVER") {
+        const serverHandshake = messageData;
+        console.log(`[ClientTransport ${this.sessionId}] Received MCP_HANDSHAKE_SERVER:`, serverHandshake);
+        if (serverHandshake.sessionId !== this.sessionId) {
+          console.warn(`[ClientTransport ${this.sessionId}] Handshake session ID mismatch. Expected ${this.sessionId}, got ${serverHandshake.sessionId}. Ignoring.`);
+          return;
+        }
+        if (this.isStarting && !this.isConnected) {
+          this.isConnected = true;
+          this.isStarting = false;
+          this.cleanupHandshakeTimers();
+          console.log(`[ClientTransport ${this.sessionId}] Handshake successful! Transport connected.`);
+          this.startResolve?.();
+          this.flushQueue();
+        } else {
+          console.warn(`[ClientTransport ${this.sessionId}] Received handshake response but not in starting state or already connected.`);
+        }
+        return;
+      }
+      if (!this.isConnected) {
+        console.warn(`[ClientTransport ${this.sessionId}] Ignoring MCP message received before connection established:`, messageData);
+        return;
+      }
+      if (typeof messageData !== "object" || messageData === null || messageData.jsonrpc !== "2.0") {
+        console.log(`[ClientTransport ${this.sessionId}] Ignoring non-JSON-RPC 2.0 message:`, messageData);
+        return;
+      }
+      const parsed = JSONRPCMessageSchema.safeParse(messageData);
+      if (!parsed.success) {
+        const error = new Error("Received invalid JSON-RPC message structure: " + parsed.error.errors.map((e) => e.message).join(", "));
+        console.warn(`[ClientTransport ${this.sessionId}] ${error.message}`, { data: messageData, errorDetails: parsed.error });
+        this.onerror?.(error);
+        return;
+      }
+      if (this.onmessage) {
+        this.onmessage(parsed.data);
+      } else {
+        console.warn(`[ClientTransport ${this.sessionId}] Received MCP message but onmessage handler is not set.`);
+      }
+    } catch (error) {
+      console.error(`[ClientTransport ${this.sessionId}] Error processing received message:`, error);
+      this.onerror?.(error);
+    }
+  };
+  async send(message) {
+    if (!this.isConnected) {
+      if (this.isStarting || !this.startPromise) {
+        console.log(`[ClientTransport ${this.sessionId}] Queuing message (connection not ready):`, message);
+        this.messageQueue.push(message);
+        if (isJsonRpcRequest(message) && message.method === "initialize") {
+          console.warn(`[ClientTransport ${this.sessionId}] ⚠️ Initialize request queued.`);
+        }
+        return;
+      } else {
+        const errorMsg = "Transport not connected or failed to start.";
+        console.error(`[ClientTransport ${this.sessionId}] ${errorMsg}`);
+        throw new McpError(ErrorCode.ConnectionClosed, errorMsg);
+      }
+    }
+    if (!this.iframeWindow || this.iframeWindow.closed) {
+      const errorMsg = "Cannot send message: Target iframe window is closed or inaccessible.";
+      console.error(`[ClientTransport ${this.sessionId}] ${errorMsg}`);
+      this.handleClose();
+      throw new McpError(ErrorCode.ConnectionClosed, errorMsg);
+    }
+    try {
+      this.iframeWindow.postMessage(message, this.serverOrigin);
+    } catch (err) {
+      const errorMsg = `Failed to send message via postMessage: ${err.message || err}`;
+      console.error(`[ClientTransport ${this.sessionId}] ${errorMsg}`);
+      const error = new Error(errorMsg);
+      this.onerror?.(error);
+      this.handleClose();
+      throw error;
+    }
+  }
+  flushQueue() {
+    if (this.messageQueue.length > 0) {
+      console.log(`[ClientTransport ${this.sessionId}] Flushing ${this.messageQueue.length} queued messages.`);
+    }
+    const errors = [];
+    while (this.messageQueue.length > 0) {
+      const message = this.messageQueue.shift();
+      if (message) {
+        this.send(message).catch((err) => {
+          console.error(`[ClientTransport ${this.sessionId}] Error sending queued message:`, err);
+          errors.push(err instanceof Error ? err : new Error(String(err)));
+        });
+      }
+    }
+    errors.forEach((err) => this.onerror?.(err));
+  }
+  handleFatalError(error) {
+    this.onerror?.(error);
+    if (this.isStarting && this.startReject) {
+      this.startReject(error);
+    }
+    this.close();
+  }
+  handleClose() {
+    const wasActive = this.isStarting || this.isConnected;
+    if (!wasActive && !this.startPromise)
+      return;
+    console.log(`[ClientTransport ${this.sessionId}] Closing connection and cleaning up resources.`);
+    this.isConnected = false;
+    this.isStarting = false;
+    this.cleanupHandshakeTimers();
+    window.removeEventListener("message", this.handleMessage);
+    if (this.iframeElement) {
+      if (this.iframeElement.parentNode) {
+        console.log(`[ClientTransport ${this.sessionId}] Removing iframe from DOM.`);
+        this.iframeElement.parentNode.removeChild(this.iframeElement);
+      }
+      this.iframeElement = null;
+    }
+    this.iframeWindow = null;
+    if (this.startReject) {
+      this.startReject(new McpError(ErrorCode.ConnectionClosed, "Transport closed during startup or due to error."));
+    }
+    this.startPromise = null;
+    this.startResolve = null;
+    this.startReject = null;
+    if (this.messageQueue.length > 0) {
+      console.warn(`[ClientTransport ${this.sessionId}] Discarding ${this.messageQueue.length} queued messages on close.`);
+      this.messageQueue = [];
+    }
+    if (wasActive) {
+      this.onclose?.();
+    }
+  }
+  async close() {
+    this.handleClose();
+  }
+}
+
+class IntraBrowserServerTransport {
+  trustedClientOrigins;
+  clientWindow = null;
+  actualClientOrigin = null;
+  isConnected = false;
+  sessionId = `server-pending-${self.crypto.randomUUID()}`;
+  isStarting = false;
+  startPromise = null;
+  startResolve = null;
+  startReject = null;
+  handshakeTimeoutId = null;
+  onmessage;
+  onclose;
+  onerror;
+  constructor({ trustedClientOrigins }) {
+    const originsArray = Array.from(typeof trustedClientOrigins === "string" ? [trustedClientOrigins] : trustedClientOrigins).filter(Boolean);
+    const hasWildcard = originsArray.includes("*");
+    const uniqueOrigins = new Set(hasWildcard ? ["*"] : originsArray);
+    if (uniqueOrigins.size === 0) {
+      console.error(`[ServerTransport ${this.sessionId}] Constructor - No trusted origins provided.`, trustedClientOrigins);
+      throw new Error("At least one trustedClientOrigin must be provided.");
+    }
+    this.trustedClientOrigins = uniqueOrigins;
+    console.log(`[ServerTransport ${this.sessionId}] Constructor - Trusted Origins:`, Array.from(this.trustedClientOrigins));
+    window.removeEventListener("message", this.handleMessage);
+    window.addEventListener("message", this.handleMessage);
+    console.log(`[ServerTransport ${this.sessionId}] Global message listener added to iframe window.`);
+  }
+  async start() {
+    if (this.isConnected) {
+      return Promise.resolve();
+    }
+    if (this.isStarting && this.startPromise) {
+      return this.startPromise;
+    }
+    console.log(`[ServerTransport ${this.sessionId}] start() called. Waiting for MCP_HANDSHAKE_CLIENT...`);
+    this.isStarting = true;
+    this.startPromise = new Promise((resolve, reject) => {
+      this.startResolve = resolve;
+      this.startReject = reject;
+      this.handshakeTimeoutId = window.setTimeout(() => {
+        const errorMsg = `Timeout (${HANDSHAKE_TIMEOUT_MS}ms) waiting for client handshake.`;
+        console.error(`[ServerTransport ${this.sessionId}] ${errorMsg}`);
+        this.isStarting = false;
+        this.startReject?.(new Error(errorMsg));
+        this.close().catch(() => {});
+      }, HANDSHAKE_TIMEOUT_MS);
+    });
+    return this.startPromise;
+  }
+  handleMessage = (event) => {
+    if (!event.source || event.source !== window.parent)
+      return;
+    let originToCheck = null;
+    let isHandshake = false;
+    let messageData = null;
+    if (typeof event.data === "object" && event.data !== null && event.data.type === "MCP_HANDSHAKE_CLIENT") {
+      isHandshake = true;
+      messageData = event.data;
+      if (!this.trustedClientOrigins.has("*") && !this.trustedClientOrigins.has(event.origin)) {
+        console.warn(`[ServerTransport ${this.sessionId}] Ignoring handshake: Origin ${event.origin} is not in trusted list.`, Array.from(this.trustedClientOrigins));
+        return;
+      }
+    } else if (this.isConnected) {
+      originToCheck = this.actualClientOrigin;
+      if (event.origin !== originToCheck) {
+        console.warn(`[ServerTransport ${this.sessionId}] Ignoring message: Origin ${event.origin} does not match established client origin ${originToCheck}.`);
+        return;
+      }
+      messageData = event.data;
+    } else {
+      return;
+    }
+    try {
+      if (isHandshake) {
+        const clientHandshake = messageData;
+        console.log(`[ServerTransport ${this.sessionId}] Received MCP_HANDSHAKE_CLIENT from trusted origin ${event.origin}:`, clientHandshake);
+        if (!this.isConnected) {
+          try {
+            new URL(clientHandshake.clientOrigin);
+          } catch {}
+          this.actualClientOrigin = event.origin;
+          this.clientWindow = event.source;
+          this.sessionId = clientHandshake.sessionId;
+          console.log(`[ServerTransport ${this.sessionId}] Handshake accepted. Stored client origin: ${this.actualClientOrigin}, Session ID: ${this.sessionId}`);
+          this.sendHandshakeResponse();
+          this.isConnected = true;
+          if (this.isStarting) {
+            this.isStarting = false;
+            if (this.handshakeTimeoutId !== null)
+              clearTimeout(this.handshakeTimeoutId);
+            this.startResolve?.();
+          }
+        } else if (this.actualClientOrigin === event.origin) {
+          console.warn(`[ServerTransport ${this.sessionId}] Received duplicate handshake from connected origin ${this.actualClientOrigin}. Responding again.`);
+          this.sendHandshakeResponse();
+        } else {
+          console.warn(`[ServerTransport ${this.sessionId}] Ignoring handshake from ${event.origin}, already connected to ${this.actualClientOrigin}.`);
+        }
+        return;
+      }
+      if (typeof messageData !== "object" || messageData === null || messageData.jsonrpc !== "2.0") {
+        console.log(`[ServerTransport ${this.sessionId}] Ignoring non-JSON-RPC 2.0 message:`, messageData);
+        return;
+      }
+      const parsed = JSONRPCMessageSchema.safeParse(messageData);
+      if (!parsed.success) {
+        const error = new Error("Received invalid JSON-RPC message structure: " + parsed.error.errors.map((e) => e.message).join(", "));
+        console.warn(`[ServerTransport ${this.sessionId}] ${error.message}`, { data: messageData, errorDetails: parsed.error });
+        this.onerror?.(error);
+        return;
+      }
+      if (this.onmessage) {
+        this.onmessage(parsed.data);
+      } else {
+        console.warn(`[ServerTransport ${this.sessionId}] Received MCP message but onmessage handler is not set.`);
+      }
+    } catch (error) {
+      console.error(`[ServerTransport ${this.sessionId}] Error processing received message:`, error);
+      this.onerror?.(error);
+    }
+  };
+  sendHandshakeResponse() {
+    if (!this.clientWindow || !this.actualClientOrigin) {
+      console.error(`[ServerTransport ${this.sessionId}] Internal error: Cannot send handshake response - client details unknown.`);
+      return;
+    }
+    try {
+      const responsePayload = { type: "MCP_HANDSHAKE_SERVER", sessionId: this.sessionId };
+      console.log(`[ServerTransport ${this.sessionId}] Sending MCP_HANDSHAKE_SERVER to specific origin: ${this.actualClientOrigin}`);
+      this.clientWindow.postMessage(responsePayload, this.actualClientOrigin);
+    } catch (e) {
+      console.error(`[ServerTransport ${this.sessionId}] Error sending MCP_HANDSHAKE_SERVER: ${e.message || e}`);
+      this.onerror?.(e instanceof Error ? e : new Error(String(e)));
+    }
+  }
+  async send(message) {
+    if (!this.isConnected || !this.clientWindow || !this.actualClientOrigin) {
+      const errorMsg = "Cannot send message: Connection not established or client origin unknown.";
+      console.error(`[ServerTransport ${this.sessionId}] ${errorMsg}`);
+      throw new McpError(ErrorCode.ConnectionClosed, errorMsg);
+    }
+    let parentClosed = false;
+    try {
+      parentClosed = this.clientWindow.closed;
+    } catch (e) {
+      parentClosed = true;
+    }
+    if (parentClosed) {
+      const errorMsg = "Cannot send message: Client window is closed.";
+      console.error(`[ServerTransport ${this.sessionId}] ${errorMsg}`);
+      this.handleClose();
+      throw new McpError(ErrorCode.ConnectionClosed, errorMsg);
+    }
+    try {
+      this.clientWindow.postMessage(message, this.actualClientOrigin);
+    } catch (err) {
+      const errorMsg = `Failed to send message via postMessage: ${err.message || err}`;
+      console.error(`[ServerTransport ${this.sessionId}] ${errorMsg}`);
+      const error = new Error(errorMsg);
+      this.onerror?.(error);
+      this.handleClose();
+      throw error;
+    }
+  }
+  handleClose() {
+    const wasConnected = this.isConnected;
+    const wasStarting = this.isStarting;
+    if (!wasConnected && !wasStarting)
+      return;
+    console.log(`[ServerTransport ${this.sessionId}] Closing connection.`);
+    this.isConnected = false;
+    this.isStarting = false;
+    if (this.handshakeTimeoutId !== null)
+      clearTimeout(this.handshakeTimeoutId);
+    window.removeEventListener("message", this.handleMessage);
+    this.clientWindow = null;
+    this.actualClientOrigin = null;
+    if (wasStarting && this.startReject) {
+      this.startReject(new Error("Transport closed before handshake completed."));
+    }
+    if (wasConnected) {
+      this.onclose?.();
+    }
+  }
+  async close() {
+    this.handleClose();
+  }
+}
+
+// node_modules/@modelcontextprotocol/sdk/dist/esm/shared/protocol.js
+var DEFAULT_REQUEST_TIMEOUT_MSEC = 60000;
+
+class Protocol {
+  constructor(_options) {
+    this._options = _options;
+    this._requestMessageId = 0;
+    this._requestHandlers = new Map;
+    this._requestHandlerAbortControllers = new Map;
+    this._notificationHandlers = new Map;
+    this._responseHandlers = new Map;
+    this._progressHandlers = new Map;
+    this._timeoutInfo = new Map;
+    this.setNotificationHandler(CancelledNotificationSchema, (notification) => {
+      const controller = this._requestHandlerAbortControllers.get(notification.params.requestId);
+      controller === null || controller === undefined || controller.abort(notification.params.reason);
+    });
+    this.setNotificationHandler(ProgressNotificationSchema, (notification) => {
+      this._onprogress(notification);
+    });
+    this.setRequestHandler(PingRequestSchema, (_request) => ({}));
+  }
+  _setupTimeout(messageId, timeout, maxTotalTimeout, onTimeout) {
+    this._timeoutInfo.set(messageId, {
+      timeoutId: setTimeout(onTimeout, timeout),
+      startTime: Date.now(),
+      timeout,
+      maxTotalTimeout,
+      onTimeout
+    });
+  }
+  _resetTimeout(messageId) {
+    const info = this._timeoutInfo.get(messageId);
+    if (!info)
+      return false;
+    const totalElapsed = Date.now() - info.startTime;
+    if (info.maxTotalTimeout && totalElapsed >= info.maxTotalTimeout) {
+      this._timeoutInfo.delete(messageId);
+      throw new McpError(ErrorCode.RequestTimeout, "Maximum total timeout exceeded", { maxTotalTimeout: info.maxTotalTimeout, totalElapsed });
+    }
+    clearTimeout(info.timeoutId);
+    info.timeoutId = setTimeout(info.onTimeout, info.timeout);
+    return true;
+  }
+  _cleanupTimeout(messageId) {
+    const info = this._timeoutInfo.get(messageId);
+    if (info) {
+      clearTimeout(info.timeoutId);
+      this._timeoutInfo.delete(messageId);
+    }
+  }
+  async connect(transport) {
+    this._transport = transport;
+    this._transport.onclose = () => {
+      this._onclose();
+    };
+    this._transport.onerror = (error) => {
+      this._onerror(error);
+    };
+    this._transport.onmessage = (message) => {
+      if (!("method" in message)) {
+        this._onresponse(message);
+      } else if ("id" in message) {
+        this._onrequest(message);
+      } else {
+        this._onnotification(message);
+      }
+    };
+    await this._transport.start();
+  }
+  _onclose() {
+    var _a;
+    const responseHandlers = this._responseHandlers;
+    this._responseHandlers = new Map;
+    this._progressHandlers.clear();
+    this._transport = undefined;
+    (_a = this.onclose) === null || _a === undefined || _a.call(this);
+    const error = new McpError(ErrorCode.ConnectionClosed, "Connection closed");
+    for (const handler of responseHandlers.values()) {
+      handler(error);
+    }
+  }
+  _onerror(error) {
+    var _a;
+    (_a = this.onerror) === null || _a === undefined || _a.call(this, error);
+  }
+  _onnotification(notification) {
+    var _a;
+    const handler = (_a = this._notificationHandlers.get(notification.method)) !== null && _a !== undefined ? _a : this.fallbackNotificationHandler;
+    if (handler === undefined) {
+      return;
+    }
+    Promise.resolve().then(() => handler(notification)).catch((error) => this._onerror(new Error(`Uncaught error in notification handler: ${error}`)));
+  }
+  _onrequest(request) {
+    var _a, _b, _c;
+    const handler = (_a = this._requestHandlers.get(request.method)) !== null && _a !== undefined ? _a : this.fallbackRequestHandler;
+    if (handler === undefined) {
+      (_b = this._transport) === null || _b === undefined || _b.send({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: {
+          code: ErrorCode.MethodNotFound,
+          message: "Method not found"
+        }
+      }).catch((error) => this._onerror(new Error(`Failed to send an error response: ${error}`)));
+      return;
+    }
+    const abortController = new AbortController;
+    this._requestHandlerAbortControllers.set(request.id, abortController);
+    const extra = {
+      signal: abortController.signal,
+      sessionId: (_c = this._transport) === null || _c === undefined ? undefined : _c.sessionId
+    };
+    Promise.resolve().then(() => handler(request, extra)).then((result) => {
+      var _a2;
+      if (abortController.signal.aborted) {
+        return;
+      }
+      return (_a2 = this._transport) === null || _a2 === undefined ? undefined : _a2.send({
+        result,
+        jsonrpc: "2.0",
+        id: request.id
+      });
+    }, (error) => {
+      var _a2, _b2;
+      if (abortController.signal.aborted) {
+        return;
+      }
+      return (_a2 = this._transport) === null || _a2 === undefined ? undefined : _a2.send({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: {
+          code: Number.isSafeInteger(error["code"]) ? error["code"] : ErrorCode.InternalError,
+          message: (_b2 = error.message) !== null && _b2 !== undefined ? _b2 : "Internal error"
+        }
+      });
+    }).catch((error) => this._onerror(new Error(`Failed to send response: ${error}`))).finally(() => {
+      this._requestHandlerAbortControllers.delete(request.id);
+    });
+  }
+  _onprogress(notification) {
+    const { progressToken, ...params } = notification.params;
+    const messageId = Number(progressToken);
+    const handler = this._progressHandlers.get(messageId);
+    if (!handler) {
+      this._onerror(new Error(`Received a progress notification for an unknown token: ${JSON.stringify(notification)}`));
+      return;
+    }
+    const responseHandler = this._responseHandlers.get(messageId);
+    if (this._timeoutInfo.has(messageId) && responseHandler) {
+      try {
+        this._resetTimeout(messageId);
+      } catch (error) {
+        responseHandler(error);
+        return;
+      }
+    }
+    handler(params);
+  }
+  _onresponse(response) {
+    const messageId = Number(response.id);
+    const handler = this._responseHandlers.get(messageId);
+    if (handler === undefined) {
+      this._onerror(new Error(`Received a response for an unknown message ID: ${JSON.stringify(response)}`));
+      return;
+    }
+    this._responseHandlers.delete(messageId);
+    this._progressHandlers.delete(messageId);
+    this._cleanupTimeout(messageId);
+    if ("result" in response) {
+      handler(response);
+    } else {
+      const error = new McpError(response.error.code, response.error.message, response.error.data);
+      handler(error);
+    }
+  }
+  get transport() {
+    return this._transport;
+  }
+  async close() {
+    var _a;
+    await ((_a = this._transport) === null || _a === undefined ? undefined : _a.close());
+  }
+  request(request, resultSchema, options) {
+    return new Promise((resolve, reject) => {
+      var _a, _b, _c, _d;
+      if (!this._transport) {
+        reject(new Error("Not connected"));
+        return;
+      }
+      if (((_a = this._options) === null || _a === undefined ? undefined : _a.enforceStrictCapabilities) === true) {
+        this.assertCapabilityForMethod(request.method);
+      }
+      (_b = options === null || options === undefined ? undefined : options.signal) === null || _b === undefined || _b.throwIfAborted();
+      const messageId = this._requestMessageId++;
+      const jsonrpcRequest = {
+        ...request,
+        jsonrpc: "2.0",
+        id: messageId
+      };
+      if (options === null || options === undefined ? undefined : options.onprogress) {
+        this._progressHandlers.set(messageId, options.onprogress);
+        jsonrpcRequest.params = {
+          ...request.params,
+          _meta: { progressToken: messageId }
+        };
+      }
+      const cancel = (reason) => {
+        var _a2;
+        this._responseHandlers.delete(messageId);
+        this._progressHandlers.delete(messageId);
+        this._cleanupTimeout(messageId);
+        (_a2 = this._transport) === null || _a2 === undefined || _a2.send({
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: {
+            requestId: messageId,
+            reason: String(reason)
+          }
+        }).catch((error) => this._onerror(new Error(`Failed to send cancellation: ${error}`)));
+        reject(reason);
+      };
+      this._responseHandlers.set(messageId, (response) => {
+        var _a2;
+        if ((_a2 = options === null || options === undefined ? undefined : options.signal) === null || _a2 === undefined ? undefined : _a2.aborted) {
+          return;
+        }
+        if (response instanceof Error) {
+          return reject(response);
+        }
+        try {
+          const result = resultSchema.parse(response.result);
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      (_c = options === null || options === undefined ? undefined : options.signal) === null || _c === undefined || _c.addEventListener("abort", () => {
+        var _a2;
+        cancel((_a2 = options === null || options === undefined ? undefined : options.signal) === null || _a2 === undefined ? undefined : _a2.reason);
+      });
+      const timeout = (_d = options === null || options === undefined ? undefined : options.timeout) !== null && _d !== undefined ? _d : DEFAULT_REQUEST_TIMEOUT_MSEC;
+      const timeoutHandler = () => cancel(new McpError(ErrorCode.RequestTimeout, "Request timed out", { timeout }));
+      this._setupTimeout(messageId, timeout, options === null || options === undefined ? undefined : options.maxTotalTimeout, timeoutHandler);
+      this._transport.send(jsonrpcRequest).catch((error) => {
+        this._cleanupTimeout(messageId);
+        reject(error);
+      });
+    });
+  }
+  async notification(notification) {
+    if (!this._transport) {
+      throw new Error("Not connected");
+    }
+    this.assertNotificationCapability(notification.method);
+    const jsonrpcNotification = {
+      ...notification,
+      jsonrpc: "2.0"
+    };
+    await this._transport.send(jsonrpcNotification);
+  }
+  setRequestHandler(requestSchema, handler) {
+    const method = requestSchema.shape.method.value;
+    this.assertRequestHandlerCapability(method);
+    this._requestHandlers.set(method, (request, extra) => Promise.resolve(handler(requestSchema.parse(request), extra)));
+  }
+  removeRequestHandler(method) {
+    this._requestHandlers.delete(method);
+  }
+  assertCanSetRequestHandler(method) {
+    if (this._requestHandlers.has(method)) {
+      throw new Error(`A request handler for ${method} already exists, which would be overridden`);
+    }
+  }
+  setNotificationHandler(notificationSchema, handler) {
+    this._notificationHandlers.set(notificationSchema.shape.method.value, (notification) => Promise.resolve(handler(notificationSchema.parse(notification))));
+  }
+  removeNotificationHandler(method) {
+    this._notificationHandlers.delete(method);
+  }
+}
+function mergeCapabilities(base, additional) {
+  return Object.entries(additional).reduce((acc, [key, value]) => {
+    if (value && typeof value === "object") {
+      acc[key] = acc[key] ? { ...acc[key], ...value } : value;
+    } else {
+      acc[key] = value;
+    }
+    return acc;
+  }, { ...base });
+}
+
+// node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.js
+class Server extends Protocol {
+  constructor(_serverInfo, options) {
+    var _a;
+    super(options);
+    this._serverInfo = _serverInfo;
+    this._capabilities = (_a = options === null || options === undefined ? undefined : options.capabilities) !== null && _a !== undefined ? _a : {};
+    this._instructions = options === null || options === undefined ? undefined : options.instructions;
+    this.setRequestHandler(InitializeRequestSchema, (request) => this._oninitialize(request));
+    this.setNotificationHandler(InitializedNotificationSchema, () => {
+      var _a2;
+      return (_a2 = this.oninitialized) === null || _a2 === undefined ? undefined : _a2.call(this);
+    });
+  }
+  registerCapabilities(capabilities) {
+    if (this.transport) {
+      throw new Error("Cannot register capabilities after connecting to transport");
+    }
+    this._capabilities = mergeCapabilities(this._capabilities, capabilities);
+  }
+  assertCapabilityForMethod(method) {
+    var _a, _b;
+    switch (method) {
+      case "sampling/createMessage":
+        if (!((_a = this._clientCapabilities) === null || _a === undefined ? undefined : _a.sampling)) {
+          throw new Error(`Client does not support sampling (required for ${method})`);
+        }
+        break;
+      case "roots/list":
+        if (!((_b = this._clientCapabilities) === null || _b === undefined ? undefined : _b.roots)) {
+          throw new Error(`Client does not support listing roots (required for ${method})`);
+        }
+        break;
+      case "ping":
+        break;
+    }
+  }
+  assertNotificationCapability(method) {
+    switch (method) {
+      case "notifications/message":
+        if (!this._capabilities.logging) {
+          throw new Error(`Server does not support logging (required for ${method})`);
+        }
+        break;
+      case "notifications/resources/updated":
+      case "notifications/resources/list_changed":
+        if (!this._capabilities.resources) {
+          throw new Error(`Server does not support notifying about resources (required for ${method})`);
+        }
+        break;
+      case "notifications/tools/list_changed":
+        if (!this._capabilities.tools) {
+          throw new Error(`Server does not support notifying of tool list changes (required for ${method})`);
+        }
+        break;
+      case "notifications/prompts/list_changed":
+        if (!this._capabilities.prompts) {
+          throw new Error(`Server does not support notifying of prompt list changes (required for ${method})`);
+        }
+        break;
+      case "notifications/cancelled":
+        break;
+      case "notifications/progress":
+        break;
+    }
+  }
+  assertRequestHandlerCapability(method) {
+    switch (method) {
+      case "sampling/createMessage":
+        if (!this._capabilities.sampling) {
+          throw new Error(`Server does not support sampling (required for ${method})`);
+        }
+        break;
+      case "logging/setLevel":
+        if (!this._capabilities.logging) {
+          throw new Error(`Server does not support logging (required for ${method})`);
+        }
+        break;
+      case "prompts/get":
+      case "prompts/list":
+        if (!this._capabilities.prompts) {
+          throw new Error(`Server does not support prompts (required for ${method})`);
+        }
+        break;
+      case "resources/list":
+      case "resources/templates/list":
+      case "resources/read":
+        if (!this._capabilities.resources) {
+          throw new Error(`Server does not support resources (required for ${method})`);
+        }
+        break;
+      case "tools/call":
+      case "tools/list":
+        if (!this._capabilities.tools) {
+          throw new Error(`Server does not support tools (required for ${method})`);
+        }
+        break;
+      case "ping":
+      case "initialize":
+        break;
+    }
+  }
+  async _oninitialize(request) {
+    const requestedVersion = request.params.protocolVersion;
+    this._clientCapabilities = request.params.capabilities;
+    this._clientVersion = request.params.clientInfo;
+    return {
+      protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.includes(requestedVersion) ? requestedVersion : LATEST_PROTOCOL_VERSION,
+      capabilities: this.getCapabilities(),
+      serverInfo: this._serverInfo,
+      ...this._instructions && { instructions: this._instructions }
+    };
+  }
+  getClientCapabilities() {
+    return this._clientCapabilities;
+  }
+  getClientVersion() {
+    return this._clientVersion;
+  }
+  getCapabilities() {
+    return this._capabilities;
+  }
+  async ping() {
+    return this.request({ method: "ping" }, EmptyResultSchema);
+  }
+  async createMessage(params, options) {
+    return this.request({ method: "sampling/createMessage", params }, CreateMessageResultSchema, options);
+  }
+  async listRoots(params, options) {
+    return this.request({ method: "roots/list", params }, ListRootsResultSchema, options);
+  }
+  async sendLoggingMessage(params) {
+    return this.notification({ method: "notifications/message", params });
+  }
+  async sendResourceUpdated(params) {
+    return this.notification({
+      method: "notifications/resources/updated",
+      params
+    });
+  }
+  async sendResourceListChanged() {
+    return this.notification({
+      method: "notifications/resources/list_changed"
+    });
+  }
+  async sendToolListChanged() {
+    return this.notification({ method: "notifications/tools/list_changed" });
+  }
+  async sendPromptListChanged() {
+    return this.notification({ method: "notifications/prompts/list_changed" });
   }
 }
 
@@ -12956,16 +14145,387 @@ var zodToJsonSchema = (schema, options) => {
   }
   return combined;
 };
+// node_modules/@modelcontextprotocol/sdk/dist/esm/server/completable.js
+var McpZodTypeKind;
+(function(McpZodTypeKind2) {
+  McpZodTypeKind2["Completable"] = "McpCompletable";
+})(McpZodTypeKind || (McpZodTypeKind = {}));
+
+class Completable extends ZodType {
+  _parse(input) {
+    const { ctx } = this._processInputParams(input);
+    const data = ctx.data;
+    return this._def.type._parse({
+      data,
+      path: ctx.path,
+      parent: ctx
+    });
+  }
+  unwrap() {
+    return this._def.type;
+  }
+}
+Completable.create = (type, params) => {
+  return new Completable({
+    type,
+    typeName: McpZodTypeKind.Completable,
+    complete: params.complete,
+    ...processCreateParams2(params)
+  });
+};
+function processCreateParams2(params) {
+  if (!params)
+    return {};
+  const { errorMap: errorMap2, invalid_type_error, required_error, description } = params;
+  if (errorMap2 && (invalid_type_error || required_error)) {
+    throw new Error(`Can't use "invalid_type_error" or "required_error" in conjunction with custom error map.`);
+  }
+  if (errorMap2)
+    return { errorMap: errorMap2, description };
+  const customMap = (iss, ctx) => {
+    var _a, _b;
+    const { message } = params;
+    if (iss.code === "invalid_enum_value") {
+      return { message: message !== null && message !== undefined ? message : ctx.defaultError };
+    }
+    if (typeof ctx.data === "undefined") {
+      return { message: (_a = message !== null && message !== undefined ? message : required_error) !== null && _a !== undefined ? _a : ctx.defaultError };
+    }
+    if (iss.code !== "invalid_type")
+      return { message: ctx.defaultError };
+    return { message: (_b = message !== null && message !== undefined ? message : invalid_type_error) !== null && _b !== undefined ? _b : ctx.defaultError };
+  };
+  return { errorMap: customMap, description };
+}
+
+// node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js
+class McpServer {
+  constructor(serverInfo, options) {
+    this._registeredResources = {};
+    this._registeredResourceTemplates = {};
+    this._registeredTools = {};
+    this._registeredPrompts = {};
+    this._toolHandlersInitialized = false;
+    this._completionHandlerInitialized = false;
+    this._resourceHandlersInitialized = false;
+    this._promptHandlersInitialized = false;
+    this.server = new Server(serverInfo, options);
+  }
+  async connect(transport) {
+    return await this.server.connect(transport);
+  }
+  async close() {
+    await this.server.close();
+  }
+  setToolRequestHandlers() {
+    if (this._toolHandlersInitialized) {
+      return;
+    }
+    this.server.assertCanSetRequestHandler(ListToolsRequestSchema.shape.method.value);
+    this.server.assertCanSetRequestHandler(CallToolRequestSchema.shape.method.value);
+    this.server.registerCapabilities({
+      tools: {}
+    });
+    this.server.setRequestHandler(ListToolsRequestSchema, () => ({
+      tools: Object.entries(this._registeredTools).map(([name, tool]) => {
+        return {
+          name,
+          description: tool.description,
+          inputSchema: tool.inputSchema ? zodToJsonSchema(tool.inputSchema, {
+            strictUnions: true
+          }) : EMPTY_OBJECT_JSON_SCHEMA
+        };
+      })
+    }));
+    this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+      const tool = this._registeredTools[request.params.name];
+      if (!tool) {
+        throw new McpError(ErrorCode.InvalidParams, `Tool ${request.params.name} not found`);
+      }
+      if (tool.inputSchema) {
+        const parseResult = await tool.inputSchema.safeParseAsync(request.params.arguments);
+        if (!parseResult.success) {
+          throw new McpError(ErrorCode.InvalidParams, `Invalid arguments for tool ${request.params.name}: ${parseResult.error.message}`);
+        }
+        const args = parseResult.data;
+        const cb = tool.callback;
+        try {
+          return await Promise.resolve(cb(args, extra));
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: error instanceof Error ? error.message : String(error)
+              }
+            ],
+            isError: true
+          };
+        }
+      } else {
+        const cb = tool.callback;
+        try {
+          return await Promise.resolve(cb(extra));
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: error instanceof Error ? error.message : String(error)
+              }
+            ],
+            isError: true
+          };
+        }
+      }
+    });
+    this._toolHandlersInitialized = true;
+  }
+  setCompletionRequestHandler() {
+    if (this._completionHandlerInitialized) {
+      return;
+    }
+    this.server.assertCanSetRequestHandler(CompleteRequestSchema.shape.method.value);
+    this.server.setRequestHandler(CompleteRequestSchema, async (request) => {
+      switch (request.params.ref.type) {
+        case "ref/prompt":
+          return this.handlePromptCompletion(request, request.params.ref);
+        case "ref/resource":
+          return this.handleResourceCompletion(request, request.params.ref);
+        default:
+          throw new McpError(ErrorCode.InvalidParams, `Invalid completion reference: ${request.params.ref}`);
+      }
+    });
+    this._completionHandlerInitialized = true;
+  }
+  async handlePromptCompletion(request, ref) {
+    const prompt = this._registeredPrompts[ref.name];
+    if (!prompt) {
+      throw new McpError(ErrorCode.InvalidParams, `Prompt ${request.params.ref.name} not found`);
+    }
+    if (!prompt.argsSchema) {
+      return EMPTY_COMPLETION_RESULT;
+    }
+    const field = prompt.argsSchema.shape[request.params.argument.name];
+    if (!(field instanceof Completable)) {
+      return EMPTY_COMPLETION_RESULT;
+    }
+    const def = field._def;
+    const suggestions = await def.complete(request.params.argument.value);
+    return createCompletionResult(suggestions);
+  }
+  async handleResourceCompletion(request, ref) {
+    const template = Object.values(this._registeredResourceTemplates).find((t) => t.resourceTemplate.uriTemplate.toString() === ref.uri);
+    if (!template) {
+      if (this._registeredResources[ref.uri]) {
+        return EMPTY_COMPLETION_RESULT;
+      }
+      throw new McpError(ErrorCode.InvalidParams, `Resource template ${request.params.ref.uri} not found`);
+    }
+    const completer = template.resourceTemplate.completeCallback(request.params.argument.name);
+    if (!completer) {
+      return EMPTY_COMPLETION_RESULT;
+    }
+    const suggestions = await completer(request.params.argument.value);
+    return createCompletionResult(suggestions);
+  }
+  setResourceRequestHandlers() {
+    if (this._resourceHandlersInitialized) {
+      return;
+    }
+    this.server.assertCanSetRequestHandler(ListResourcesRequestSchema.shape.method.value);
+    this.server.assertCanSetRequestHandler(ListResourceTemplatesRequestSchema.shape.method.value);
+    this.server.assertCanSetRequestHandler(ReadResourceRequestSchema.shape.method.value);
+    this.server.registerCapabilities({
+      resources: {}
+    });
+    this.server.setRequestHandler(ListResourcesRequestSchema, async (request, extra) => {
+      const resources = Object.entries(this._registeredResources).map(([uri, resource]) => ({
+        uri,
+        name: resource.name,
+        ...resource.metadata
+      }));
+      const templateResources = [];
+      for (const template of Object.values(this._registeredResourceTemplates)) {
+        if (!template.resourceTemplate.listCallback) {
+          continue;
+        }
+        const result = await template.resourceTemplate.listCallback(extra);
+        for (const resource of result.resources) {
+          templateResources.push({
+            ...resource,
+            ...template.metadata
+          });
+        }
+      }
+      return { resources: [...resources, ...templateResources] };
+    });
+    this.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+      const resourceTemplates = Object.entries(this._registeredResourceTemplates).map(([name, template]) => ({
+        name,
+        uriTemplate: template.resourceTemplate.uriTemplate.toString(),
+        ...template.metadata
+      }));
+      return { resourceTemplates };
+    });
+    this.server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
+      const uri = new URL(request.params.uri);
+      const resource = this._registeredResources[uri.toString()];
+      if (resource) {
+        return resource.readCallback(uri, extra);
+      }
+      for (const template of Object.values(this._registeredResourceTemplates)) {
+        const variables = template.resourceTemplate.uriTemplate.match(uri.toString());
+        if (variables) {
+          return template.readCallback(uri, variables, extra);
+        }
+      }
+      throw new McpError(ErrorCode.InvalidParams, `Resource ${uri} not found`);
+    });
+    this.setCompletionRequestHandler();
+    this._resourceHandlersInitialized = true;
+  }
+  setPromptRequestHandlers() {
+    if (this._promptHandlersInitialized) {
+      return;
+    }
+    this.server.assertCanSetRequestHandler(ListPromptsRequestSchema.shape.method.value);
+    this.server.assertCanSetRequestHandler(GetPromptRequestSchema.shape.method.value);
+    this.server.registerCapabilities({
+      prompts: {}
+    });
+    this.server.setRequestHandler(ListPromptsRequestSchema, () => ({
+      prompts: Object.entries(this._registeredPrompts).map(([name, prompt]) => {
+        return {
+          name,
+          description: prompt.description,
+          arguments: prompt.argsSchema ? promptArgumentsFromSchema(prompt.argsSchema) : undefined
+        };
+      })
+    }));
+    this.server.setRequestHandler(GetPromptRequestSchema, async (request, extra) => {
+      const prompt = this._registeredPrompts[request.params.name];
+      if (!prompt) {
+        throw new McpError(ErrorCode.InvalidParams, `Prompt ${request.params.name} not found`);
+      }
+      if (prompt.argsSchema) {
+        const parseResult = await prompt.argsSchema.safeParseAsync(request.params.arguments);
+        if (!parseResult.success) {
+          throw new McpError(ErrorCode.InvalidParams, `Invalid arguments for prompt ${request.params.name}: ${parseResult.error.message}`);
+        }
+        const args = parseResult.data;
+        const cb = prompt.callback;
+        return await Promise.resolve(cb(args, extra));
+      } else {
+        const cb = prompt.callback;
+        return await Promise.resolve(cb(extra));
+      }
+    });
+    this.setCompletionRequestHandler();
+    this._promptHandlersInitialized = true;
+  }
+  resource(name, uriOrTemplate, ...rest) {
+    let metadata;
+    if (typeof rest[0] === "object") {
+      metadata = rest.shift();
+    }
+    const readCallback = rest[0];
+    if (typeof uriOrTemplate === "string") {
+      if (this._registeredResources[uriOrTemplate]) {
+        throw new Error(`Resource ${uriOrTemplate} is already registered`);
+      }
+      this._registeredResources[uriOrTemplate] = {
+        name,
+        metadata,
+        readCallback
+      };
+    } else {
+      if (this._registeredResourceTemplates[name]) {
+        throw new Error(`Resource template ${name} is already registered`);
+      }
+      this._registeredResourceTemplates[name] = {
+        resourceTemplate: uriOrTemplate,
+        metadata,
+        readCallback
+      };
+    }
+    this.setResourceRequestHandlers();
+  }
+  tool(name, ...rest) {
+    if (this._registeredTools[name]) {
+      throw new Error(`Tool ${name} is already registered`);
+    }
+    let description;
+    if (typeof rest[0] === "string") {
+      description = rest.shift();
+    }
+    let paramsSchema;
+    if (rest.length > 1) {
+      paramsSchema = rest.shift();
+    }
+    const cb = rest[0];
+    this._registeredTools[name] = {
+      description,
+      inputSchema: paramsSchema === undefined ? undefined : z.object(paramsSchema),
+      callback: cb
+    };
+    this.setToolRequestHandlers();
+  }
+  prompt(name, ...rest) {
+    if (this._registeredPrompts[name]) {
+      throw new Error(`Prompt ${name} is already registered`);
+    }
+    let description;
+    if (typeof rest[0] === "string") {
+      description = rest.shift();
+    }
+    let argsSchema;
+    if (rest.length > 1) {
+      argsSchema = rest.shift();
+    }
+    const cb = rest[0];
+    this._registeredPrompts[name] = {
+      description,
+      argsSchema: argsSchema === undefined ? undefined : z.object(argsSchema),
+      callback: cb
+    };
+    this.setPromptRequestHandlers();
+  }
+}
+var EMPTY_OBJECT_JSON_SCHEMA = {
+  type: "object"
+};
+function promptArgumentsFromSchema(schema) {
+  return Object.entries(schema.shape).map(([name, field]) => ({
+    name,
+    description: field.description,
+    required: !field.isOptional()
+  }));
+}
+function createCompletionResult(suggestions) {
+  return {
+    completion: {
+      values: suggestions.slice(0, 100),
+      total: suggestions.length,
+      hasMore: suggestions.length > 100
+    }
+  };
+}
+var EMPTY_COMPLETION_RESULT = {
+  completion: {
+    values: [],
+    hasMore: false
+  }
+};
+
 // src/tools-browser-entry.ts
 console.log(GrepRecordInputSchema.shape);
-var GrepRecordInputJsonSchema = zodToJsonSchema(GrepRecordInputSchema);
-var ReadResourceInputJsonSchema = zodToJsonSchema(ReadResourceInputSchema);
-var ReadAttachmentInputJsonSchema = zodToJsonSchema(ReadAttachmentInputSchema);
 export {
+  z,
+  registerEhrTools,
   readResourceLogic,
   readAttachmentLogic,
   grepRecordLogic,
-  ReadResourceInputJsonSchema,
-  ReadAttachmentInputJsonSchema,
-  GrepRecordInputJsonSchema
+  McpServer,
+  IntraBrowserServerTransport
 };

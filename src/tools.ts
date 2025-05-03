@@ -2,7 +2,7 @@
 import { z } from 'zod';
 import _ from 'lodash';
 import { Database } from 'bun:sqlite';
-import vm from 'vm';
+// import vm from 'vm'; // REMOVE static import
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { createFhirRenderer } from './fhirToPlaintext.js'; // Import the renderer
@@ -820,6 +820,16 @@ export async function evalRecordLogic(
     fullEhr: ClientFullEHR,
     userCode: string
 ): Promise<string> { // Returns JSON string
+    // --- Dynamic Import for vm ---
+    let vm: typeof import('vm');
+    try {
+        vm = (await import('vm')).default;
+    } catch (e) {
+        console.error("[EVAL Logic] Failed to dynamically import 'vm'. This tool is likely running in an unsupported environment.", e);
+        return JSON.stringify({ error: "Internal server error: VM module not available." });
+    }
+    // ---------------------------
+
     const logs: string[] = [];
     const errors: string[] = [];
     const MAX_LOG_MESSAGES = 100;

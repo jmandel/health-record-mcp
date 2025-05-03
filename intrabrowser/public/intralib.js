@@ -1,149 +1,236 @@
 /**
  * MCP Tool Server Client Library (for iframe using postMessage)
- * Simplifies implementing MCP server logic within a tool iframe.
+ * Simplifies implementing MCP server logic within an iframe.
+ * Implements delayed handshake: Uses a Promise and signalReady() to coordinate.
  */
+
+// Define a reasonable timeout for waiting for the client handshake
+const HANDSHAKE_TIMEOUT_MS = 15000; // e.g., 15 seconds
+
 export default class MCPToolServer {
+    /**
+     * Creates an MCPToolServer instance.
+     * @param {object} [config] - Configuration options.
+     * @param {object} [config.serverInfo] - Information about this server (e.g., { name: "my-tool", version: "1.0" }).
+     * @param {string[] | string} [config.trustedClientOrigins] - An array of specific origins (e.g., ['https://client.com', 'http://localhost:3000'])
+     *                                                          or a single origin string allowed to connect.
+     *                                                          Use '*' ONLY for local development to allow any origin (INSECURE for production).
+     *                                                          If omitted or invalid, an error is thrown unless '*' is used.
+     * @param {boolean} [config.debug] - Enable verbose logging to the console. Defaults to false.
+     */
     constructor(config = {}) {
         this.serverInfo = config.serverInfo || { name: "mcp-tool", version: "0.0.0" };
-        this.targetOrigin = config.targetOrigin || '*'; // SECURITY: Defaulting to '*' is insecure for production!
-        this.tools = new Map(); // Stores { definition, handlerFn }
-        this.parentWindow = null; // Will be set on first message or if pre-set
+        this.trustedClientOrigins = new Set(
+             Array.isArray(config.trustedClientOrigins)
+                 ? config.trustedClientOrigins.filter(o => o && o !== '*')
+                 : (config.trustedClientOrigins && config.trustedClientOrigins !== '*' ? [config.trustedClientOrigins] : [])
+         );
+        this.allowAnyOrigin = this.trustedClientOrigins.size === 0 && config.trustedClientOrigins === '*';
+
+        this.tools = new Map();
+        this.parentWindow = null;
+        this.actualClientOrigin = null;
+        this.sessionId = `server-pending-${self.crypto.randomUUID()}`;
         this.debug = config.debug || false;
 
-        // Track whether initialize has been processed
-        this._initialized = false;
-        // Interval ID for repeated ready signals
-        this._readyInterval = null;
+        // --- State ---
+        this.isConnected = false;
+        this._appHasSignaledReady = false; // Track if signalReady was called
+        this._pendingClientDetails = null;  // Store details upon handshake arrival
+        this._handshakeTimeoutId = null;   // Timer for handshake timeout
 
-        if (this.targetOrigin === '*') {
-            console.warn("MCPToolServer initialized with targetOrigin '*'. This is insecure and should ONLY be used for local development. Set a specific origin in production.");
-        }
+        // --- Promise for Handshake Arrival ---
+        this._resolveHandshake = null;
+        this._rejectHandshake = null;
+        this._handshakePromise = new Promise((resolve, reject) => {
+            this._resolveHandshake = resolve;
+            this._rejectHandshake = reject;
+        });
 
-        this._log(`Initializing MCPToolServer with origin: ${this.targetOrigin}`);
+        // Start timeout for handshake
+        this._handshakeTimeoutId = setTimeout(() => {
+            if (!this._pendingClientDetails) { // Only reject if handshake hasn't arrived yet
+                this._log(`Timeout (${HANDSHAKE_TIMEOUT_MS}ms) waiting for client handshake.`);
+                this._rejectHandshake?.(new Error("Timeout waiting for client handshake."));
+            }
+        }, HANDSHAKE_TIMEOUT_MS);
+
+        if (this.allowAnyOrigin) {
+             console.warn("MCPToolServer initialized with wildcard origin '*'. Insecure for production.");
+         } else if (this.trustedClientOrigins.size === 0) {
+              throw new Error("MCPToolServer: No specific trustedClientOrigins provided and wildcard '*' not allowed.");
+         } else {
+             this._log("Initializing MCPToolServer - Trusted Origins:", Array.from(this.trustedClientOrigins));
+         }
+
         this._attachListener();
     }
 
     _log(message, ...args) {
+        // Use pending or actual session ID for logging
+        const id = this.isConnected ? this.sessionId : (this._pendingClientDetails?.sessionId || this.sessionId);
         if (this.debug) {
-            console.log(`[MCPToolServer Lib] ${message}`, ...args);
+            console.log(`[MCPToolServer ${id}] ${message}`, ...args);
         }
     }
 
     _attachListener() {
+        window.removeEventListener('message', this._handleMessage);
         window.addEventListener('message', this._handleMessage.bind(this));
-        this._log("Attached message listener.");
+        this._log("Attached message listener. Ready to receive handshake from trusted origins.");
     }
 
     _handleMessage(event) {
-        // --- Origin Validation ---
-        if (this.targetOrigin !== '*' && event.origin !== this.targetOrigin) {
-            this._log(`Ignoring message from invalid origin: ${event.origin}. Expected: ${this.targetOrigin}`);
-            return;
+        // --- Security Checks: Source and Origin ---
+        if (!event.source || event.source !== window.parent) {
+            return; // Must be parent
         }
 
-        // --- Store Parent Reference ---
-        // Store on first valid message or if origin is '*'
-        if (!this.parentWindow && event.source) {
-            this.parentWindow = event.source;
-            this._log(`Stored parent window reference (origin: ${event.origin})`);
-            // If origin was '*', update it to the specific sender's origin for future sends
-            // Note: This assumes the first message is from the intended parent.
-            if (this.targetOrigin === '*') {
-                 // Re-check: Only set if it's not the iframe itself sending a message?
-                 if (event.source !== window) {
-                    this.targetOrigin = event.origin;
-                    this._log(`Updated targetOrigin to specific sender: ${this.targetOrigin}`);
-                 } else {
-                     this._log("Received message from self, not updating targetOrigin yet.");
-                     // Potentially ignore messages from self if not expected
+        let originToCheck = event.origin;
+        let isHandshake = false;
+        let messageData = event.data;
+
+        // --- Handshake Detection ---
+        if (typeof messageData === 'object' && messageData !== null && messageData.type === 'MCP_HANDSHAKE_CLIENT') {
+            isHandshake = true;
+            // *** Origin Check: Against configured trusted list or wildcard ***
+            const isTrusted = this.allowAnyOrigin || this.trustedClientOrigins.has(originToCheck);
+            if (!isTrusted) {
+                this._log(`Ignoring handshake: Origin ${originToCheck} is not in the trusted list. Allowed: ${this.allowAnyOrigin ? '*' : Array.from(this.trustedClientOrigins)}`);
+                return; // Exit if origin is not trusted
+            }
+            // *** Origin check passed ***
+
+            const clientHandshake = messageData;
+            this._log(`Received MCP_HANDSHAKE_CLIENT from TRUSTED origin ${originToCheck}:`, clientHandshake);
+
+            if (!clientHandshake.sessionId) {
+                 this._log("Handshake ignored: Missing sessionId.");
+                 return;
+            }
+
+            // Decide how to handle this valid handshake message...
+            if (this.isConnected && this.actualClientOrigin === originToCheck) {
+                // Re-handshake from same client (e.g., client reload)
+                this._log(`Duplicate handshake from connected origin ${originToCheck}. Session ID: ${clientHandshake.sessionId}. Responding again.`);
+                this.sessionId = clientHandshake.sessionId; // Re-adopt ID
+                 // Respond immediately since app is already ready
+                this._sendHandshakeResponse(clientHandshake.sessionId, event.source, originToCheck);
+            } else if (this.isConnected) {
+                 // Handshake from a different origin while already connected
+                 this._log(`Ignoring handshake from ${originToCheck}, already connected to ${this.actualClientOrigin}.`);
+            } else if (this._pendingClientDetails) {
+                // Already received a handshake, maybe updating details if session ID changed
+                this._log(`Received another handshake while waiting for signalReady. Updating pending details.`);
+                this._pendingClientDetails = {
+                    clientOrigin: originToCheck,
+                    sessionId: clientHandshake.sessionId,
+                    sourceWindow: event.source
+                };
+                // No need to resolve the promise again
+            } else {
+                // First valid handshake received
+                this._log(`Handshake details stored. Resolving handshake promise.`);
+                 this._pendingClientDetails = {
+                     clientOrigin: originToCheck,
+                     sessionId: clientHandshake.sessionId,
+                     sourceWindow: event.source
+                 };
+                 // Resolve the promise to signal arrival
+                 this._resolveHandshake?.();
+                 // Clear the timeout as we received the handshake
+                 if (this._handshakeTimeoutId) {
+                     clearTimeout(this._handshakeTimeoutId);
+                     this._handshakeTimeoutId = null;
                  }
+                 // NOTE: We do NOT complete the connection here yet. signalReady() must still be called.
             }
-        } else if (this.parentWindow && event.source !== this.parentWindow) {
-            this._log(`Warning: Received message from a different source (${event.origin}) than the initial parent (${this.targetOrigin}). Ignoring.`);
-            // This prevents other iframes/windows on the same origin (if targetOrigin='*') from hijacking
-            return;
+            return; // Handshake handled (or stored)
         }
-
-
-        // --- Parsing & Basic Validation ---
-        let message;
-        if (typeof event.data !== 'string') {
-            this._log("Ignoring non-string message data:", event.data);
-            return; // MCP expects stringified JSON
-        }
-        try {
-            message = JSON.parse(event.data);
-            this._log("Received Parsed:", message);
-        } catch (e) {
-            this._log("Failed to parse JSON:", e, "Data:", event.data.substring(0, 100));
-            // Cannot send Parse Error (-32700) without a valid request ID
-            return;
-        }
-
-        // --- JSON-RPC Request Validation ---
-        const isValidRequest = typeof message === 'object' && message !== null &&
-                              typeof message.method === 'string' &&
-                              message.id !== undefined && message.id !== null; // Allow id: 0
-
-        const isNotification = typeof message === 'object' && message !== null &&
-                              typeof message.method === 'string' &&
-                              message.id === undefined;
-
-
-        if (!isValidRequest && !isNotification) {
-            this._log("Ignoring invalid/unrecognized message structure:", message);
-            // Cannot send Invalid Request (-32600) without a valid request ID
-            return;
-        }
-        
-        if(isNotification) {
-             this._log(`Received notification ${message.method}, ignoring.`);
-             // Could add notification handlers later if needed
-             return;
-        }
-
-        // --- Routing ---
-        try {
-            switch (message.method) {
-                case "initialize":
-                    this._handleInitialize(message);
-                    break;
-                case "tools/list":
-                    this._handleToolsList(message);
-                    break;
-                case "tools/call":
-                    // Use Promise.resolve to handle both sync and async handlers gracefully
-                    Promise.resolve(this._handleToolsCall(message))
-                        .catch(err => {
-                            // Catch errors *during* the handler lookup/execution
-                            this._log(`Internal error during tools/call handling for ID ${message.id}:`, err);
-                            this._sendError(message.id, -32603, "Internal server error processing tool call.", { details: err.message });
-                        });
-                    break;
-                case "ping":
-                    this._handlePing(message);
-                    break;
-                // Add other standard MCP methods here if needed (shutdown, etc.)
-                default:
-                    this._log(`Unknown method: ${message.method}`);
-                    this._sendError(message.id, -32601, `Method not found: ${message.method}`);
-                    break;
+        // ... [rest of message handling for connected state] ...
+         else if (this.isConnected) {
+            // --- Standard MCP Message Handling (Only if connected) ---
+            if (originToCheck !== this.actualClientOrigin) { // Check against the specific connected origin
+                this._log(`Ignoring message: Origin ${originToCheck} does not match established client origin ${this.actualClientOrigin}.`);
+                return;
             }
+            // Assume event.data is the object directly
+            messageData = event.data;
+        } else {
+            // Not a handshake and not connected
+            this._log("Ignoring message received before connection established (signalReady not called or handshake incomplete):", messageData);
+            return;
+        }
+
+
+        // --- Process Valid, Connected MCP Message ---
+        try {
+            const isValidRequest = typeof messageData === 'object' && messageData !== null &&
+                                   messageData.jsonrpc === "2.0" &&
+                                   typeof messageData.method === 'string' &&
+                                   messageData.id !== undefined && messageData.id !== null;
+
+            const isNotification = typeof messageData === 'object' && messageData !== null &&
+                                   messageData.jsonrpc === "2.0" &&
+                                   typeof messageData.method === 'string' &&
+                                   messageData.id === undefined;
+
+            if (!isValidRequest && !isNotification) {
+                this._log("Ignoring invalid/unrecognized JSON-RPC message structure:", messageData);
+                return;
+            }
+
+            if(isNotification) {
+                 this._log(`Received notification ${messageData.method}, ignoring.`);
+                 return;
+            }
+
+            // It's a valid request
+            const request = messageData;
+            this._routeRequest(request);
+
         } catch (err) {
-             // Catch synchronous errors in the routing/handler logic itself
-             this._log(`Internal error processing request ID ${message.id}:`, err);
-             this._sendError(message.id, -32603, "Internal server error processing request.", { details: err.message });
+             const messageId = (typeof messageData === 'object' && messageData !== null) ? messageData.id : undefined;
+             this._log(`Internal error processing request ID ${messageId}:`, err);
+             this._sendError(messageId, -32603, "Internal server error processing request.", { details: err.message });
         }
     }
 
-    // --- Public API Methods ---
+     _routeRequest(request) {
+        // Ensure connection is established before routing
+        if (!this.isConnected) {
+             this._log(`Request ${request.method} received but connection not established. Ignoring.`);
+             // Maybe send error? Need request ID.
+             return;
+        }
+        switch (request.method) {
+            case "initialize": this._handleInitialize(request); break;
+            case "tools/list": this._handleToolsList(request); break;
+            case "tools/call":
+                Promise.resolve(this._handleToolsCall(request))
+                    .catch(err => {
+                        this._log(`Internal error during tools/call handling for ID ${request.id}:`, err);
+                        this._sendError(request.id, -32603, "Internal server error processing tool call.", { details: err.message });
+                    });
+                break;
+            case "ping": this._handlePing(request); break;
+            default:
+                this._log(`Unknown method: ${request.method}`);
+                this._sendError(request.id, -32601, `Method not found: ${request.method}`);
+                break;
+         }
+     }
 
     /**
      * Registers a tool and its handler function.
+     * Should ideally be called BEFORE signalReady().
      * @param {object} toolDefinition - Tool definition (name, description, inputSchema, etc.)
-     * @param {Function} handlerFn - Async function(args): Promise<ToolResultContent[]>
+     * @param {Function} handlerFn - Async function(args): Promise<{content: ToolResultContent[], isError: boolean}>
      */
     registerTool(toolDefinition, handlerFn) {
+         if (this.isConnected || this._appHasSignaledReady) {
+             console.warn(`MCPToolServer: registerTool called after signalReady. Tool '${toolDefinition?.name}' might not be listed correctly.`);
+         }
         if (!toolDefinition || typeof toolDefinition.name !== 'string') {
             console.error("MCPToolServer: Invalid tool definition provided to registerTool.", toolDefinition);
             return;
@@ -157,11 +244,94 @@ export default class MCPToolServer {
     }
 
     /**
+     * Signals that the application has finished setup (e.g., registering tools)
+     * and is ready to complete the handshake and handle requests.
+     * This function is now async and will wait for the client handshake if needed.
+     * @returns {Promise<void>} Resolves when the connection is established, rejects on timeout or error.
+     */
+    async signalReady() {
+        this._log("signalReady() called by application.");
+        if (this.isConnected) {
+            this._log("signalReady() called, but already connected. Ignoring.");
+            return;
+        }
+        if (this._appHasSignaledReady) {
+            this._log("signalReady() called multiple times. Returning existing promise/state.");
+            // Optionally return the handshake promise again or just return void
+             await this._handshakePromise; // Ensure we still wait if called rapidly twice
+            return;
+        }
+
+        this._appHasSignaledReady = true; // Mark application as ready
+
+        try {
+            this._log("Waiting for client handshake promise to resolve...");
+            // Wait for the handshake details promise to resolve (or reject on timeout)
+            await this._handshakePromise;
+            this._log("Client handshake promise resolved.");
+
+            // Now that we have the handshake details (_pendingClientDetails is populated), complete the connection.
+             if (this.isConnected) {
+                 this._log("Connection was already completed concurrently. Exiting signalReady.");
+                 return;
+             }
+            this._completeHandshake();
+
+        } catch (error) {
+            this._log("Error during signalReady (likely handshake timeout):", error);
+            // Ensure state reflects failure
+            this.isConnected = false;
+             this.parentWindow = null;
+             this.actualClientOrigin = null;
+             // Re-throw or handle as appropriate for the application
+            throw error;
+        }
+    }
+
+    // --- Helper to complete the handshake ---
+    _completeHandshake() {
+        if (!this._pendingClientDetails) {
+            this._log("Error: _completeHandshake called without pending details (should not happen after await).");
+            // This case should be impossible if signalReady awaits correctly
+            return;
+        }
+         if (this.isConnected) {
+             this._log("Warning: _completeHandshake called when already connected.");
+             return; // Avoid completing twice
+         }
+
+        const { clientOrigin, sessionId, sourceWindow } = this._pendingClientDetails;
+        this.actualClientOrigin = clientOrigin;
+        this.parentWindow = sourceWindow;
+        this.sessionId = sessionId;
+
+        this._log(`Completing handshake. Client: ${this.actualClientOrigin}, Session: ${this.sessionId}`);
+        this._sendHandshakeResponse(this.sessionId, this.parentWindow, this.actualClientOrigin);
+
+        if (this.parentWindow) {
+            this.isConnected = true;
+            // No need for _handshakePending flag anymore
+            // _pendingClientDetails = null; // Keep details for reference? Or clear? Let's clear.
+            this._pendingClientDetails = null;
+            this._log("Connection established and ready for requests.");
+        } else {
+             this._log("Handshake completion failed (likely could not send response). State reset.");
+             this.isConnected = false;
+             // _pendingClientDetails = null; // Already cleared by error handling in sendHandshakeResponse
+        }
+    }
+
+    /**
      * Sends a JSON-RPC notification to the parent.
+     * Requires connection to be established (signalReady called and handshake completed).
      * @param {string} method - The notification method name (e.g., 'tool_status')
      * @param {object} [params] - Optional parameters for the notification.
      */
     sendNotification(method, params) {
+        if (!this.isConnected) {
+             this._log("Cannot send notification: Connection not established.");
+             return;
+        }
         if (!method) return;
         const notification = {
             jsonrpc: "2.0",
@@ -171,61 +341,41 @@ export default class MCPToolServer {
         this._sendMessage(notification);
     }
 
-    /**
-     * Explicitly signal to parent window that this server is ready to handle requests.
-     * Call this after registering all tools.
-     */
-    sendReadySignal() {
-        this._log("Sending ready signal to parent");
-        try {
-            const readyMsg = JSON.stringify({ jsonrpc: "2.0", method: "server_ready" });
-            if (window.parent && window.parent !== window) {
-                window.parent.postMessage(readyMsg, this.targetOrigin);
-                this._log("Sent 'server_ready' notification to parent.");
-                // Kick off interval to keep sending until initialize arrives
-                if (this._readyInterval === null) {
-                    this._readyInterval = setInterval(() => {
-                        if (this._initialized) {
-                            clearInterval(this._readyInterval);
-                            this._readyInterval = null;
-                            return;
-                        }
-                        this._log("Re-sending 'server_ready' notification (awaiting initialize)...");
-                        try {
-                            window.parent.postMessage(readyMsg, this.targetOrigin);
-                        } catch (e) {
-                            this._log("Error re-sending server_ready", e);
-                        }
-                    }, 500);
-                }
-                return true;
-            }
-        } catch(e) {
-            this._log("Error sending server_ready notification", e);
+    // --- Internal Handlers ---
+
+    _sendHandshakeResponse(sessionId, targetWindow, targetOrigin) {
+        if (!targetWindow || !targetOrigin) {
+            this._log("Internal error: Cannot send handshake response - client details missing.");
+            // Reset state as we cannot proceed
+            this.isConnected = false;
+            this._pendingClientDetails = null;
+            this.parentWindow = null;
+            this.actualClientOrigin = null;
+            return;
         }
-        return false;
+        try {
+            const responsePayload = { type: 'MCP_HANDSHAKE_SERVER', sessionId: sessionId };
+            this._log(`Sending MCP_HANDSHAKE_SERVER to origin: ${targetOrigin}`);
+            targetWindow.postMessage(responsePayload, targetOrigin);
+        } catch (e) {
+             this._log(`Error sending MCP_HANDSHAKE_SERVER: ${e.message || e}. Resetting connection state.`);
+             // Reset state as the client will not receive the confirmation
+             this.isConnected = false;
+             this._pendingClientDetails = null;
+             this.parentWindow = null;        // Clear potentially invalid reference
+             this.actualClientOrigin = null;
+        }
     }
 
-    // --- Internal Handlers ---
 
     _handleInitialize(request) {
         this._log("Handling 'initialize'");
-        // Mark that initialize has been received; stop ready interval
-        this._initialized = true;
-        if (this._readyInterval !== null) {
-            clearInterval(this._readyInterval);
-            this._readyInterval = null;
-        }
         const response = {
             jsonrpc: "2.0",
             id: request.id,
             result: {
-                protocolVersion: "2024-11-05", // Align with spec date used elsewhere
-                capabilities: {
-                    // Derive capabilities from registered tools
-                    tools: {} // For now, just indicate tool support exists
-                    // Add other capabilities if supported (prompts, resources, etc.)
-                },
+                protocolVersion: "2024-11-05",
+                capabilities: { tools: {} },
                 serverInfo: this.serverInfo
             }
         };
@@ -238,10 +388,7 @@ export default class MCPToolServer {
         const response = {
             jsonrpc: "2.0",
             id: request.id,
-            result: {
-                tools: toolDefs
-                // nextCursor: undefined // Pagination not implemented
-            }
+            result: { tools: toolDefs }
         };
         this._sendMessage(response);
     }
@@ -252,7 +399,6 @@ export default class MCPToolServer {
         const requestId = request.id;
 
         this._log(`Handling 'tools/call' for tool: ${toolName}`, args);
-
         const toolEntry = this.tools.get(toolName);
 
         if (!toolEntry) {
@@ -280,30 +426,39 @@ export default class MCPToolServer {
             // Expecting it to return { content: ToolResultContent[], isError: boolean }
             const handlerResult = await toolEntry.handlerFn(args || {});
 
-            // --- Validate Handler Result Wrapper ---
-            if (typeof handlerResult !== 'object' || handlerResult === null || !Array.isArray(handlerResult.content)) {
-                this._log(`Invalid structure returned by handler for tool ${toolName} (expected {{content: [], isError: boolean}}):`, handlerResult);
+            // Check what the handler returned and normalize it
+            let finalContent;
+            let finalIsError = false; // Default to success
+
+            if (Array.isArray(handlerResult)) {
+                // Handler returned just the content array - wrap it
+                this._log(`Handler for ${toolName} returned content array directly. Wrapping.`);
+                finalContent = handlerResult;
+                // finalIsError remains false (default)
+            } else if (typeof handlerResult === 'object' && handlerResult !== null && Array.isArray(handlerResult.content)) {
+                // Handler returned the full structure { content: [], isError?: boolean }
+                this._log(`Handler for ${toolName} returned full structure.`);
+                finalContent = handlerResult.content;
+                finalIsError = handlerResult.isError || false; // Use provided isError or default to false
+            } else {
+                // Handler returned an invalid structure
+                this._log(`Invalid structure returned by handler for tool ${toolName} (expected Array or {{content: [], isError?: boolean}}):`, handlerResult);
                 this._sendError(requestId, -32603, `Internal error: Invalid structure returned by tool handler ${toolName}.`);
                 return;
             }
-            const resultContent = handlerResult.content;
-            const resultIsError = handlerResult.isError || false;
 
-            // --- Validate nested content array ---
-            if (!resultContent.every(item => typeof item === 'object' && item !== null && typeof item.type === 'string')) {
-                 this._log(`Invalid content array structure returned by handler for tool ${toolName}:`, resultContent);
-                 this._sendError(requestId, -32603, `Internal error: Invalid content array structure returned by tool handler ${toolName}.`);
-                 return;
+            // Validate nested content array
+            if (!finalContent.every(item => typeof item === 'object' && item !== null && typeof item.type === 'string')) {
+                this._log(`Invalid final content array structure for tool ${toolName}:`, finalContent);
+                this._sendError(requestId, -32603, `Internal error: Invalid content array structure returned by tool handler ${toolName}.`);
+                return;
             }
 
-            // --- Send Success/Error Response based on handler result ---
+            // Send Success/Error Response
             this._sendMessage({
                 jsonrpc: "2.0",
                 id: requestId,
-                result: {
-                    content: resultContent, // Use the validated content
-                    isError: resultIsError  // Use the isError flag from the handler
-                }
+                result: { content: finalContent, isError: finalIsError }
             });
 
         } catch (error) {
@@ -316,34 +471,28 @@ export default class MCPToolServer {
 
      _handlePing(request) {
         this._log("Handling 'ping'");
-        this._sendMessage({
-            jsonrpc: "2.0",
-            id: request.id,
-            result: {} // Empty result indicates success
-        });
+        this._sendMessage({ jsonrpc: "2.0", id: request.id, result: {} });
     }
 
     // --- Messaging Helpers ---
 
     _sendMessage(payload) {
-        if (!this.parentWindow) {
-            this._log("Error sending: Parent window reference not available.");
-            // Maybe queue message? For now, just log error.
+        if (!this.isConnected || !this.parentWindow || !this.actualClientOrigin) {
+            this._log("Error sending: Connection not established or client details missing.");
             return;
         }
         try {
-            const messageString = JSON.stringify(payload);
             this._log("Sending:", payload);
-            this.parentWindow.postMessage(messageString, this.targetOrigin);
+            // Send the object directly, postMessage handles serialization
+            this.parentWindow.postMessage(payload, this.actualClientOrigin);
         } catch (error) {
-            this._log("Error stringifying or sending message:", error, "Payload:", payload);
-            // If it was an error response we failed to send, we can't do much else
+            this._log("Error sending message via postMessage:", error, "Payload:", payload);
+            // Consider if we need to handle errors here, e.g., disconnect?
         }
     }
 
     _sendError(id, code, message, data) {
-        // Only send error if ID is valid (was part of a valid request)
-        if (id !== undefined && id !== null) {
+        if (id !== undefined && id !== null && this.isConnected) {
             this._sendMessage({
                 jsonrpc: "2.0",
                 id: id,
@@ -354,7 +503,7 @@ export default class MCPToolServer {
                 }
             });
         } else {
-            this._log(`Attempted to send error for request without ID. Code: ${code}, Message: ${message}`);
+            this._log(`Attempted to send error for request without ID or before connected. Code: ${code}, Message: ${message}`);
         }
     }
 }
