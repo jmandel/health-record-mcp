@@ -1,4 +1,4 @@
-name: Build and Package EHR Retriever
+name: Build and Package EHR Retriever and Intrabrowser Examples
 
 on:
   push:
@@ -30,15 +30,27 @@ jobs:
       - name: Build EHR Retriever bundle
         run: bun run ./scripts/build-ehretriever.ts -c config.epic-gh-pages.json
 
+      - name: Link main package for intrabrowser build
+        run: bun link
+
+      - name: Build intrabrowser examples
+        working-directory: ./intrabrowser
+        run: |
+          bun link @jmandel/ehr-mcp
+          bun build public/*.html public/**/*.html --outdir out
+          echo "Intrabrowser build complete. Output in intrabrowser/out/"
+
       - name: Prepare artifact directory
         run: |
           mkdir -p artifact_content/dist
           mkdir -p artifact_content/brands
+          mkdir -p artifact_content/server
           cp static/ehretriever.html artifact_content/ehretriever.html # Keep original filename
           cp static/ehretriever.html artifact_content/ehr-callback.html # Additional copy with different name
           cp static/ehretriever.html artifact_content/ehr-connect.html # Additional copy with different name
           cp -r static/dist/* artifact_content/dist/
           cp -r static/brands/* artifact_content/brands/
+          mv intrabrowser/out/* artifact_content/server/
 
       - name: List artifact contents (for debugging)
         run: ls -R artifact_content
