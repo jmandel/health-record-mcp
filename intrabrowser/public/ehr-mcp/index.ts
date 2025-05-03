@@ -1,7 +1,5 @@
         // --- Imports ---
         // Import SDK Server, custom Transport, Zod, and the tool registration helper
-        import * as uuid from 'uuid';
-        console.log(uuid)
         import { McpServer, IntraBrowserServerTransport, z, registerEhrTools } from '@jmandel/ehr-mcp/src/tools-browser-entry.js';
 
         // Dynamically import the bundled browser-safe tool logic
@@ -58,7 +56,8 @@
                      reject("IndexedDB not supported by this browser.");
                      return;
                  }
-                 const request = indexedDB.open(DB_NAME, 1); // Use same version as configure.html
+                 // Open without specifying a version so we always get the latest schema
+                 const request = indexedDB.open(DB_NAME); 
 
                  request.onerror = (event) => {
                      console.error("IndexedDB error:", event.target.error);

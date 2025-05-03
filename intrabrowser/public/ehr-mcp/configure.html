@@ -57,7 +57,7 @@
         const statusDiv = document.getElementById('status');
 
         const DB_NAME = 'ehrMcpDB';
-        const DB_VERSION = 1;
+        const DB_VERSION = 2;
         const STORE_NAME = 'configuration';
 
         // Helper to derive per-config keys
@@ -87,10 +87,13 @@
 
                 // This event only executes if the DB version changes
                 request.onupgradeneeded = (event) => {
+                    // Defensively check and create the store
                     const db = event.target.result;
                     if (!db.objectStoreNames.contains(STORE_NAME)) {
-                        console.log(`Creating object store: ${STORE_NAME}`);
+                        console.log(`Object store '${STORE_NAME}' not found, creating it...`);
                         db.createObjectStore(STORE_NAME);
+                    } else {
+                        console.log(`Object store '${STORE_NAME}' already exists.`);
                     }
                     // Handle future schema upgrades here if needed
                 };
