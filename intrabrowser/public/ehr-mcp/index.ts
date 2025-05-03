@@ -68,15 +68,14 @@
                      resolve(event.target.result);
                  };
 
-                 // No upgrade needed here, assuming configure.html created it
+                 // If the DB is being created for the first time, or upgraded,
+                 // ensure the required object store exists.
                  request.onupgradeneeded = (event) => {
-                      console.warn("IndexedDB upgrade needed during load? This shouldn't happen if configure.html ran.");
-                      // If needed, you could recreate the store here
-                      // const db = event.target.result;
-                      // if (!db.objectStoreNames.contains(STORE_NAME)) {
-                      //     db.createObjectStore(STORE_NAME);
-                      // }
-                      // For robustness, let's allow the success handler to proceed
+                      const db = (event.target as IDBOpenDBRequest).result as IDBDatabase;
+                      if (!db.objectStoreNames.contains(STORE_NAME)) {
+                          console.log(`[openDB] Creating missing object store '${STORE_NAME}' during upgrade/create.`);
+                          db.createObjectStore(STORE_NAME);
+                      }
                  };
              });
         }
