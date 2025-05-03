@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Install MCP Service Worker</title>
+    <style>
+        body { font-family: sans-serif; padding: 1em; }
+        #status { margin-top: 1em; font-weight: bold; }
+        button { padding: 8px 15px; font-size: 14px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>MCP Service Worker Installer</h1>
+    <p>This page registers the Service Worker required for the in-browser MCP OAuth flow.</p>
+    <button id="installBtn">Register Service Worker</button>
+    <div id="status">Status: Idle</div>
+
+    <script>
+        const installBtn = document.getElementById('installBtn');
+        const statusDiv = document.getElementById('status');
+
+        installBtn.addEventListener('click', () => {
+            if ('serviceWorker' in navigator) {
+                statusDiv.textContent = 'Status: Registering...';
+                navigator.serviceWorker.register('/sw.js') // Path relative to origin
+                    .then(registration => {
+                        console.log('[Install Page] ServiceWorker registration successful with scope: ', registration.scope);
+                        statusDiv.textContent = `Status: Registration successful! Scope: ${registration.scope}`;
+                        statusDiv.style.color = 'green';
+                        installBtn.disabled = true;
+                    })
+                    .catch(error => {
+                        console.error('[Install Page] ServiceWorker registration failed: ', error);
+                        statusDiv.textContent = `Status: Registration failed! Error: ${error.message}`;
+                        statusDiv.style.color = 'red';
+                    });
+            } else {
+                console.log('[Install Page] Service workers are not supported by this browser.');
+                statusDiv.textContent = 'Status: Service Workers are not supported by this browser.';
+                statusDiv.style.color = 'orange';
+                installBtn.disabled = true;
+            }
+        });
+
+        // Optional: Check if already controlled on load
+        if (navigator.serviceWorker.controller) {
+            statusDiv.textContent = 'Status: Already controlled by an active Service Worker.';
+            statusDiv.style.color = 'blue';
+            installBtn.disabled = true;
+        }
+
+    </script>
+</body>
+</html> 

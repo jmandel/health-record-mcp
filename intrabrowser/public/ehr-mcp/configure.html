@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Configure EHR MCP Tool</title>
+    <style>
+        body { font-family: sans-serif; padding: 1em; max-width: 600px; margin: auto; }
+        .config-section { margin-bottom: 1.5em; padding: 1em; border: 1px solid #ccc; border-radius: 5px; }
+        label { display: block; margin-bottom: 0.5em; font-weight: bold; }
+        input[type="file"], input[type="text"] { width: 100%; padding: 8px; margin-bottom: 0.5em; box-sizing: border-box; }
+        button { padding: 10px 15px; font-size: 16px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; }
+        button:hover { background-color: #0056b3; }
+        #status { margin-top: 1em; font-weight: bold; padding: 0.5em; border-radius: 4px; }
+        .status-success { color: green; background-color: #e7f4e7; border: 1px solid green; }
+        .status-error { color: red; background-color: #fce8e6; border: 1px solid red; }
+        .status-info { color: #333; background-color: #eee; border: 1px solid #ccc; }
+        small { display: block; color: #555; margin-top: -0.3em; margin-bottom: 0.8em;}
+    </style>
+</head>
+<body>
+    <h1>Configure EHR MCP Tool</h1>
+    <p>Upload an EHR dataset (JSON format) and configure communication settings for the tool.</p>
+
+    <div class="config-section">
+        <label for="ehrFile">1. Upload EHR Data (JSON):</label>
+        <input type="file" id="ehrFile" accept=".json,application/json">
+        <small>Select the JSON file containing the patient's electronic health record data.</small>
+        <div id="fileStatus" class="status-info" style="display: none;">No file selected.</div>
+    </div>
+
+    <div class="config-section">
+        <label for="allowedOrigins">2. Allowed Parent Origins:</label>
+        <input type="text" id="allowedOrigins" value="*">
+        <small>Enter the specific origin(s) allowed to communicate with this tool (comma-separated), or use '*' for any origin (less secure, suitable for local development).</small>
+    </div>
+
+    <div class="config-section">
+        <label for="configKey">Config Identifier (optional):</label>
+        <input type="text" id="configKey" placeholder="global">
+        <small>Specify a config bucket name to associate these settings with.  Use the same ?config=… query when loading the tool iframe.  Leave blank for the default "global" bucket.</small>
+    </div>
+
+    <button id="saveBtn">Save Configuration</button>
+
+    <h2 style="margin-top:2em;">Existing Configurations</h2>
+    <div id="configsList" class="config-section" style="display:none"></div>
+
+    <div id="status" style="display: none;"></div>
+
+    <script>
+        const ehrFileInput = document.getElementById('ehrFile');
+        const fileStatusDiv = document.getElementById('fileStatus');
+        const allowedOriginsInput = document.getElementById('allowedOrigins');
+        const configInput = document.getElementById('configKey');
+        const saveBtn = document.getElementById('saveBtn');
+        const statusDiv = document.getElementById('status');
+
+        const DB_NAME = 'ehrMcpDB';
+        const DB_VERSION = 1;
+        const STORE_NAME = 'configuration';
+
+        // Helper to derive per-config keys
+        function getKeys(configKey){
+            const key = configKey || 'global';
+            return {
+                dataKey: `ehrJsonData::${key}`,
+                originsKey: `ehrMcpAllowedOrigins::${key}`
+            };
+        }
+
+        let ehrFileContent = null;
+
+        // --- IndexedDB Helper Functions ---
+        function openDB() {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+                request.onerror = (event) => {
+                    console.error("IndexedDB error:", event.target.error);
+                    reject(`IndexedDB error: ${event.target.error?.message}`);
+                };
+
+                request.onsuccess = (event) => {
+                    resolve(event.target.result);
+                };
+
+                // This event only executes if the DB version changes
+                request.onupgradeneeded = (event) => {
+                    const db = event.target.result;
+                    if (!db.objectStoreNames.contains(STORE_NAME)) {
+                        console.log(`Creating object store: ${STORE_NAME}`);
+                        db.createObjectStore(STORE_NAME);
+                    }
+                    // Handle future schema upgrades here if needed
+                };
+            });
+        }
+
+        async function saveEhrDataToDB(dataString, key) {
+            const db = await openDB();
+            return new Promise((resolve, reject) => {
+                const transaction = db.transaction([STORE_NAME], 'readwrite');
+                const store = transaction.objectStore(STORE_NAME);
+                // Store as an object to potentially add metadata later
+                const dataObject = { content: dataString }; 
+                const request = store.put(dataObject, key); 
+
+                request.onsuccess = () => {
+                    resolve();
+                };
+
+                request.onerror = (event) => {
+                    console.error('Error saving data to IndexedDB:', event.target.error);
+                    reject(`Error saving data: ${event.target.error?.message}`);
+                };
+
+                transaction.oncomplete = () => {
+                    db.close();
+                    console.log("DB transaction completed.");
+                };
+                 transaction.onerror = (event) => {
+                     // Log transaction errors which might not be caught by request.onerror
+                     console.error('IndexedDB transaction error:', event.target.error);
+                     reject(`DB Transaction error: ${event.target.error?.message}`);
+                 };
+            });
+        }
+        // --- End IndexedDB Helpers ---
+
+        // Handle file selection
+        ehrFileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (!file) {
+                ehrFileContent = null;
+                fileStatusDiv.textContent = 'No file selected.';
+                fileStatusDiv.className = 'status-info';
+                fileStatusDiv.style.display = 'block';
+                return;
+            }
+
+            if (file.type !== 'application/json' && !file.name.endsWith('.json')) {
+                ehrFileContent = null;
+                fileStatusDiv.textContent = `Error: Invalid file type. Please select a JSON file. (Selected: ${file.type || 'unknown'})`;
+                fileStatusDiv.className = 'status-error';
+                fileStatusDiv.style.display = 'block';
+                ehrFileInput.value = ''; // Clear the input
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    // Basic validation: Try parsing to ensure it's valid JSON
+                    JSON.parse(e.target.result);
+                    ehrFileContent = e.target.result; // Store the raw string content
+                    fileStatusDiv.textContent = `File selected: ${file.name} (${(file.size / 1024).toFixed(2)} KB). Ready to save.`;
+                    fileStatusDiv.className = 'status-success';
+                    fileStatusDiv.style.display = 'block';
+                    statusDiv.style.display = 'none'; // Hide main status
+                } catch (jsonError) {
+                    ehrFileContent = null;
+                    fileStatusDiv.textContent = `Error: Failed to parse JSON file. ${jsonError.message}`;
+                    fileStatusDiv.className = 'status-error';
+                    fileStatusDiv.style.display = 'block';
+                    ehrFileInput.value = ''; // Clear the input
+                }
+            };
+            reader.onerror = (e) => {
+                ehrFileContent = null;
+                fileStatusDiv.textContent = 'Error reading file.';
+                fileStatusDiv.className = 'status-error';
+                fileStatusDiv.style.display = 'block';
+            };
+            reader.readAsText(file);
+        });
+
+        // Handle save button click
+        saveBtn.addEventListener('click', async () => {
+            if (!ehrFileContent) {
+                showStatus('Error: Please select a valid EHR JSON file first.', 'error');
+                return;
+            }
+
+            const allowedOrigins = allowedOriginsInput.value.trim();
+            const configKey = configInput.value.trim() || 'global';
+            const {dataKey, originsKey} = getKeys(configKey);
+
+            if (!allowedOrigins) {
+                showStatus('Error: Allowed Origins cannot be empty. Use '*' to allow any origin.', 'error');
+                return;
+            }
+
+            showStatus('Saving configuration... Please wait.', 'info'); // Show progress
+            saveBtn.disabled = true; // Disable button during save
+
+            try {
+                // --- Save EHR data to IndexedDB --- 
+                await saveEhrDataToDB(ehrFileContent, dataKey);
+                console.log('EHR Data saved successfully to IndexedDB.');
+
+                // --- Save allowedOrigins to localStorage (still okay for small setting) ---
+                localStorage.setItem(originsKey, allowedOrigins);
+                console.log('Allowed Origins saved successfully to localStorage.');
+                // --------------------------
+
+                console.log('Configuration saved:');
+                console.log('ehrMcpAllowedOrigins:', allowedOrigins);
+                console.log('ehrMcpConfigData (in IndexedDB) length:', ehrFileContent.length);
+
+                showStatus(`Config "${configKey}" saved. Allowed Origins: ${allowedOrigins}. EHR Data Size: ${(ehrFileContent.length / 1024).toFixed(2)} KB stored in IndexedDB.`, 'success');
+
+            } catch (error) {
+                console.error('Error saving configuration:', error);
+                showStatus(`Error saving configuration: ${error}`, 'error'); // Show error from promise rejection
+            } finally {
+                 saveBtn.disabled = false; // Re-enable button
+            }
+        });
+
+        function showStatus(message, type) {
+            statusDiv.textContent = message;
+            statusDiv.className = `status-${type}`;
+            statusDiv.style.display = 'block';
+        }
+
+        // --- List Existing Configs on Load ---
+        window.addEventListener('load', populateConfigs);
+
+        async function populateConfigs(){
+            const listDiv = document.getElementById('configsList');
+            listDiv.innerHTML = '';
+
+            try{
+                const db = await openDB();
+                const tx = db.transaction([STORE_NAME], 'readonly');
+                const store = tx.objectStore(STORE_NAME);
+                const req = store.getAllKeys();
+                req.onsuccess = async () => {
+                    const keys = req.result.filter(k=>typeof k==='string' && k.startsWith('ehrJsonData::'));
+                    if(keys.length===0){
+                        listDiv.style.display='none';
+                        return;
+                    }
+                    listDiv.style.display='block';
+                    for(const dataKey of keys){
+                        const configName = dataKey.split('::')[1] || 'global';
+                        const dataReq = store.get(dataKey);
+                        await new Promise((res)=>{dataReq.onsuccess=res;});
+                        const jsonStr = dataReq.result?.content || '';
+                        let count = 'n/a';
+                        const sizeMB = (jsonStr.length/1048576).toFixed(2);
+                        try{
+                            const parsed = JSON.parse(jsonStr);
+                            const fhir = parsed.fhir || {};
+                            count = Object.values(fhir).reduce((acc,arr)=>acc+(Array.isArray(arr)?arr.length:0),0);
+                        }catch{}
+                        const item = document.createElement('div');
+                        item.style.marginBottom='0.8em';
+                        item.innerHTML = `<strong>${configName}</strong> &nbsp; — &nbsp; Resources: ${count} &nbsp; | &nbsp; Size: ${sizeMB} MB &nbsp; <button data-cfg="${configName}">Delete</button>`;
+                        listDiv.appendChild(item);
+                        item.querySelector('button').addEventListener('click',()=>deleteConfig(configName));
+                    }
+                };
+            }catch(err){
+               console.error('Error listing configs', err);
+            }
+        }
+
+        async function deleteConfig(cfg){
+            if(!confirm(`Delete configuration '${cfg}'? This cannot be undone.`)) return;
+            const {dataKey, originsKey} = getKeys(cfg);
+            try{
+                const db = await openDB();
+                const tx = db.transaction([STORE_NAME], 'readwrite');
+                tx.objectStore(STORE_NAME).delete(dataKey);
+                tx.oncomplete = ()=>console.log('Deleted dataKey');
+            }catch(e){console.error(e);}
+            localStorage.removeItem(originsKey);
+            await populateConfigs();
+        }
+
+    </script>
+</body>
+</html> 

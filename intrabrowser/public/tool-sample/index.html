@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>MCP Server Tool – Echo (Using Library)</title>
+    <style>
+        body { font-family: sans-serif; padding: 1em; }
+        pre { background-color: #f4f4f4; padding: 1em; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; }
+        code { font-family: monospace; }
+        .note { color: #555; font-style: italic; }
+    </style>
+</head>
+<body>
+
+<h3>MCP Echo Tool Server (Using Library)</h3>
+<p>This iframe implements a basic MCP server exposing an <code>echo</code> tool using the <code>MCPToolServer</code> library.</p>
+<p class="note">The library handles the underlying <code>postMessage</code> communication and MCP protocol details.</p>
+<hr>
+<h4>Server Log:</h4>
+<pre id="log"></pre>
+
+<script type="module">
+    import MCPToolServer from '../intralib.js';
+
+    const logElement = document.getElementById('log');
+    function log(message) {
+        console.log('[Echo Tool]', message);
+        if (logElement) {
+            const time = new Date().toLocaleTimeString();
+            logElement.textContent += `[${time}] ${message}\n`;
+            logElement.scrollTop = logElement.scrollHeight;
+        }
+    }
+
+    const myServerInfo = {
+        name: "iframe-echo-server-lib",
+        version: "1.1.0"
+    };
+
+    const mcpServer = new MCPToolServer({
+        serverInfo: myServerInfo,
+        targetOrigin: '*',
+        debug: true
+    });
+
+    const echoSchema = {
+        type: "object",
+        properties: {
+            text: { type: "string", description: "The text to echo." },
+            delayMs: { type: "number", description: "Optional delay in milliseconds." }
+        },
+        required: ["text"]
+    };
+
+    async function handleEcho(args) {
+        log(`Echoing: ${args.text}`);
+        if (args.delayMs) {
+            log(`Delaying for ${args.delayMs}ms...`);
+            await new Promise(resolve => setTimeout(resolve, args.delayMs));
+        }
+        return [{ type: "text", text: `[From Lib] You sent: ${args.text}` }];
+    }
+
+    mcpServer.registerTool({
+        name: "echo",
+        description: "Echoes back the provided text, with an optional delay (library version).",
+        inputSchema: echoSchema
+    }, handleEcho);
+
+    mcpServer.sendReadySignal();
+
+    log("Echo server script loaded and tool registered using MCPToolServer library.");
+
+</script>
+
+</body>
+</html> 

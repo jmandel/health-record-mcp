@@ -1,0 +1,17 @@
+{
+  "name": "mcp-intrabrowser-proxy-bun",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot src/server.ts",
+    "start": "bun src/server.ts"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "ws": "^8.17.0",
+    "uuid": "^9.0.1"
+  }
+}
+

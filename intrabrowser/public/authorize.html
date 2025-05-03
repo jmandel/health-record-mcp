@@ -1,0 +1,87 @@
+<!-- public/authorize.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SW MCP Proxy Authorization</title>
+  <style>
+    body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; flex-direction: column; text-align: center; }
+    button { padding: 10px 20px; font-size: 16px; cursor: pointer; margin-top: 1em; }
+    code { background: #eee; padding: 2px 5px; border-radius: 3px; }
+    .error { color: red; font-weight: bold; margin-top: 1em; }
+  </style>
+</head>
+<body>
+  <h1>Authorize Access (via Service Worker)</h1>
+  <p id="message">Client requests access.</p>
+  <button id="authorizeBtn" disabled>Authorize and Open Tool</button>
+  <p id="errorMsg" class="error" style="display: none;"></p>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const authorizeBtn = document.getElementById('authorizeBtn');
+    const errorMsg = document.getElementById('errorMsg');
+    const messageEl = document.getElementById('message');
+
+    // Extract data passed from the Service Worker via redirect
+    const toolToken = params.get('token'); // For opening the portal WS
+    const authCode = params.get('code'); // For redirecting the client
+    const clientRedirectUri = params.get('client_redirect_uri'); // Where to send the client back to
+    const state = params.get('state'); // Opaque state value
+
+    if (!toolToken || !authCode || !clientRedirectUri) {
+        messageEl.textContent = 'Authorization cannot proceed.';
+        errorMsg.textContent = 'Error: Missing required parameters from authorization server.';
+        errorMsg.style.display = 'block';
+        authorizeBtn.disabled = true;
+        console.error("Missing params:", { toolToken, authCode, clientRedirectUri });
+    } else {
+        messageEl.innerHTML = `Client requesting authorization requires you to click the button below.`; // Simplified message
+        authorizeBtn.disabled = false;
+        console.log("Params received:", { toolToken, authCode, clientRedirectUri, state });
+
+        authorizeBtn.addEventListener('click', () => {
+            console.log("Authorize button clicked.");
+            // 1. Construct Tool URL (portal page) using the provided token
+            const toolUrl = new URL('/', window.location.origin); // Relative to origin
+            toolUrl.searchParams.set('token', toolToken);
+            console.log("Opening tool URL:", toolUrl.toString());
+            window.open(toolUrl.toString(), '_blank', 'popup');
+
+            // 2. Construct the redirect URL for the *original client*
+            // Use the clientRedirectUri passed from the SW
+            // This MUST be an absolute URL or one resolvable by the *client*.
+            // Assuming it's often relative to the origin or absolute.
+            // For safety, let's try resolving relative to origin if it's not absolute.
+             let redirectUrl;
+             try {
+                 // Try creating URL directly - works for absolute URLs
+                 redirectUrl = new URL(clientRedirectUri);
+             } catch (e) {
+                 // If it fails, assume it's relative to the origin
+                 console.warn(`clientRedirectUri "${clientRedirectUri}" is not absolute, resolving relative to origin.`);
+                 try {
+                    redirectUrl = new URL(clientRedirectUri, window.location.origin);
+                 } catch (e2) {
+                     console.error("Failed to construct final redirect URL:", e2);
+                     errorMsg.textContent = 'Error: Invalid client redirect URI provided.';
+                     errorMsg.style.display = 'block';
+                     authorizeBtn.disabled = true;
+                     return; // Stop execution
+                 }
+             }
+
+            redirectUrl.searchParams.set('code', authCode); // Pass the auth code back
+            if (state !== null && state !== undefined) { // Check for null/undefined, not just truthiness
+                redirectUrl.searchParams.set('state', state);
+            }
+            console.log("Redirecting client to:", redirectUrl.toString());
+
+            // 3. Redirect the current tab (where the user clicked the button)
+            window.location.href = redirectUrl.toString();
+        });
+    }
+  </script>
+</body>
+</html> 
