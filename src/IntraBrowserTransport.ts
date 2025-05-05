@@ -4,6 +4,66 @@ import { JSONRPCMessage, JSONRPCMessageSchema, McpError, ErrorCode, JSONRPCReque
 const HANDSHAKE_INTERVAL_MS = 200; // How often client sends handshake ping
 const HANDSHAKE_TIMEOUT_MS = 15000; // Max time client waits for handshake response
 
+// --- Setup Protocol Message Interfaces ---
+/** =========  client ← iframe / window =========== */
+export interface ServerSetupRequirements {
+  type: 'SERVER_SETUP_REQUIREMENTS';
+  /** Provider still needs a configuration step in a first‑party window */
+  needsConfiguration: boolean;
+  /** Provider needs Storage‑Access (document.requestStorageAccess())   */
+  needsPermission: boolean;
+}
+
+export interface ServerPermissionResult {
+  type: 'SERVER_PERMISSION_RESULT';
+  granted: boolean;
+}
+
+export interface ServerConfigured {
+  type: 'SERVER_CONFIGURED';
+  success: boolean;         // true = user clicked "Save / Done"
+  error?: string;           // optional detail if success === false
+}
+
+export interface ServerSetupError {
+  type: 'SERVER_SETUP_ERROR';
+  code: 'CONFIG_FAILED' | 'PERMISSION_DENIED' | 'UNEXPECTED';
+  message: string;
+}
+
+/** =========  client → iframe / window  ========= */
+export interface ClientTriggerPermission {
+  type: 'CLIENT_TRIGGER_PERMISSION';   // no payload
+}
+// --- End Setup Protocol Message Interfaces ---
+
+
+// --- Setup Helper Types ---
+
+/** Hand‑over for UI events during setup */
+export interface UiCallbacks {
+  onRequirements(
+    req: ServerSetupRequirements,
+    actions: {
+      openConfigure: () => void;      // call in **Configure** button
+      triggerPermission: () => void;  // call in **Allow** button
+    }
+  ): void;
+  /** Allows the setup helper to report status changes back to the UI */
+  onStatusUpdate(status: 'configuring' | 'awaiting_permission' | 'error', message?: string): void;
+}
+
+/** Simplified error type for setup failures */
+export class SetupError extends Error {
+  constructor(public code: string, message: string) {
+     super(message);
+     this.name = 'SetupError'; // Optional: Set name for better debugging
+  }
+}
+
+// --- End Setup Helper Types ---
+
+
 // --- Helper Functions ---
 
 // Type guard to check if a message is a valid JSON-RPC Request
@@ -84,6 +144,7 @@ export class IntraBrowserClientTransport implements Transport {
     this.iframeSrc = iframeSrc;
     this.serverOrigin = serverOrigin;
     this.clientOrigin = window.location.origin;
+    console.log(`[ClientTransport ${this.sessionId}] NEW INSTANCE CREATED`, { iframeSrc, serverOrigin, clientOrigin: this.clientOrigin });
   }
 
   /**
@@ -91,12 +152,13 @@ export class IntraBrowserClientTransport implements Transport {
    * and resolves when the server acknowledges the handshake.
    */
   public start(): Promise<void> {
+    console.log(`[ClientTransport ${this.sessionId}] start() called. isStarting=${this.isStarting}, isConnected=${this.isConnected}`);
     if (this.isStarting || this.isConnected) {
       console.warn(`[ClientTransport ${this.sessionId}] start() called while already starting or connected.`);
       return this.startPromise || Promise.resolve();
     }
     this.isStarting = true;
-    console.log(`[ClientTransport ${this.sessionId}] start() invoked.`);
+    console.log(`[ClientTransport ${this.sessionId}] start() proceeding...`);
 
     window.removeEventListener('message', this.handleMessage); // Clean up previous if any
     window.addEventListener('message', this.handleMessage);
@@ -108,6 +170,7 @@ export class IntraBrowserClientTransport implements Transport {
       this.startReject = reject;
 
       try {
+        console.log(`[ClientTransport ${this.sessionId}] Creating iframe element...`);
         this.iframeElement = document.createElement('iframe');
         // this.iframeElement.setAttribute('sandbox', 'allow-scripts'); // Minimal permissions
         this.iframeElement.style.display = 'none';
@@ -143,6 +206,7 @@ export class IntraBrowserClientTransport implements Transport {
         };
 
         this.iframeElement.src = this.iframeSrc;
+        console.log(`[ClientTransport ${this.sessionId}] Appending iframe to DOM...`);
         document.body.appendChild(this.iframeElement);
         console.log(`[ClientTransport ${this.sessionId}] Iframe appended to DOM.`);
 

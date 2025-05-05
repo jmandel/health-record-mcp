@@ -2,21 +2,50 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>MCP Server Tool – Echo (Using SDK + IntraBrowserTransport)</title>
+    <title>MCP Server Tool – Echo (Setup/Run)</title>
     <style>
-        body { font-family: sans-serif; padding: 1em; }
+        body { font-family: sans-serif; padding: 1em; margin: 0; background-color: #f0f0f0; /* distinguish iframe */ }
         pre { background-color: #f4f4f4; padding: 1em; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; }
         code { font-family: monospace; }
-        .note { color: #555; font-style: italic; }
+        .note { color: #555; font-style: italic; font-size: 0.9em; margin-top: 0.5em; }
+        button { padding: 0.5em 1em; font-size: 1em; cursor: pointer; }
+        /* Style the permission button container for setup phase */
+        #setup-phase-content { 
+            display: none; /* Hidden by default, shown by script */
+            text-align: center; 
+            padding-top: 1em;
+        }
     </style>
 </head>
 <body>
 
-<h3>MCP Echo Tool Server (Using SDK + IntraBrowserTransport)</h3>
-<p>This iframe implements a basic MCP server exposing an <code>echo</code> tool using the official <code>McpServer</code> and a custom <code>IntraBrowserServerTransport</code>.</p>
-<hr>
-<h4>Server Log:</h4>
-<pre id="log"></pre>
+
+<!-- Setup Phase Content -->
+<div id="setup-phase-content" style="display: none;">
+    <h4>Echo Tool Provider Setup</h4>
+    <p>Please grant storage access, then configure the suffix.</p>
+    <div style="margin: 1em 0;">
+        <label for="suffix-input">Echo Suffix:</label>
+        <input type="text" id="suffix-input" placeholder="e.g., !" disabled/>
+    </div>
+    <div style="margin: 1em 0;">
+        <label>Config Status: <span id="setup-config-status">Checking...</span></label>
+    </div>
+    <div style="margin: 1em 0;">
+        <label>Storage Access: <span id="setup-storage-status">Checking...</span></label>
+    </div>
+    <hr>
+    <button id="grant-access-btn" disabled>Grant Storage Access</button>
+    <button id="save-finish-btn" disabled style="margin-left: 1em;">Save Suffix & Finish</button>
+    <button id="abort-btn" style="margin-left: 1em; color: red; border-color: red;">Abort Setup</button>
+    <p class="note" id="setup-note">Checking current status...</p>
+</div>
+
+<!-- Transport/Log Section (Shown by default in transport phase) -->
+<div id="transport-section" style="display: none;">
+    <h4>Server Log:</h4>
+    <pre id="log"></pre>
+</div>
 
 <script type="module" src="index.ts"></script>
 
