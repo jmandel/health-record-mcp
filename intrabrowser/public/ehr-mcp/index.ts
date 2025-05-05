@@ -17,6 +17,7 @@
 
         const dataKey = `ehrJsonData::${configKey}`;
         const originsKey = `ehrMcpAllowedOrigins::${configKey}`;
+        const DEFAULT_CONFIG_LS_KEY = 'ehrMcpDefaultConfigName'; // Key for partitioned localStorage
 
         let logElement: HTMLElement | null = document.getElementById('log');
         let statusElement: HTMLElement | null = document.getElementById('toolStatus');
@@ -29,24 +30,31 @@
         let grantAccessBtn: HTMLButtonElement | null = null;
         let abortBtn: HTMLButtonElement | null = null;
         let setupNoteSpan: HTMLElement | null = null;
-        // New setup elements for config
+        // Setup elements for config
         let setupInstructionP: HTMLElement | null = null;
         let configInputsDiv: HTMLElement | null = null;
+        let configNameInput: HTMLInputElement | null = null;
         let ehrFileInput: HTMLInputElement | null = null;
         let fileStatusDiv: HTMLElement | null = null;
-        let allowedOriginsInput: HTMLInputElement | null = null;
         let saveConfigBtn: HTMLButtonElement | null = null;
+        let doneBtn: HTMLButtonElement | null = null;
+        let connectEhrBtn: HTMLButtonElement | null = null;
 
         // Transport Phase Elements
         let transportSection: HTMLElement | null = null;
         let testUiContainer: HTMLElement | null = null; // For Test UI
 
+        // Config List Elements
+        let configsListContainer: HTMLElement | null = null;
+        let configsListDiv: HTMLElement | null = null;
+
         // --- State ---
-        let ehrFileContent: string | null = null; // For storing uploaded EHR data string
+        let ehrDataToSave: string | null = null; // Holds JSON string from file OR connection
         let fullEhr: ClientFullEHR | null = null; // Use imported type
-        let allowedOrigins = '*'; // Default allowed origins
+        let currentAllowedOrigin: string | null = null; // Loaded for the current config in transport phase
         let mcpServer: McpServer | null = null; // Use imported type
         let transport: IntraBrowserServerTransport | null = null; // Use imported type
+        let setupClientOrigin: string | null = null; // Store client origin passed during setup
 
         // --- Helper Functions ---
         function log(message: string, ...args: any[]) {
@@ -67,6 +75,19 @@
         }
 
         // --- Permissions and IndexedDB Helpers ---
+
+        // Helper to derive per-config keys
+        function getKeys(configName: string | null | undefined){
+            const key = configName || 'global';
+            if (!key.match(/^[a-zA-Z0-9_-]+$/)) { // Basic validation for key safety
+                throw new Error('Invalid configuration name. Use letters, numbers, underscore, or hyphen.');
+            }
+            return {
+                dataKey: `ehrJsonData::${key}`,
+                originsKey: `ehrMcpAllowedOrigins::${key}`,
+                configName: key // Return the validated/defaulted name
+            };
+        }
 
         // Helper to get the correct IDBFactory (unpartitioned if handle exists, otherwise global)
         function getIdbFactory(): IDBFactory {
@@ -194,7 +215,7 @@
              postToParent(message, clientOrigin);
         }
 
-        async function loadEhrDataFromDB(): Promise<string | null> { // Return string or null
+        async function loadEhrDataFromDB(dataKey: string): Promise<string | null> { // Return string or null
             try {
                 const db = await openDB();
                 return new Promise<string | null>((resolve, reject) => {
@@ -275,10 +296,177 @@
             });
         }
 
+        // --- Default Config Helpers (using Partitioned localStorage) ---
+        function getDefaultConfigName(): string | null {
+            try {
+                // Explicitly use window.localStorage for partitioned access
+                return window.localStorage.getItem(DEFAULT_CONFIG_LS_KEY);
+            } catch (e) {
+                log("Error reading default config name from partitioned localStorage:", e);
+                return null;
+            }
+        }
+
+        function setDefaultConfigName(name: string): void {
+            try {
+                // Explicitly use window.localStorage for partitioned access
+                window.localStorage.setItem(DEFAULT_CONFIG_LS_KEY, name);
+                log(`Set default config name to '${name}' in partitioned localStorage.`);
+                // We'll call populateConfigsList separately to update UI
+            } catch (e) {
+                log("Error setting default config name in partitioned localStorage:", e);
+            }
+        }
+
+        // --- Config List Management ---
+        async function populateConfigsList() {
+            if (!configsListContainer || !configsListDiv) return;
+
+            configsListDiv.innerHTML = '<i>Loading...</i>';
+            configsListContainer.style.display = 'block'; // Show the container
+            const defaultConfig = getDefaultConfigName();
+
+            try {
+                const db = await openDB();
+                if (!db.objectStoreNames.contains(STORE_NAME)) {
+                    configsListDiv.innerHTML = '<i>No configurations found (store missing).</i>';
+                    db.close();
+                    return;
+                }
+                const tx = db.transaction([STORE_NAME], 'readonly');
+                const store = tx.objectStore(STORE_NAME);
+                const getAllKeysRequest = store.getAllKeys();
+
+                getAllKeysRequest.onerror = () => {
+                    configsListDiv!.innerHTML = '<i>Error loading configurations.</i>';
+                };
+
+                getAllKeysRequest.onsuccess = () => {
+                    // Filter for strings first, then map
+                    const keys = getAllKeysRequest.result
+                        .filter((k): k is string => typeof k === 'string' && k.startsWith('ehrJsonData::'))
+                        .map(k => k.substring('ehrJsonData::'.length)); // Extract config name
+
+                    if (keys.length === 0) {
+                        configsListDiv!.innerHTML = '<i>No configurations found.</i>';
+                        return;
+                    }
+
+                    configsListDiv!.innerHTML = ''; // Assert non-null, clear loading message
+                    keys.sort().forEach(configName => {
+                        const item = document.createElement('div');
+                        item.style.marginBottom = '0.5em';
+
+                        const nameSpan = document.createElement('span');
+                        nameSpan.textContent = configName;
+                        if (configName === defaultConfig) {
+                            nameSpan.classList.add('default-config');
+                            nameSpan.title = 'Default configuration';
+                        }
+                        item.appendChild(nameSpan);
+
+                        const deleteBtn = document.createElement('button');
+                        deleteBtn.textContent = 'Delete';
+                        deleteBtn.onclick = () => deleteConfig(configName);
+                        item.appendChild(deleteBtn);
+
+                        if (configName !== defaultConfig) {
+                            const defaultBtn = document.createElement('button');
+                            defaultBtn.textContent = 'Set Default';
+                            defaultBtn.onclick = () => {
+                                setDefaultConfigName(configName);
+                                populateConfigsList(); // Refresh list to show new default
+                            };
+                            item.appendChild(defaultBtn);
+                        }
+                        configsListDiv!.appendChild(item);
+                    });
+                };
+
+                // Close the DB when the transaction completes
+                tx.oncomplete = () => {
+                    db.close();
+                };
+                tx.onerror = () => {
+                    // Error already handled by getAllKeysRequest.onerror
+                     db.close(); 
+                };
+
+            } catch (err) {
+                console.error('Error accessing IndexedDB to populate configs:', err);
+                configsListDiv.innerHTML = '<i>Error accessing database.</i>';
+            }
+        }
+
+        async function deleteConfig(configName: string): Promise<void> {
+            if (!confirm(`Are you sure you want to delete the configuration named "${configName}"? This cannot be undone.`)) {
+                return;
+            }
+            log(`Deleting configuration: ${configName}`);
+            try {
+                const { dataKey, originsKey } = getKeys(configName);
+                const db = await openDB();
+                if (db.objectStoreNames.contains(STORE_NAME)) {
+                    const tx = db.transaction([STORE_NAME], 'readwrite');
+                    tx.objectStore(STORE_NAME).delete(dataKey);
+                    await new Promise((resolve, reject) => {
+                        tx.oncomplete = resolve;
+                        tx.onerror = reject;
+                    });
+                    db.close();
+                    log(`Deleted data key '${dataKey}' from IndexedDB.`);
+                } else {
+                     log(`Store '${STORE_NAME}' not found, skipping IndexedDB delete for ${dataKey}.`);
+                     db.close();
+                }
+
+                // Delete origin from localStorage (use getStorage for potential unpartitioned access)
+                try {
+                    // Use partitioned localStorage for origins config associated with IDB data
+                    window.localStorage.removeItem(originsKey);
+                    log(`Removed origins key '${originsKey}' from localStorage.`);
+                } catch (e) {
+                    log(`Error removing origins key '${originsKey}' from localStorage:`, e);
+                }
+
+                // If deleting the default, clear the default setting
+                if (getDefaultConfigName() === configName) {
+                    log(`Clearing default config setting because '${configName}' was deleted.`);
+                    window.localStorage.removeItem(DEFAULT_CONFIG_LS_KEY); // Explicitly partitioned
+                }
+
+            } catch (error: any) {
+                console.error(`Error deleting config '${configName}':`, error);
+                // Optionally show an error message to the user
+                alert(`Failed to delete configuration: ${error.message || error}`);
+            }
+
+            // Refresh the list after deletion
+            await populateConfigsList();
+        }
+
         // --- Main Initialization Function (Renamed to handleTransportPhase) ---
         async function handleTransportPhase() { // Renamed
             log('Running in TRANSPORT phase.');
             setStatus('Initializing transport phase...');
+
+            // --- Determine Config Name --- 
+            const urlConfig = urlParams.get('config');
+            const defaultConfig = getDefaultConfigName();
+            const effectiveConfigName = urlConfig || defaultConfig || 'global';
+            log(`Using configuration: '${effectiveConfigName}' (URL: ${urlConfig}, Default: ${defaultConfig})`);
+
+            let resolvedDataKey: string;
+            let resolvedOriginsKey: string;
+            try {
+                const keys = getKeys(effectiveConfigName);
+                resolvedDataKey = keys.dataKey;
+                resolvedOriginsKey = keys.originsKey;
+            } catch (e: any) {
+                log("CRITICAL ERROR: Invalid configuration name provided or determined.", e.message);
+                setStatus(`Error: Invalid configuration name '${effectiveConfigName}'`, 'error');
+                return; // Stop initialization
+            }
 
             // --- Activate Storage Access before proceeding ---
             const permissionState = await getStoragePermissionState();
@@ -303,23 +491,22 @@
 
             log('Attempting to load configuration...');
             try {
-                // 1. Load Allowed Origins from LocalStorage (Still uses default localStorage)
-                // Note: This might be partitioned if storage access wasn't granted/activated!
-                // Consider if origins also need unpartitioned storage or separate config mechanism.
-                const storedOrigins = localStorage.getItem(originsKey);
+                // 1. Load Allowed Origins from Partitioned localStorage for the determined config
+                const storedOrigins = window.localStorage.getItem(resolvedOriginsKey);
                 if (storedOrigins) {
-                    allowedOrigins = storedOrigins;
-                    log(`Loaded allowed origins: ${allowedOrigins} (from default localStorage)`);
+                    currentAllowedOrigin = storedOrigins;
+                    log(`Loaded allowed origin '${currentAllowedOrigin}' for config '${effectiveConfigName}' from partitioned localStorage.`);
                 } else {
-                    log(`Using default allowed origins: ${allowedOrigins}`);
+                    log(`No specific allowed origin found for config '${effectiveConfigName}' in partitioned localStorage. Using default ('*').`);
+                    currentAllowedOrigin = '*'; // Default if not found
                 }
 
-                // 2. Load EHR Data from IndexedDB (Uses getIdbFactory())
+                // 2. Load EHR Data from IndexedDB (Uses getIdbFactory() for potential unpartitioning)
                 setStatus('Loading EHR data from IndexedDB...');
-                const ehrDataString = await loadEhrDataFromDB();
+                const ehrDataString = await loadEhrDataFromDB(resolvedDataKey); // Pass specific dataKey
 
                 if (!ehrDataString) {
-                    throw new Error('EHR data not found in IndexedDB. Please run the configuration page (ehr-mcp/configure.html) first.');
+                    throw new Error(`EHR data for config '${effectiveConfigName}' (key: ${resolvedDataKey}) not found in IndexedDB. Please run setup first.`);
                 }
 
                 // 3. Parse EHR Data
@@ -346,7 +533,8 @@
                 log("McpServer instance created.");
 
                 transport = new IntraBrowserServerTransport({
-                     trustedClientOrigins: allowedOrigins === '*' ? '*' : allowedOrigins.split(',').map(s => s.trim()).filter(Boolean)
+                    // Ensure currentAllowedOrigin is not null before splitting
+                    trustedClientOrigins: currentAllowedOrigin === '*' ? '*' : (currentAllowedOrigin || '*').split(',').map(s => s.trim()).filter(Boolean)
                 });
                 log("IntraBrowserServerTransport instance created.");
 
@@ -493,9 +681,10 @@
             log("Running in SETUP phase.");
             // Verify all essential elements are present
             if (!clientOrigin || !setupSection || !setupStorageStatusSpan || !grantAccessBtn || !abortBtn || !setupNoteSpan || 
-                !configInputsDiv || !ehrFileInput || !fileStatusDiv || !allowedOriginsInput || !saveConfigBtn || !setupInstructionP) {
+                !configInputsDiv || !ehrFileInput || !fileStatusDiv || !configNameInput || !saveConfigBtn || !setupInstructionP || !doneBtn || !connectEhrBtn) {
                 log("Error: Setup phase requires client origin or essential DOM elements are missing.");
                 if (clientOrigin) {
+                    log("*** Sending SERVER_SETUP_ABORT due to setup phase error (missing elements) ***");
                     sendSetupStatus('SERVER_SETUP_ABORT', { code: 'FAILED', reason: 'Setup iframe internal error (missing elements)' }, clientOrigin);
                 }
                 return;
@@ -507,66 +696,68 @@
             if (statusElement) statusElement.style.display = 'none'; // Hide main status
 
             // --- Helper to enable/disable configuration part of the UI ---
-            const enableConfigUI = (enable: boolean) => {
+            const enableConfigUI = (enable: boolean, isSetupComplete: boolean = false) => {
                 configInputsDiv!.style.display = enable ? 'block' : 'none';
+                configNameInput!.disabled = !enable;
                 ehrFileInput!.disabled = !enable;
-                allowedOriginsInput!.disabled = !enable;
-                saveConfigBtn!.disabled = true; // Always start disabled when state changes
-                fileStatusDiv!.textContent = 'No file selected.';
+                connectEhrBtn!.disabled = !enable; // Enable/disable connect button too
+                saveConfigBtn!.disabled = true; // Always start disabled when config UI state changes
+                doneBtn!.disabled = !isSetupComplete; // Enable Done only after initial access grant
+                fileStatusDiv!.textContent = 'No data loaded.';
                 fileStatusDiv!.className = 'status-info';
-                fileStatusDiv!.style.display = 'block';
-                ehrFileContent = null; // Reset file content
+                fileStatusDiv!.style.display = 'none'; // Hide status initially
+                ehrDataToSave = null; // Reset data
                 ehrFileInput!.value = ''; // Reset file input
             };
 
             // --- File Input Handler ---
-            ehrFileInput.addEventListener('change', (event) => {
+            ehrFileInput!.addEventListener('change', (event) => {
                 const target = event.target as HTMLInputElement;
                 const file = target.files?.[0];
+                saveConfigBtn!.disabled = true; // Disable save button initially
                 if (!file) {
-                    ehrFileContent = null;
-                    fileStatusDiv!.textContent = 'No file selected.';
+                    ehrDataToSave = null;
+                    fileStatusDiv!.textContent = 'File removed.';
                     fileStatusDiv!.className = 'status-info';
-                    fileStatusDiv!.style.display = 'block';
-                    saveConfigBtn!.disabled = true; // Disable save if no file
+                    fileStatusDiv!.style.display = 'block'; // Show status
                     return;
                 }
 
                 if (file.type !== 'application/json' && !file.name.endsWith('.json')) {
-                    ehrFileContent = null;
+                    ehrDataToSave = null;
                     fileStatusDiv!.textContent = `Error: Invalid file type. Please select a JSON file.`;
                     fileStatusDiv!.className = 'status-error';
                     fileStatusDiv!.style.display = 'block';
                     ehrFileInput!.value = ''; // Clear the input
-                    saveConfigBtn!.disabled = true; // Disable save if invalid file
                     return;
                 }
 
+                fileStatusDiv!.textContent = 'Reading file...';
+                fileStatusDiv!.className = 'status-info';
+                fileStatusDiv!.style.display = 'block';
                 const reader = new FileReader();
                 reader.onload = (e) => {
                     try {
                         const content = e.target?.result as string;
                         JSON.parse(content); // Validate JSON
-                        ehrFileContent = content; 
-                        fileStatusDiv!.textContent = `File selected: ${file.name} (${(file.size / 1024).toFixed(2)} KB). Ready.`;
+                        ehrDataToSave = content;
+                        fileStatusDiv!.textContent = `JSON file loaded (${(file.size / 1024).toFixed(2)} KB). Ready to Save.`;
                         fileStatusDiv!.className = 'status-success';
                         fileStatusDiv!.style.display = 'block';
-                        saveConfigBtn!.disabled = false; // Enable save ONLY if file is valid
+                        saveConfigBtn!.disabled = false; // Enable save ONLY if file is valid and loaded
                     } catch (jsonError: any) {
-                        ehrFileContent = null;
+                        ehrDataToSave = null;
                         fileStatusDiv!.textContent = `Error: Failed to parse JSON file. ${jsonError.message}`;
                         fileStatusDiv!.className = 'status-error';
                         fileStatusDiv!.style.display = 'block';
                         ehrFileInput!.value = ''; 
-                        saveConfigBtn!.disabled = true; // Disable save if parse error
                     }
                 };
                 reader.onerror = () => {
-                    ehrFileContent = null;
+                    ehrDataToSave = null;
                     fileStatusDiv!.textContent = 'Error reading file.';
                     fileStatusDiv!.className = 'status-error';
                     fileStatusDiv!.style.display = 'block';
-                    saveConfigBtn!.disabled = true;
                 };
                 reader.readAsText(file);
             });
@@ -593,9 +784,10 @@
                     setupStorageStatusSpan!.textContent = 'Granted (Activated)';
                     setupNoteSpan!.textContent = "Storage access active. Ready for configuration.";
                     grantAccessBtn!.style.display = 'none'; // Hide grant button
-                    enableConfigUI(true); // Show and enable config inputs
+                    enableConfigUI(true, true); // Show/enable config inputs, enable Done button
+                    populateConfigsList(); // Populate list now that access is active
                     // Save button remains disabled until file is loaded
-                        } else {
+                } else {
                     log("Failed to activate storage access even though permission was granted.");
                     setupInstructionP!.textContent = "Automatic activation failed."
                     setupStorageStatusSpan!.textContent = 'Activation Failed';
@@ -603,7 +795,8 @@
                     grantAccessBtn!.disabled = true; // Keep disabled
                     saveConfigBtn!.disabled = true;
                     // Optionally send abort?
-                     sendSetupStatus('SERVER_SETUP_ABORT', { code: 'FAILED', reason: 'Storage access activation failed.' }, clientOrigin);
+                    log("*** Sending SERVER_SETUP_ABORT due to activation failure (granted state) ***");
+                    sendSetupStatus('SERVER_SETUP_ABORT', { code: 'FAILED', reason: 'Storage access activation failed.' }, clientOrigin);
                 }
 
             } else if (initialState === 'prompt') {
@@ -628,7 +821,8 @@
                         setupStorageStatusSpan!.textContent = 'Granted (Activated)';
                         setupNoteSpan!.textContent = "Storage access granted. Ready for configuration.";
                         grantAccessBtn!.style.display = 'none'; // Hide grant button
-                        enableConfigUI(true); // Show and enable config inputs
+                        enableConfigUI(true, true); // Show/enable config inputs, enable Done button
+                        populateConfigsList(); // Populate list now that access is active
                     } else {
                         log("Storage access activation failed after button click.");
                         setupInstructionP!.textContent = "Access Request Failed"
@@ -636,6 +830,7 @@
                         setupNoteSpan!.textContent = "Storage access denied or failed. You may need to adjust browser settings.";
                         grantAccessBtn!.disabled = false; // Re-enable grant button after failed attempt
                         // Optionally send abort? Or allow retry? For now, send abort.
+                        log("*** Sending SERVER_SETUP_ABORT due to activation failure (prompt state) ***");
                         sendSetupStatus('SERVER_SETUP_ABORT', { code: 'USER_CANCELED', reason: 'Storage access denied or failed after prompt.' }, clientOrigin);
                     }
                 };
@@ -648,21 +843,50 @@
                 grantAccessBtn!.disabled = true;
                 saveConfigBtn!.disabled = true;
                 // Send abort status
+                log("*** Sending SERVER_SETUP_ABORT due to initial state 'denied' ***");
                 sendSetupStatus('SERVER_SETUP_ABORT', { code: 'PERMISSION_DENIED', reason: 'Storage access permission denied.' }, clientOrigin);
             }
 
-            // --- Save Config Button Handler ---
-            saveConfigBtn.onclick = async () => {
-                log("Save Config button clicked.");
-                if (!ehrFileContent) {
-                    log("Save aborted: No valid EHR file content loaded.");
-                    setupNoteSpan!.textContent = "Error: Please select and load a valid EHR JSON file first.";
+            // --- Connect EHR Button Handler ---
+            connectEhrBtn!.onclick = () => {
+                const configName = configNameInput!.value.trim();
+                if (!configName) {
+                    alert("Please enter a Configuration Name before connecting to an EHR.");
+                    configNameInput?.focus();
                     return;
                 }
-                const origins = allowedOriginsInput!.value.trim();
-                if (!origins) {
-                    log("Save aborted: Allowed origins cannot be empty.");
-                    setupNoteSpan!.textContent = "Error: Allowed Origins cannot be empty. Use '*' for any origin.";
+
+                const connectUrl = `https://mcp.fhir.me/ehr-connect#deliver-to-opener:${window.location.origin}`;
+                log(`Opening EHR connection window: ${connectUrl}`);
+
+                // Consider adding popup blocker handling
+                const popup = window.open(connectUrl, "ehrConnectWindow", "width=1000,height=800");
+                if (!popup) {
+                    alert("Failed to open EHR connection window. Please check your popup blocker settings.");
+                    return;
+                }
+
+                fileStatusDiv!.textContent = "Waiting for data from EHR connection window...";
+                fileStatusDiv!.className = 'status-info';
+                fileStatusDiv!.style.display = 'block';
+                ehrFileInput!.value = ''; // Clear file input if connection is used
+                ehrDataToSave = null;
+                saveConfigBtn!.disabled = true; // Disable save until data arrives
+                connectEhrBtn!.disabled = true; // Temporarily disable connect button
+            };
+
+            // --- Save Config Button Handler ---
+            saveConfigBtn!.onclick = async () => {
+                log("Save Config button clicked.");
+                if (!ehrDataToSave) {
+                    log("Save aborted: No valid EHR data loaded (from file or connection).");
+                    setupNoteSpan!.textContent = "Error: Please load data via file upload or EHR connection first.";
+                    return;
+                }
+                const configName = configNameInput!.value.trim();
+                if (!configName) {
+                    log("Save aborted: Config name cannot be empty.");
+                    setupNoteSpan!.textContent = "Error: Config name cannot be empty. Use '*' for any origin.";
                     return;
                 }
                 
@@ -670,38 +894,65 @@
                 grantAccessBtn!.disabled = true;
                 saveConfigBtn!.disabled = true;
                 ehrFileInput!.disabled = true;
-                allowedOriginsInput!.disabled = true;
+                configNameInput!.disabled = true;
                 abortBtn!.disabled = true;
 
                 try {
-                    // Use the global configKey for simplicity in this example
-                    const currentConfigKey = 'global'; 
-                    const dataKey = `ehrJsonData::${currentConfigKey}`;
-                    const originsKey = `ehrMcpAllowedOrigins::${currentConfigKey}`;
+                    const { dataKey, originsKey, configName: validatedConfigName } = getKeys(configName);
 
-                    await saveEhrDataToDB(ehrFileContent, dataKey);
+                    // Store the single derived client origin 
+                    const derivedOrigin = setupClientOrigin; // Use origin stored when setup phase started
+                    if (!derivedOrigin) {
+                        log("Warning: Client origin was not available during setup phase. Cannot save specific allowed origin.");
+                        // Decide if we should proceed without saving origin, or default to '*'?
+                        // Let's proceed but log clearly.
+                    }
+
+                    await saveEhrDataToDB(ehrDataToSave, dataKey);
                     log('EHR Data saved successfully to IndexedDB.');
 
-                    localStorage.setItem(originsKey, origins);
-                    log('Allowed Origins saved successfully to localStorage.');
+                    // Save the single derived allowed origin to *partitioned* localStorage
+                    if (derivedOrigin) {
+                        window.localStorage.setItem(originsKey, derivedOrigin);
+                        log(`Allowed Origin '${derivedOrigin}' saved to partitioned localStorage for key '${originsKey}'.`);
+                    } else {
+                         window.localStorage.removeItem(originsKey); // Remove if no origin
+                         log(`No client origin available, removing/ensuring no origin saved for key '${originsKey}'.`);
+                    }
                     
-                    setupNoteSpan!.textContent = "Configuration saved successfully! Setup complete.";
-                    sendSetupStatus('SERVER_SETUP_COMPLETE', {}, clientOrigin);
+                    setupNoteSpan!.textContent = `Configuration '${validatedConfigName}' saved. You can save another or click Done.`;
+
+                    // Refresh the list immediately
+                    populateConfigsList(); 
+
+                    // Clear file input and saved data for next potential save
+                    ehrDataToSave = null;
+                    ehrFileInput!.value = '';
+                    fileStatusDiv!.textContent = 'No data loaded.';
+                    fileStatusDiv!.style.display = 'none';
+                    saveConfigBtn!.disabled = true; // Disable save until new data selected
+                    // Keep config name input populated for potentially saving same data under different name?
+                    // Or clear it? Let's keep it for now.
 
                 } catch (error: any) {
                     log("Error saving configuration:", error);
                     setupNoteSpan!.textContent = `Error saving configuration: ${error.message || error}`;
-                    // Re-enable buttons/inputs on failure?
+                    // Re-enable save button on failure
                     saveConfigBtn!.disabled = false;
-                    ehrFileInput!.disabled = false;
-                    allowedOriginsInput!.disabled = false;
-                    abortBtn!.disabled = false;
                 }
             };
 
+            // --- Done Button Handler ---
+            doneBtn!.onclick = () => {
+                log("Done button clicked.");
+                log("*** Sending SERVER_SETUP_COMPLETE from Done button ***");
+                sendSetupStatus('SERVER_SETUP_COMPLETE', {}, clientOrigin);
+            };
+
             // Abort Button Handler (Common to all states except success)
-            abortBtn.onclick = () => {
+            abortBtn!.onclick = () => {
                 log("Abort button clicked by user.");
+                log("*** Sending SERVER_SETUP_ABORT from Abort button ***");
                 sendSetupStatus('SERVER_SETUP_ABORT', { code: 'USER_CANCELED', reason: 'User aborted setup.' }, clientOrigin);
             };
         }
@@ -720,13 +971,19 @@
             grantAccessBtn = document.getElementById('grant-access-btn') as HTMLButtonElement | null;
             abortBtn = document.getElementById('abort-btn') as HTMLButtonElement | null;
             setupNoteSpan = document.getElementById('setup-note');
-            // New setup elements
+            // Setup elements for config
             setupInstructionP = document.getElementById('setup-instruction');
             configInputsDiv = document.getElementById('config-inputs');
+            configNameInput = document.getElementById('configNameInput') as HTMLInputElement | null;
             ehrFileInput = document.getElementById('ehrFile') as HTMLInputElement | null;
             fileStatusDiv = document.getElementById('fileStatus');
-            allowedOriginsInput = document.getElementById('allowedOrigins') as HTMLInputElement | null;
-            saveConfigBtn = document.getElementById('save-config-btn') as HTMLButtonElement | null;
+            saveConfigBtn = document.getElementById('save-this-config-btn') as HTMLButtonElement | null;
+            doneBtn = document.getElementById('done-btn') as HTMLButtonElement | null;
+            connectEhrBtn = document.getElementById('connect-ehr-btn') as HTMLButtonElement | null;
+
+            // Config list elements
+            configsListContainer = document.getElementById('configsListContainer');
+            configsListDiv = document.getElementById('configsList');
 
             log("DOM Loaded. Checking phase...");
 
@@ -748,6 +1005,44 @@
                 if (setupSection) setupSection.style.display = 'none';
                 handleTransportPhase(); // Default phase
             }
+
+            // --- Global Message Listener for EHR Connect --- 
+            window.addEventListener('message', (event) => {
+                // IMPORTANT: Always verify the origin of the message!
+                if (event.origin !== 'https://mcp.fhir.me') {
+                    // log(`Ignoring message from unexpected origin: ${event.origin}`);
+                    return; 
+                }
+
+                log("Received message from ehr-connect origin:", event.data);
+
+                // Basic validation: Check for expected structure
+                if (event.data && typeof event.data === 'object' && 
+                    event.data.fhir && typeof event.data.fhir === 'object' && 
+                    Array.isArray(event.data.attachments)) 
+                {
+                    log("Message appears to be valid ClientFullEHR data.");
+                    try {
+                        ehrDataToSave = JSON.stringify(event.data, null, 2); // Store as string
+                        if (fileStatusDiv && saveConfigBtn && connectEhrBtn) {
+                            fileStatusDiv.textContent = "Data received via EHR connection. Ready to Save.";
+                            fileStatusDiv.className = 'status-success';
+                            fileStatusDiv.style.display = 'block';
+                            saveConfigBtn.disabled = false; // Enable save button
+                            connectEhrBtn.disabled = false; // Re-enable connect button
+                            ehrFileInput!.value = ''; // Clear file input
+                        } else {
+                            log("Warning: UI elements not found to update after receiving EHR data.");
+                        }
+                    } catch (stringifyError) {
+                        log("Error stringifying received EHR data:", stringifyError);
+                        if(fileStatusDiv) fileStatusDiv.textContent = "Error processing received EHR data.";
+                        if(connectEhrBtn) connectEhrBtn.disabled = false; // Re-enable connect button
+                    }
+                } else {
+                    log("Received message from ehr-connect origin, but it does not match expected ClientFullEHR format.");
+                }
+            });
         });
 
         log("EHR MCP script loaded. Waiting for DOM...");

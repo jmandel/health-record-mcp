@@ -17,6 +17,10 @@
         .test-section label { display: block; margin: 0.5em 0; }
         .test-section input[type="text"], .test-section input[type="number"], .test-section select { margin-left: 5px; }
         .test-section button { margin-top: 0.5em; }
+        .config-section { margin-bottom: 1.5em; padding: 1em; border: 1px solid #ccc; border-radius: 5px; }
+        small { display: block; color: #555; margin-top: -0.3em; margin-bottom: 0.8em;}
+        #configsList button { font-size: 0.8em; padding: 2px 5px; margin-left: 10px; }
+        #configsList .default-config { font-weight: bold; }
     </style>
 </head>
 <body>
@@ -36,24 +40,28 @@
 
         <div id="config-inputs" style="display: none;"> <!-- Hide config until access granted -->
             <div class="config-section">
-                <label for="ehrFile">1. Upload EHR Data (JSON):</label>
-                <input type="file" id="ehrFile" accept=".json,application/json">
-                <small>Select the JSON file containing the patient's electronic health record data.</small>
-                <div id="fileStatus" class="status-info" style="display: none;">No file selected.</div>
+                <label for="configNameInput">Configuration Name:</label>
+                <input type="text" id="configNameInput" placeholder="e.g., patient-123 or global">
+                <small>Unique name for this dataset configuration.</small>
             </div>
             
-            <div class="config-section">
-                <label for="allowedOrigins">2. Allowed Parent Origins:</label>
-                <input type="text" id="allowedOrigins" value="*">
-                <small>Enter the specific origin(s) allowed to communicate with this tool (comma-separated), or use '*' for any origin.</small>
+            <div class="config-section" style="display: flex; align-items: center; gap: 1em;">
+                <div style="flex-grow: 1;">
+                    <label for="ehrFile">Upload EHR Data (JSON):</label>
+                    <input type="file" id="ehrFile" accept=".json,application/json">
+                    <small>Select the JSON file...</small>
+                </div>
+                <button id="connect-ehr-btn" disabled>Connect EHR & Fetch Data</button>
             </div>
+            <div id="fileStatus" class="status-info" style="display: none; margin-top: -0.5em; margin-bottom: 1em;">No data loaded.</div>
         </div>
 
         <hr id="setup-separator-2">
 
         <div id="setup-actions">
             <button id="grant-access-btn" disabled>Grant Storage Access</button>
-            <button id="save-config-btn" disabled>Save Config & Finish Setup</button>
+            <button id="save-this-config-btn" disabled>Save This Configuration</button>
+            <button id="done-btn" disabled>Done (Close Setup)</button>
             <button id="abort-btn" style="margin-left: 1em; color: red; border-color: red;">Abort Setup</button>
         </div>
         <p class="note" id="setup-note"></p> 
@@ -115,6 +123,13 @@
                 </div>
             </fieldset>
         </div>
+    </div>
+
+    <hr>
+    <h2>Existing Configurations</h2>
+    <div id="configsListContainer" class="config-section" style="display:none">
+        <small>Manage saved EHR datasets. The default is used when no `?config=...` parameter is given.</small>
+        <div id="configsList">Loading...</div>
     </div>
 
     <script src="./index.ts"></script>
