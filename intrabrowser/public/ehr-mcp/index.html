@@ -3,136 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EHR MCP Tool (In-Browser)</title>
+    <title>EHR MCP Tool (React)</title>
     <style>
-        body { font-family: sans-serif; padding: 1em; }
-        pre { background-color: #f4f4f4; padding: 1em; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; }
-        code { font-family: monospace; }
-        .status { margin-bottom: 1em; font-weight: bold; padding: 0.5em; border-radius: 4px; }
-        .status-error { color: red; background-color: #fce8e6; border: 1px solid red; }
-        .status-loading { color: #333; background-color: #eee; border: 1px solid #ccc; }
-        .status-ready { color: green; background-color: #e7f4e7; border: 1px solid green; }
-        .test-section fieldset { margin-bottom: 1em; padding: 1em; border: 1px solid #ddd; border-radius: 4px; }
-        .test-section legend { font-weight: bold; padding: 0 0.5em; }
-        .test-section label { display: block; margin: 0.5em 0; }
-        .test-section input[type="text"], .test-section input[type="number"], .test-section select { margin-left: 5px; }
-        .test-section button { margin-top: 0.5em; }
-        .config-section { margin-bottom: 1.5em; padding: 1em; border: 1px solid #ccc; border-radius: 5px; }
-        small { display: block; color: #555; margin-top: -0.3em; margin-bottom: 0.8em;}
-        #configsList button { font-size: 0.8em; padding: 2px 5px; margin-left: 10px; }
-        #configsList .default-config { font-weight: bold; }
+        body { font-family: sans-serif; padding: 1em; margin: 0; }
+        /* Add other minimal base styles if needed */
     </style>
 </head>
 <body>
-    <h1>EHR MCP Tool (In-Browser)</h1>
-    <div id="toolStatus" class="status status-loading">Loading configuration and initializing...</div>
-
-    <!-- Setup Phase Content -->
-    <div id="setup-phase-content" style="display: none;">
-        <h4>EHR Tool Provider Setup</h4>
-        <p id="setup-instruction">Checking storage access permission...</p>
-        
-        <div style="margin: 1em 0;">
-            <label>Storage Access Status: <span id="setup-storage-status">Checking...</span></label>
-        </div>
-        
-        <hr id="setup-separator-1">
-
-        <div id="config-inputs" style="display: none;"> <!-- Hide config until access granted -->
-            <div class="config-section">
-                <label for="configNameInput">Configuration Name:</label>
-                <input type="text" id="configNameInput" placeholder="e.g., patient-123 or global">
-                <small>Unique name for this dataset configuration.</small>
-            </div>
-            
-            <div class="config-section" style="display: flex; align-items: center; gap: 1em;">
-                <div style="flex-grow: 1;">
-                    <label for="ehrFile">Upload EHR Data (JSON):</label>
-                    <input type="file" id="ehrFile" accept=".json,application/json">
-                    <small>Select the JSON file...</small>
-                </div>
-                <button id="connect-ehr-btn" disabled>Connect EHR & Fetch Data</button>
-            </div>
-            <div id="fileStatus" class="status-info" style="display: none; margin-top: -0.5em; margin-bottom: 1em;">No data loaded.</div>
-        </div>
-
-        <hr id="setup-separator-2">
-
-        <div id="setup-actions">
-            <button id="grant-access-btn" disabled>Grant Storage Access</button>
-            <button id="abort-btn" style="margin-left: 1em; color: red; border-color: red;">Abort Setup</button>
-        </div>
-        <p class="note" id="setup-note"></p> 
-    </div>
-
-    <!-- Transport/Log Section -->
-    <div id="transport-section"> <!-- Will be hidden during setup phase -->
-        <h4>Log:</h4>
-        <pre id="log">Initializing...
-</pre>
-
-        <hr>
-        <h2>Test UI</h2>
-        <p>Manually call the registered tools. Results will appear in the log above.</p>
-        <div class="test-section" id="test-ui-container" style="display: none;">
-            <!-- Grep Record -->
-            <fieldset>
-                <legend><strong>grep_record</strong></legend>
-                <label>Query (Regex): <input type="text" id="grepQuery" value="patient|condition"></label>
-                <label>Resource Types (comma-separated, empty for all): <input type="text" id="grepResourceTypes" placeholder="Condition,Observation,Attachment"></label>
-                <label>Resource Format:
-                    <select id="grepResourceFormat">
-                        <option value="plaintext" selected>plaintext</option>
-                        <option value="json">json</option>
-                    </select>
-                </label>
-                <label>Page: <input type="number" id="grepPage" value="1" min="1" style="width: 60px;"></label>
-                <label>Page Size: <input type="number" id="grepPageSize" value="10" min="1" max="50" style="width: 60px;"></label>
-                <button id="grepBtn">Run Grep</button>
-                <div style="margin-top: 1em;">
-                    <strong>Result (Markdown):</strong>
-                    <pre id="grepResult" style="background:#eee; padding: 5px; border: 1px solid #ccc; max-height: 300px; overflow: auto;">[Result will appear here]</pre>
-                </div>
-            </fieldset>
-
-            <!-- Read Resource -->
-            <fieldset>
-                <legend><strong>read_resource</strong></legend>
-                <label>Resource Type: <input type="text" id="readResourceType" placeholder="Patient"></label>
-                <label>Resource ID: <input type="text" id="readResourceId" placeholder="example-patient-id"></label>
-                <button id="readResourceBtn">Read Resource</button>
-                <div style="margin-top: 1em;">
-                    <strong>Result:</strong>
-                    <pre id="readResourceResult" style="background:#eee; padding: 5px; border: 1px solid #ccc; max-height: 300px; overflow: auto;">[Result will appear here]</pre>
-                </div>
-            </fieldset>
-
-            <!-- Read Attachment -->
-            <fieldset>
-                <legend><strong>read_attachment</strong></legend>
-                <label>Resource Type: <input type="text" id="attachResourceType" placeholder="DocumentReference"></label>
-                <label>Resource ID: <input type="text" id="attachResourceId" placeholder="example-doc-id"></label>
-                <label>Attachment Path: <input type="text" id="attachPath" placeholder="content.attachment"></label>
-                <label><input type="checkbox" id="attachIncludeBase64"> Include Raw Base64</label>
-                <button id="readAttachmentBtn">Read Attachment</button>
-                <div style="margin-top: 1em;">
-                    <strong>Result (Markdown):</strong>
-                    <pre id="readAttachmentResult" style="background:#eee; padding: 5px; border: 1px solid #ccc; max-height: 300px; overflow: auto;">[Result will appear here]</pre>
-                </div>
-            </fieldset>
-        </div>
-    </div>
-
-    <hr>
-    <h2>Existing Configurations</h2>
-    <div id="configsListContainer" class="config-section" style="display:none">
-        <small>Manage saved EHR datasets. The default is used when no `?config=...` parameter is given.</small>
-        <div id="configsList">Loading...</div>
-        <div style="margin-top: 1em; text-align: center;">
-             <button id="done-btn" disabled>Done (Close Setup)</button> 
-        </div>
-    </div>
-
-    <script src="./index.ts"></script>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <!-- Script tag points to the React entry point -->
+    <script type="module" src="main.tsx"></script> 
 </body>
 </html> 
