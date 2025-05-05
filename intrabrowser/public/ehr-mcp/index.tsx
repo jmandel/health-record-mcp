@@ -582,9 +582,6 @@ const EhrMcpTool = () => {
                     appendLog("Transport Phase: Unpartitioned storage access activated.");
                 } else {
                     appendLog("WARNING: Failed to activate unpartitioned storage access in Transport Phase even though permission was granted. Proceeding with default (potentially partitioned) IndexedDB.");
-                    // Optionally update status, but don't block
-                    // setStatusMessage('Warning: Using potentially partitioned storage.');
-                    // setStatusType('warning');
                 }
             } else {
                 appendLog(`WARNING: Storage access permission is '${permissionState}' in Transport Phase. Activation cannot be requested silently. Proceeding with default (potentially partitioned) IndexedDB.`);
@@ -750,43 +747,7 @@ const EhrMcpTool = () => {
         };
     }, [phase, appendLog, saveConfiguration, savedConfigs]); // Removed configNameInput dep
 
-    // Effect for postMessage Listener (Transport Phase)
-    useEffect(() => {
-        if (phase !== 'transport' || !transportRef.current) return; // Ensure transport exists
-
-        const transportInstance = transportRef.current; // Capture instance
-
-        const handleMessage = (event: MessageEvent) => {
-            // Basic validation: origin, data presence, and type
-            if (!event.data || typeof event.data !== 'object' || event.data.type !== 'ehr-mcp-message') {
-                return; // Ignore irrelevant messages
-            }
-
-            // Origin check (optional but recommended for security)
-            // if (clientOrigin && event.origin !== clientOrigin) {
-            //     appendLog(`Error: Received message from unexpected origin: ${event.origin}. Expected: ${clientOrigin}. Ignoring.`);
-            //     return;
-            // }
-
-            appendLog('Received message from client via listener:', event.data.payload);
-
-            // Pass the message to the transport instance for the server to handle
-            // Assuming the transport exposes a method to receive messages from the listener
-            // If not, the server might directly listen via the transport after initialization.
-            // Let's assume the transport constructor handles the listening and server integration.
-            // transportInstance.handleIncomingMessage(event.data); // Remove this - likely handled internally
-
-        };
-
-        appendLog('Adding postMessage listener for transport phase (primarily for logging/debugging).');
-        window.addEventListener('message', handleMessage);
-
-        return () => {
-            appendLog('Removing postMessage listener.');
-            window.removeEventListener('message', handleMessage);
-        };
-    }, [phase, clientOrigin, appendLog]);
-
+            
     // --- Event Handlers ---
     const handleGrantAccessClick = useCallback(async () => {
         if (activationStatus === 'activating' || activationStatus === 'activated') return; // Prevent clicks if activating/activated
