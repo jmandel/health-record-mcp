@@ -447,6 +447,16 @@ const EhrMcpTool = () => {
             setSavedConfigs(newConfigList);
             localStorage.setItem(CONFIG_LIST_KEY, JSON.stringify(newConfigList));
 
+            // --- Add default setting logic ---
+            if (newConfigList.length === 1 && effectiveConfigName !== defaultConfigName) {
+                appendLog(`Setting '${effectiveConfigName}' as default since it's the only configuration.`);
+                // Directly update localStorage and state here, as handleSetDefaultConfig isn't needed
+                // and calling it might cause issues if it relies on state updates that haven't propagated yet.
+                localStorage.setItem(DEFAULT_CONFIG_LS_KEY, effectiveConfigName);
+                setDefaultConfigNameState(effectiveConfigName); 
+            }
+            // --- End default setting logic ---
+
             // Reset form for next potential save
             setEhrDataString(null);
             if (fileInputRef.current) fileInputRef.current.value = '';
