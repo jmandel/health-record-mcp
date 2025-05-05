@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/jmandel-health-record-mcp-badge.png)](https://mseep.ai/app/jmandel-health-record-mcp)
+
 # EHR Tools with MCP and FHIR
 ![EHR Tools Overview](static/overview.png)
 
