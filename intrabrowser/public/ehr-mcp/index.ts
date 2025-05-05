@@ -34,9 +34,7 @@
         let setupInstructionP: HTMLElement | null = null;
         let configInputsDiv: HTMLElement | null = null;
         let configNameInput: HTMLInputElement | null = null;
-        let ehrFileInput: HTMLInputElement | null = null;
         let fileStatusDiv: HTMLElement | null = null;
-        let saveConfigBtn: HTMLButtonElement | null = null;
         let doneBtn: HTMLButtonElement | null = null;
         let connectEhrBtn: HTMLButtonElement | null = null;
 
@@ -445,6 +443,97 @@
             await populateConfigsList();
         }
 
+        // --- Auto-Save Configuration Logic ---
+        async function saveConfiguration(configName: string | null | undefined, dataString: string | null, clientOrigin: string | null) {
+            const ehrFileInput = document.getElementById('ehrFile') as HTMLInputElement | null;
+            if (!configNameInput || !ehrFileInput || !connectEhrBtn || !fileStatusDiv || !setupNoteSpan || !doneBtn) {
+                log("Error: Cannot save configuration, essential UI elements missing.");
+                return;
+            }
+
+            const name = configName?.trim();
+            if (!name) {
+                log("Save aborted: Config name cannot be empty.");
+                setupNoteSpan.textContent = "Error: Config name cannot be empty.";
+                // Re-enable inputs if needed?
+                return;
+            }
+            if (!dataString) {
+                log("Save aborted: No data string provided.");
+                setupNoteSpan.textContent = "Error: No data available to save.";
+                return;
+            }
+
+            log(`Attempting auto-save for configuration: '${name}'`);
+            setupNoteSpan.textContent = `Saving configuration '${name}'...`;
+            // Disable inputs during save
+            configNameInput.disabled = true;
+            if (ehrFileInput) ehrFileInput.disabled = true;
+            connectEhrBtn.disabled = true;
+            doneBtn.disabled = true; // Disable done during save
+
+            try {
+                const { dataKey, originsKey, configName: validatedConfigName } = getKeys(name);
+                const derivedOrigin = clientOrigin; // Use origin stored when setup phase started
+
+                if (!derivedOrigin) {
+                    log("Warning: Client origin was not available during setup phase. Cannot save specific allowed origin.");
+                }
+
+                await saveEhrDataToDB(dataString, dataKey);
+                log('EHR Data saved successfully to IndexedDB.');
+
+                // Save the single derived allowed origin to *partitioned* localStorage
+                if (derivedOrigin) {
+                    window.localStorage.setItem(originsKey, derivedOrigin);
+                    log(`Allowed Origin '${derivedOrigin}' saved to partitioned localStorage for key '${originsKey}'.`);
+                } else {
+                    window.localStorage.removeItem(originsKey);
+                    log(`No client origin available, removing/ensuring no origin saved for key '${originsKey}'.`);
+                }
+                
+                setupNoteSpan.textContent = `Configuration '${validatedConfigName}' saved. You can add another or click Done.`;
+                log(`Configuration '${validatedConfigName}' saved.`);
+
+                // Refresh the list immediately
+                await populateConfigsList(); 
+
+                // Reset inputs for next potential save
+                ehrDataToSave = null;
+                if (ehrFileInput) ehrFileInput.value = ''; // Clear file input
+                fileStatusDiv.textContent = 'No data loaded.';
+                fileStatusDiv.style.display = 'none';
+                // Keep config name? Clear it?
+                // configNameInput.value = ''; 
+
+            } catch (error: any) {
+                log("Error saving configuration:", error);
+                setupNoteSpan.textContent = `Error saving configuration '${name}': ${error.message || error}`;
+                // Handle error state?
+            } finally {
+                // Re-enable inputs after save attempt
+                configNameInput.disabled = false;
+                if (ehrFileInput) ehrFileInput.disabled = false;
+                connectEhrBtn.disabled = false;
+                doneBtn.disabled = false; // Re-enable Done button
+            }
+        }
+
+        // --- Helper to enable/disable configuration part of the UI ---
+        const enableConfigUI = (enable: boolean) => {
+            const ehrFileInput = document.getElementById('ehrFile') as HTMLInputElement | null;
+            configInputsDiv!.style.display = enable ? 'block' : 'none';
+            configNameInput!.disabled = !enable;
+            if (ehrFileInput) ehrFileInput.disabled = !enable;
+            connectEhrBtn!.disabled = !enable;
+            doneBtn!.disabled = !enable; // Enable Done button when config UI is enabled
+            fileStatusDiv!.textContent = 'No data loaded.';
+            fileStatusDiv!.className = 'status-info';
+            fileStatusDiv!.style.display = 'none'; // Hide status initially
+            ehrDataToSave = null; // Reset data
+            if (ehrFileInput) ehrFileInput.value = ''; // Reset file input
+        };
+
         // --- Main Initialization Function (Renamed to handleTransportPhase) ---
         async function handleTransportPhase() { // Renamed
             log('Running in TRANSPORT phase.');
@@ -679,10 +768,10 @@
         // --- Setup Phase Handler ---
         async function handleSetupPhase(clientOrigin: string | null) {
             log("Running in SETUP phase.");
-            // Verify all essential elements are present
+            // Verify all essential elements are present (excluding ehrFileInput now)
             if (!clientOrigin || !setupSection || !setupStorageStatusSpan || !grantAccessBtn || !abortBtn || !setupNoteSpan || 
-                !configInputsDiv || !ehrFileInput || !fileStatusDiv || !configNameInput || !saveConfigBtn || !setupInstructionP || !doneBtn || !connectEhrBtn) {
-                log("Error: Setup phase requires client origin or essential DOM elements are missing.");
+                !configInputsDiv || !fileStatusDiv || !configNameInput || !doneBtn || !connectEhrBtn) {
+                log("Error: Setup phase requires client origin or essential DOM elements are missing (excluding file input initially).");
                 if (clientOrigin) {
                     log("*** Sending SERVER_SETUP_ABORT due to setup phase error (missing elements) ***");
                     sendSetupStatus('SERVER_SETUP_ABORT', { code: 'FAILED', reason: 'Setup iframe internal error (missing elements)' }, clientOrigin);
@@ -695,31 +784,26 @@
             if (transportSection) transportSection.style.display = 'none';
             if (statusElement) statusElement.style.display = 'none'; // Hide main status
 
-            // --- Helper to enable/disable configuration part of the UI ---
-            const enableConfigUI = (enable: boolean, isSetupComplete: boolean = false) => {
-                configInputsDiv!.style.display = enable ? 'block' : 'none';
-                configNameInput!.disabled = !enable;
-                ehrFileInput!.disabled = !enable;
-                connectEhrBtn!.disabled = !enable; // Enable/disable connect button too
-                saveConfigBtn!.disabled = true; // Always start disabled when config UI state changes
-                doneBtn!.disabled = !isSetupComplete; // Enable Done only after initial access grant
-                fileStatusDiv!.textContent = 'No data loaded.';
-                fileStatusDiv!.className = 'status-info';
-                fileStatusDiv!.style.display = 'none'; // Hide status initially
-                ehrDataToSave = null; // Reset data
-                ehrFileInput!.value = ''; // Reset file input
-            };
+            setupClientOrigin = clientOrigin; // Store for later use
 
-            // --- File Input Handler ---
-            ehrFileInput!.addEventListener('change', (event) => {
+            // **** DECLARE and CHECK ehrFileInput FIRST ****
+            const ehrFileInput = document.getElementById('ehrFile') as HTMLInputElement | null;
+            if (!ehrFileInput) {
+                log("CRITICAL ERROR: ehrFile input element not found...");
+                sendSetupStatus('SERVER_SETUP_ABORT', { code: 'FAILED', reason: 'Setup iframe internal error (missing ehrFile element)' }, clientOrigin);
+                return;
+            }
+
+            // **** ADD LISTENER AFTER DECLARATION ****
+            ehrFileInput.addEventListener('change', async (event: Event) => {
                 const target = event.target as HTMLInputElement;
                 const file = target.files?.[0];
-                saveConfigBtn!.disabled = true; // Disable save button initially
+                enableConfigUI(false); // Disable config UI initially
                 if (!file) {
                     ehrDataToSave = null;
                     fileStatusDiv!.textContent = 'File removed.';
                     fileStatusDiv!.className = 'status-info';
-                    fileStatusDiv!.style.display = 'block'; // Show status
+                    fileStatusDiv!.style.display = 'block';
                     return;
                 }
 
@@ -728,7 +812,7 @@
                     fileStatusDiv!.textContent = `Error: Invalid file type. Please select a JSON file.`;
                     fileStatusDiv!.className = 'status-error';
                     fileStatusDiv!.style.display = 'block';
-                    ehrFileInput!.value = ''; // Clear the input
+                    ehrFileInput.value = ''; // Use local constant
                     return;
                 }
 
@@ -736,21 +820,24 @@
                 fileStatusDiv!.className = 'status-info';
                 fileStatusDiv!.style.display = 'block';
                 const reader = new FileReader();
-                reader.onload = (e) => {
+                reader.onload = async (e) => { // Make async
                     try {
                         const content = e.target?.result as string;
                         JSON.parse(content); // Validate JSON
                         ehrDataToSave = content;
-                        fileStatusDiv!.textContent = `JSON file loaded (${(file.size / 1024).toFixed(2)} KB). Ready to Save.`;
+                        fileStatusDiv!.textContent = `JSON file loaded (${(file.size / 1024).toFixed(2)} KB).`;
                         fileStatusDiv!.className = 'status-success';
                         fileStatusDiv!.style.display = 'block';
-                        saveConfigBtn!.disabled = false; // Enable save ONLY if file is valid and loaded
+                        // Automatically save after successful file load
+                        const configName = configNameInput!.value;
+                        await saveConfiguration(configName, ehrDataToSave, clientOrigin);
+
                     } catch (jsonError: any) {
                         ehrDataToSave = null;
                         fileStatusDiv!.textContent = `Error: Failed to parse JSON file. ${jsonError.message}`;
                         fileStatusDiv!.className = 'status-error';
                         fileStatusDiv!.style.display = 'block';
-                        ehrFileInput!.value = ''; 
+                        ehrFileInput.value = ''; // Use local constant
                     }
                 };
                 reader.onerror = () => {
@@ -762,13 +849,13 @@
                 reader.readAsText(file);
             });
 
+            // **** REST OF handleSetupPhase ****
             // --- Initial State Determination ---
             const initialState = await getStoragePermissionState();
 
             // Default UI state
             setupInstructionP!.textContent = "Checking storage access permission...";
-            grantAccessBtn.disabled = true;
-            saveConfigBtn.disabled = true;
+            grantAccessBtn!.disabled = true;
             enableConfigUI(false); // Config UI starts hidden/disabled
             setupStorageStatusSpan!.textContent = 'Checking...';
 
@@ -784,7 +871,7 @@
                     setupStorageStatusSpan!.textContent = 'Granted (Activated)';
                     setupNoteSpan!.textContent = "Storage access active. Ready for configuration.";
                     grantAccessBtn!.style.display = 'none'; // Hide grant button
-                    enableConfigUI(true, true); // Show/enable config inputs, enable Done button
+                    enableConfigUI(true); // Show/enable config inputs, enable Done button
                     populateConfigsList(); // Populate list now that access is active
                     // Save button remains disabled until file is loaded
                 } else {
@@ -793,7 +880,6 @@
                     setupStorageStatusSpan!.textContent = 'Activation Failed';
                     setupNoteSpan!.textContent = "Permission granted, but failed to activate storage access automatically. Cannot proceed.";
                     grantAccessBtn!.disabled = true; // Keep disabled
-                    saveConfigBtn!.disabled = true;
                     // Optionally send abort?
                     log("*** Sending SERVER_SETUP_ABORT due to activation failure (granted state) ***");
                     sendSetupStatus('SERVER_SETUP_ABORT', { code: 'FAILED', reason: 'Storage access activation failed.' }, clientOrigin);
@@ -806,7 +892,6 @@
                 setupNoteSpan!.textContent = "Please click 'Grant Storage Access' to proceed.";
                 grantAccessBtn!.disabled = false; // Enable the button
                 grantAccessBtn!.style.display = 'inline-block'; // Ensure visible
-                saveConfigBtn!.style.display = 'inline-block'; // Ensure visible but disabled
 
                 grantAccessBtn.onclick = async () => {
                     log("Grant Storage Access button clicked.");
@@ -821,7 +906,7 @@
                         setupStorageStatusSpan!.textContent = 'Granted (Activated)';
                         setupNoteSpan!.textContent = "Storage access granted. Ready for configuration.";
                         grantAccessBtn!.style.display = 'none'; // Hide grant button
-                        enableConfigUI(true, true); // Show/enable config inputs, enable Done button
+                        enableConfigUI(true); // Show/enable config inputs, enable Done button
                         populateConfigsList(); // Populate list now that access is active
                     } else {
                         log("Storage access activation failed after button click.");
@@ -841,7 +926,6 @@
                 setupStorageStatusSpan!.textContent = 'Denied';
                 setupNoteSpan!.textContent = "Storage access has been denied by the browser or user. Cannot proceed.";
                 grantAccessBtn!.disabled = true;
-                saveConfigBtn!.disabled = true;
                 // Send abort status
                 log("*** Sending SERVER_SETUP_ABORT due to initial state 'denied' ***");
                 sendSetupStatus('SERVER_SETUP_ABORT', { code: 'PERMISSION_DENIED', reason: 'Storage access permission denied.' }, clientOrigin);
@@ -871,75 +955,8 @@
                 fileStatusDiv!.style.display = 'block';
                 ehrFileInput!.value = ''; // Clear file input if connection is used
                 ehrDataToSave = null;
-                saveConfigBtn!.disabled = true; // Disable save until data arrives
+                enableConfigUI(false); // Disable config UI during connection
                 connectEhrBtn!.disabled = true; // Temporarily disable connect button
-            };
-
-            // --- Save Config Button Handler ---
-            saveConfigBtn!.onclick = async () => {
-                log("Save Config button clicked.");
-                if (!ehrDataToSave) {
-                    log("Save aborted: No valid EHR data loaded (from file or connection).");
-                    setupNoteSpan!.textContent = "Error: Please load data via file upload or EHR connection first.";
-                    return;
-                }
-                const configName = configNameInput!.value.trim();
-                if (!configName) {
-                    log("Save aborted: Config name cannot be empty.");
-                    setupNoteSpan!.textContent = "Error: Config name cannot be empty. Use '*' for any origin.";
-                    return;
-                }
-                
-                setupNoteSpan!.textContent = "Saving configuration...";
-                grantAccessBtn!.disabled = true;
-                saveConfigBtn!.disabled = true;
-                ehrFileInput!.disabled = true;
-                configNameInput!.disabled = true;
-                abortBtn!.disabled = true;
-
-                try {
-                    const { dataKey, originsKey, configName: validatedConfigName } = getKeys(configName);
-
-                    // Store the single derived client origin 
-                    const derivedOrigin = setupClientOrigin; // Use origin stored when setup phase started
-                    if (!derivedOrigin) {
-                        log("Warning: Client origin was not available during setup phase. Cannot save specific allowed origin.");
-                        // Decide if we should proceed without saving origin, or default to '*'?
-                        // Let's proceed but log clearly.
-                    }
-
-                    await saveEhrDataToDB(ehrDataToSave, dataKey);
-                    log('EHR Data saved successfully to IndexedDB.');
-
-                    // Save the single derived allowed origin to *partitioned* localStorage
-                    if (derivedOrigin) {
-                        window.localStorage.setItem(originsKey, derivedOrigin);
-                        log(`Allowed Origin '${derivedOrigin}' saved to partitioned localStorage for key '${originsKey}'.`);
-                    } else {
-                         window.localStorage.removeItem(originsKey); // Remove if no origin
-                         log(`No client origin available, removing/ensuring no origin saved for key '${originsKey}'.`);
-                    }
-                    
-                    setupNoteSpan!.textContent = `Configuration '${validatedConfigName}' saved. You can save another or click Done.`;
-
-                    // Refresh the list immediately
-                    populateConfigsList(); 
-
-                    // Clear file input and saved data for next potential save
-                    ehrDataToSave = null;
-                    ehrFileInput!.value = '';
-                    fileStatusDiv!.textContent = 'No data loaded.';
-                    fileStatusDiv!.style.display = 'none';
-                    saveConfigBtn!.disabled = true; // Disable save until new data selected
-                    // Keep config name input populated for potentially saving same data under different name?
-                    // Or clear it? Let's keep it for now.
-
-                } catch (error: any) {
-                    log("Error saving configuration:", error);
-                    setupNoteSpan!.textContent = `Error saving configuration: ${error.message || error}`;
-                    // Re-enable save button on failure
-                    saveConfigBtn!.disabled = false;
-                }
             };
 
             // --- Done Button Handler ---
@@ -975,9 +992,7 @@
             setupInstructionP = document.getElementById('setup-instruction');
             configInputsDiv = document.getElementById('config-inputs');
             configNameInput = document.getElementById('configNameInput') as HTMLInputElement | null;
-            ehrFileInput = document.getElementById('ehrFile') as HTMLInputElement | null;
             fileStatusDiv = document.getElementById('fileStatus');
-            saveConfigBtn = document.getElementById('save-this-config-btn') as HTMLButtonElement | null;
             doneBtn = document.getElementById('done-btn') as HTMLButtonElement | null;
             connectEhrBtn = document.getElementById('connect-ehr-btn') as HTMLButtonElement | null;
 
@@ -1007,7 +1022,7 @@
             }
 
             // --- Global Message Listener for EHR Connect --- 
-            window.addEventListener('message', (event) => {
+            window.addEventListener('message', async (event) => { // Make async
                 // IMPORTANT: Always verify the origin of the message!
                 if (event.origin !== 'https://mcp.fhir.me') {
                     // log(`Ignoring message from unexpected origin: ${event.origin}`);
@@ -1024,13 +1039,16 @@
                     log("Message appears to be valid ClientFullEHR data.");
                     try {
                         ehrDataToSave = JSON.stringify(event.data, null, 2); // Store as string
-                        if (fileStatusDiv && saveConfigBtn && connectEhrBtn) {
+                        // Also check ehrFileInput here if needed for clearing
+                        const ehrFileInput = document.getElementById('ehrFile') as HTMLInputElement | null;
+                        if (fileStatusDiv && connectEhrBtn && configNameInput && ehrFileInput) {
                             fileStatusDiv.textContent = "Data received via EHR connection. Ready to Save.";
                             fileStatusDiv.className = 'status-success';
                             fileStatusDiv.style.display = 'block';
-                            saveConfigBtn.disabled = false; // Enable save button
-                            connectEhrBtn.disabled = false; // Re-enable connect button
-                            ehrFileInput!.value = ''; // Clear file input
+                            // Automatically save after receiving data
+                            const configName = configNameInput.value;
+                            await saveConfiguration(configName, ehrDataToSave, clientOrigin);
+
                         } else {
                             log("Warning: UI elements not found to update after receiving EHR data.");
                         }

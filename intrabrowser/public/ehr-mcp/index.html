@@ -60,15 +60,13 @@
 
         <div id="setup-actions">
             <button id="grant-access-btn" disabled>Grant Storage Access</button>
-            <button id="save-this-config-btn" disabled>Save This Configuration</button>
-            <button id="done-btn" disabled>Done (Close Setup)</button>
             <button id="abort-btn" style="margin-left: 1em; color: red; border-color: red;">Abort Setup</button>
         </div>
         <p class="note" id="setup-note"></p> 
     </div>
 
     <!-- Transport/Log Section -->
-    <div id="transport-section" style="display: block;"> <!-- Show by default, hide in setup phase -->
+    <div id="transport-section"> <!-- Will be hidden during setup phase -->
         <h4>Log:</h4>
         <pre id="log">Initializing...
 </pre>
@@ -130,6 +128,9 @@
     <div id="configsListContainer" class="config-section" style="display:none">
         <small>Manage saved EHR datasets. The default is used when no `?config=...` parameter is given.</small>
         <div id="configsList">Loading...</div>
+        <div style="margin-top: 1em; text-align: center;">
+             <button id="done-btn" disabled>Done (Close Setup)</button> 
+        </div>
     </div>
 
     <script src="./index.ts"></script>
