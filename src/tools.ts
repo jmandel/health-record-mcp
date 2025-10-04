@@ -1029,6 +1029,7 @@ export function registerEhrTools(
 
     mcpServer.tool(
         "grep_record",
+        "Performs text or regular expression searches across all parts of the fetched record (structured FHIR data + text from notes/attachments). Ideal for finding keywords or specific mentions (e.g., \"diabetes\", \"aspirin\").",
         GrepRecordInputSchema.shape, // Use the updated schema
         async (args, extra) => {
             try {
@@ -1060,6 +1061,7 @@ export function registerEhrTools(
 
     mcpServer.tool(
         "query_record",
+        "Executes read-only SQL SELECT queries directly against the structured FHIR data. Useful for precise lookups based on known FHIR resource structures (e.g., finding specific lab results by LOINC code).",
         QueryRecordInputSchema.shape,
         async (args, extra) => {
             try {
@@ -1082,6 +1084,7 @@ export function registerEhrTools(
 
     mcpServer.tool(
         "eval_record",
+        "Executes custom JavaScript code directly on the fetched data (FHIR resources + attachments). Offers maximum flexibility for complex calculations, combining data from multiple sources, or custom formatting.",
         EvalRecordInputSchema.shape,
         async (args, extra) => {
             try {
@@ -1104,6 +1107,7 @@ export function registerEhrTools(
 
     mcpServer.tool(
         "read_resource",
+        "Retrieve the complete FHIR JSON for a specific resource by type and ID. Use this to get full details after finding interesting resources with grep_record or query_record.",
         ReadResourceInputSchema.shape,
         async (args, extra) => {
             try {
@@ -1126,6 +1130,7 @@ export function registerEhrTools(
 
     mcpServer.tool(
         "read_attachment",
+        "Retrieve the full plaintext content of a specific attachment (clinical note, document, etc.) by resource reference and path. Optionally includes raw base64 data. Use after finding relevant attachments with grep_record.",
         ReadAttachmentInputSchema.shape,
         async (args, extra) => {
             try {
