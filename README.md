@@ -60,6 +60,11 @@ This mode is ideal for running the MCP server locally, often used with tools lik
 *   **Two-Step Process:**
     1.  **Fetch Data to Database:** First, run the command-line interface with the `--create-db` and `--db` flags. This starts a temporary web server and uses the same SMART on FHIR web client logic described above to fetch data. Instead of sending the data via `postMessage`, it saves the `ClientFullEHR` data into a local SQLite database file.
         ```bash
+        # Generate self-signed certificates (first time only)
+        # macOS/Linux: Install mkcert then run:
+        mkcert localhost 127.0.0.1 ::1
+        # Windows: Use mkcert or OpenSSL to generate localhost+2.pem and localhost+2-key.pem
+        
         # Example: Fetch data and save to data/my_record.sqlite
         bun run src/cli.ts --create-db --db ./data/my_record.sqlite
         ```

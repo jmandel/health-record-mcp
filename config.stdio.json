@@ -1,4 +1,5 @@
 {
+  "_comment": "Local development config for stdio mode. URLs point to localhost server with self-signed certificate.",
   "retrieverConfig": {
     "deliveryEndpoints": {
       "mcp-callback": {
@@ -12,7 +13,7 @@
         "vendorConfig": {
           "clientId": "012662a7-8a52-4b22-8252-f58b9b52e8c9",
           "scopes": "patient/*.rs",
-          "redirectUrl": "https://mcp.fhir.me/ehr-callback"
+          "redirectUrl": "https://localhost:8443/ehr-callback"
         }
       },
       {
@@ -21,7 +22,7 @@
         "vendorConfig": {
           "clientId": "6a424079-77de-418b-94c7-485d08ffc3f7",
           "scopes": "launch/patient …",
-          "redirectUrl": "https://mcp.fhir.me/ehr-callback"
+          "redirectUrl": "https://localhost:8443/ehr-callback"
         }
       }
     ]
