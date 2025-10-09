@@ -1,0 +1,66 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Build artifacts
+**/bin/
+**/obj/
+**/out/
+
+# IDE files
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.idea/
+
+# Test files
+**/*[Tt]est*/
+**/*.Tests/
+
+# Documentation
+*.md
+LICENSE
+LICENSE.txt
+
+# Docker files (don't need in image)
+**/Dockerfile*
+**/docker-compose*
+.dockerignore
+
+# Environment files - CRITICAL: Never include in image
+**/.env
+**/.env.*
+**/appsettings.Development.json
+**/appsettings.*.json
+
+# Secrets and certificates
+**/*.pfx
+**/*.p12
+**/*.key
+**/*.pem
+**/secrets/
+**/certs/
+
+# Database files
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+
+# Logs
+**/logs/
+**/*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Package files
+*.nupkg
+*.snupkg

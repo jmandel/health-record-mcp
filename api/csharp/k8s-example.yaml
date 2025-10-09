@@ -1,0 +1,326 @@
+---
+# Example Kubernetes deployment with security hardening
+# This manifest demonstrates security best practices for the Family Health API
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: family-health
+  labels:
+    name: family-health
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-connection
+  namespace: family-health
+type: Opaque
+stringData:
+  # Replace with your actual connection string
+  connection-string: "Host=postgres.database.svc.cluster.local;Port=5432;Database=family_health;Username=api_user;Password=CHANGEME"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: family-health
+data:
+  ASPNETCORE_ENVIRONMENT: "Production"
+  DOTNET_EnableDiagnostics: "0"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  COMPlus_EnableDiagnostics: "0"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: family-health-api
+  namespace: family-health
+  labels:
+    app: family-health-api
+    version: v1
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: family-health-api
+  template:
+    metadata:
+      labels:
+        app: family-health-api
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Security Context for all containers in this pod
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # Service account with minimal permissions
+      serviceAccountName: family-health-api
+      automountServiceAccountToken: false
+      
+      containers:
+      - name: api
+        image: family-health-api:latest  # Replace with your registry
+        imagePullPolicy: Always
+        
+        # Container Security Context
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1001
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL
+        
+        ports:
+        - name: http
+          containerPort: 5000
+          protocol: TCP
+        
+        env:
+        - name: OUR_HEALTHS_POSTGRES_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: postgres-connection
+              key: connection-string
+        
+        envFrom:
+        - configMapRef:
+            name: api-config
+        
+        # Resource limits and requests
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        
+        # Liveness probe
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        
+        # Readiness probe
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        
+        # Startup probe for slow starts
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 0
+          periodSeconds: 10
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 30
+        
+        # Volume mounts for writable directories
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: aspnet-temp
+          mountPath: /app/.aspnet
+      
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: aspnet-temp
+        emptyDir: {}
+      
+      # Pod affinity rules for high availability
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - family-health-api
+              topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: family-health-api
+  namespace: family-health
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: family-health-api
+  namespace: family-health
+  labels:
+    app: family-health-api
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: http
+    protocol: TCP
+    name: http
+  selector:
+    app: family-health-api
+
+---
+# Network Policy - Allow traffic only from ingress and to postgres
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: family-health-api-netpol
+  namespace: family-health
+spec:
+  podSelector:
+    matchLabels:
+      app: family-health-api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx  # Adjust based on your ingress
+    ports:
+    - protocol: TCP
+      port: 5000
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow PostgreSQL
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: database  # Adjust based on your postgres namespace
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow HTTPS for external services (if needed)
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# Pod Disruption Budget for high availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: family-health-api-pdb
+  namespace: family-health
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: family-health-api
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: family-health-api-hpa
+  namespace: family-health
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: family-health-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# Resource Quota for the namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: family-health-quota
+  namespace: family-health
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    persistentvolumeclaims: "0"  # No PVCs needed
+    services.loadbalancers: "0"  # Use ingress instead
+
+---
+# Limit Range for default resource constraints
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: family-health-limits
+  namespace: family-health
+spec:
+  limits:
+  - max:
+      cpu: "2"
+      memory: 2Gi
+    min:
+      cpu: 50m
+      memory: 64Mi
+    default:
+      cpu: 500m
+      memory: 512Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    type: Container

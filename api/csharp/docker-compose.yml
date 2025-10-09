@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  familyhealth-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: familyhealth-api:latest
+    container_name: familyhealth-api
+    
+    # Security settings
+    security_opt:
+      - no-new-privileges:true
+    
+    # Read-only root filesystem (uncomment if app supports it)
+    # read_only: true
+    
+    # Limit capabilities (drop all, add only what's needed)
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    
+    # Network settings
+    ports:
+      - "5000:5000"
+    
+    # Environment variables (use secrets in production)
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:5000
+      # Use Docker secrets or external secret management in production
+      # - OUR_HEALTHS_POSTGRES_CONNECTION_STRING=${OUR_HEALTHS_POSTGRES_CONNECTION_STRING}
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Temporary filesystem for tmp directory (if read_only is enabled)
+    # tmpfs:
+    #   - /tmp:size=100M,mode=1777
+    #   - /app/temp:size=50M,uid=1001,gid=1001
+
+# Optional: Use Docker secrets (recommended for production)
+# secrets:
+#   db_connection_string:
+#     external: true
+
+# Optional: Custom network with encryption
+# networks:
+#   app_network:
+#     driver: bridge
+#     driver_opts:
+#       encrypted: "true"
