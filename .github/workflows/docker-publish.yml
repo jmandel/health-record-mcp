@@ -2,7 +2,11 @@ name: Build and Push Docker Image to GHCR
 
 on:
   release:
-    types: [published]
+    types: [published, created]
+  push:
+    tags:
+      - 'v*.*.*'
+      - '*.*.*'
   workflow_dispatch:  # Allow manual trigger
 
 env:
