@@ -7,8 +7,6 @@ on:
 
 permissions:
   contents: read # Needed for checkout
-  pages: write   # Needed to deploy to GitHub Pages
-  id-token: write # Needed for GitHub Pages authentication
 
 jobs:
   build:
@@ -55,19 +53,9 @@ jobs:
       - name: List artifact contents (for debugging)
         run: ls -R artifact_content
 
-      - name: Upload artifact for GitHub Pages
-        uses: actions/upload-pages-artifact@v3
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
+          name: ehr-retriever-build
           path: artifact_content/
-
-  # Optional: Add a deployment job if you want to deploy to GitHub Pages
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4 
+          retention-days: 90 
