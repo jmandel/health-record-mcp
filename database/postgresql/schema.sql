@@ -1,6 +1,33 @@
 -- PostgreSQL Schema for Multi-Provider Family EHR Data
--- Supports multiple medical providers and patients (family members)
--- Designed to store FHIR resources with proper normalization
+-- Clean, normalized schema with extracted FHIR fields for simple queries
+-- Drop all existing objects and start fresh
+
+-- ============================================================================
+-- DROP ALL EXISTING OBJECTS (Clean slate)
+-- ============================================================================
+
+DROP MATERIALIZED VIEW IF EXISTS mv_active_conditions CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS mv_latest_vitals CASCADE;
+
+DROP TRIGGER IF EXISTS populate_fhir_resources_searchable_text ON fhir_resources;
+DROP TRIGGER IF EXISTS update_fhir_resources_updated_at ON fhir_resources;
+DROP TRIGGER IF EXISTS update_patient_provider_links_updated_at ON patient_provider_links;
+DROP TRIGGER IF EXISTS update_patients_updated_at ON patients;
+DROP TRIGGER IF EXISTS update_medical_providers_updated_at ON medical_providers;
+DROP TRIGGER IF EXISTS trigger_extract_fhir_values ON fhir_resources;
+
+DROP FUNCTION IF EXISTS refresh_all_materialized_views();
+DROP FUNCTION IF EXISTS extract_primary_code(JSONB);
+DROP FUNCTION IF EXISTS extract_searchable_text(JSONB);
+DROP FUNCTION IF EXISTS populate_searchable_text();
+DROP FUNCTION IF EXISTS update_updated_at_column();
+DROP FUNCTION IF EXISTS extract_fhir_values();
+
+DROP TABLE IF EXISTS fhir_attachments CASCADE;
+DROP TABLE IF EXISTS fhir_resources CASCADE;
+DROP TABLE IF EXISTS patient_provider_links CASCADE;
+DROP TABLE IF EXISTS patients CASCADE;
+DROP TABLE IF EXISTS medical_providers CASCADE;
 
 -- Enable necessary extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -28,6 +55,7 @@ CREATE TABLE patients (
     first_name TEXT NOT NULL,
     last_name TEXT NOT NULL,
     date_of_birth DATE,
+    gender TEXT, -- Patient's gender (male, female, other, unknown)
     metadata JSONB DEFAULT '{}', -- Additional patient info
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -53,7 +81,7 @@ CREATE TABLE patient_provider_links (
 -- FHIR RESOURCES
 -- ============================================================================
 
--- Main FHIR Resources table (normalized)
+-- Main FHIR Resources table with normalized columns
 CREATE TABLE fhir_resources (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     
@@ -65,7 +93,7 @@ CREATE TABLE fhir_resources (
     resource_type TEXT NOT NULL, -- e.g., 'Observation', 'Condition', 'MedicationRequest'
     resource_id TEXT NOT NULL, -- The FHIR resource ID from the provider
     
-    -- Resource content
+    -- Resource content (keep full FHIR for reference)
     resource_json JSONB NOT NULL, -- Full FHIR resource as JSON
     
     -- Common FHIR fields (denormalized for query performance)
@@ -78,6 +106,27 @@ CREATE TABLE fhir_resources (
     -- Temporal fields
     effective_date DATE, -- When this resource was effective/observed
     issued_at TIMESTAMPTZ, -- When this resource was issued
+    
+    -- ===== NORMALIZED OBSERVATION VALUES =====
+    -- These replace complex JSON queries with simple column access
+    value_quantity_value NUMERIC, -- Extracted from valueQuantity.value
+    value_quantity_unit TEXT, -- Extracted from valueQuantity.unit
+    value_string TEXT, -- Extracted from valueString (e.g., "Negative", "Positive")
+    value_codeable_concept TEXT, -- Extracted from valueCodeableConcept (e.g., "Normal")
+    interpretation TEXT, -- Extracted from interpretation (e.g., "High", "Low")
+    reference_range_low NUMERIC, -- Lower bound of reference range
+    reference_range_high NUMERIC, -- Upper bound of reference range
+    components JSONB, -- Extracted component array for multi-value observations
+    
+    -- ===== NORMALIZED CONDITION FIELDS =====
+    onset_datetime TIMESTAMPTZ, -- When condition started
+    recorded_date TIMESTAMPTZ, -- When condition was recorded
+    
+    -- ===== NORMALIZED MEDICATION FIELDS =====
+    dosage_instruction TEXT, -- Medication dosage instructions
+    
+    -- ===== NORMALIZED ALLERGY FIELDS =====
+    criticality TEXT, -- Allergy criticality (low, high, unable-to-assess)
     
     -- Full-text search
     searchable_text TEXT, -- Concatenated searchable fields
@@ -98,10 +147,16 @@ CREATE INDEX idx_fhir_resources_type_patient ON fhir_resources(resource_type, pa
 CREATE INDEX idx_fhir_resources_effective_date ON fhir_resources(effective_date DESC NULLS LAST);
 CREATE INDEX idx_fhir_resources_code ON fhir_resources(code_system, code_value);
 
--- GIN index for JSONB queries
+-- Indexes for normalized value columns (for fast Observation queries)
+CREATE INDEX idx_fhir_resources_value_quantity ON fhir_resources(value_quantity_value) 
+    WHERE resource_type = 'Observation';
+CREATE INDEX idx_fhir_resources_value_string ON fhir_resources(value_string) 
+    WHERE resource_type = 'Observation';
+
+-- GIN index for JSONB queries (when you need the full resource)
 CREATE INDEX idx_fhir_resources_json ON fhir_resources USING GIN (resource_json);
 
--- Full-text search index
+-- Full-text search indexes
 CREATE INDEX idx_fhir_resources_search ON fhir_resources USING GIN (to_tsvector('english', searchable_text));
 CREATE INDEX idx_fhir_resources_trigram ON fhir_resources USING GIN (searchable_text gin_trgm_ops);
 
@@ -268,11 +323,65 @@ CREATE TRIGGER populate_fhir_resources_searchable_text
     BEFORE INSERT OR UPDATE ON fhir_resources
     FOR EACH ROW EXECUTE FUNCTION populate_searchable_text();
 
+-- ============================================================================
+-- AUTO-EXTRACT FHIR VALUES TO NORMALIZED COLUMNS
+-- ============================================================================
+-- This trigger automatically extracts values from FHIR JSON to typed columns
+-- Eliminates the need for complex JSON queries in application code
+
+CREATE OR REPLACE FUNCTION extract_fhir_values()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Extract values for Observations
+    IF NEW.resource_type = 'Observation' THEN
+        NEW.value_quantity_value = (NEW.resource_json->'valueQuantity'->>'value')::NUMERIC;
+        NEW.value_quantity_unit = NEW.resource_json->'valueQuantity'->>'unit';
+        NEW.value_string = NEW.resource_json->>'valueString';
+        NEW.value_codeable_concept = NEW.resource_json->'valueCodeableConcept'->'coding'->0->>'display';
+        NEW.interpretation = NEW.resource_json->'interpretation'->0->'coding'->0->>'display';
+        NEW.reference_range_low = (NEW.resource_json->'referenceRange'->0->'low'->>'value')::NUMERIC;
+        NEW.reference_range_high = (NEW.resource_json->'referenceRange'->0->'high'->>'value')::NUMERIC;
+        NEW.components = NEW.resource_json->'component';
+    
+    -- Extract values for MedicationRequest
+    ELSIF NEW.resource_type = 'MedicationRequest' THEN
+        NEW.dosage_instruction = NEW.resource_json->'dosageInstruction'->0->>'text';
+    
+    -- Extract values for Condition
+    ELSIF NEW.resource_type = 'Condition' THEN
+        NEW.onset_datetime = (NEW.resource_json->>'onsetDateTime')::TIMESTAMPTZ;
+        NEW.recorded_date = (NEW.resource_json->>'recordedDate')::TIMESTAMPTZ;
+    
+    -- Extract values for AllergyIntolerance
+    ELSIF NEW.resource_type = 'AllergyIntolerance' THEN
+        NEW.criticality = NEW.resource_json->>'criticality';
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_extract_fhir_values
+    BEFORE INSERT OR UPDATE ON fhir_resources
+    FOR EACH ROW
+    EXECUTE FUNCTION extract_fhir_values();
 
 
 
 COMMENT ON TABLE medical_providers IS 'Healthcare organizations that provide medical records';
 COMMENT ON TABLE patients IS 'Family members whose records are being stored';
 COMMENT ON TABLE patient_provider_links IS 'Links patients to their providers with FHIR IDs';
-COMMENT ON TABLE fhir_resources IS 'All FHIR resources (Observations, Conditions, etc.) from all providers';
+COMMENT ON TABLE fhir_resources IS 'All FHIR resources with normalized columns for common fields';
 COMMENT ON TABLE fhir_attachments IS 'Binary attachments (PDFs, images) associated with FHIR resources';
+
+-- Column comments for normalized fields
+COMMENT ON COLUMN fhir_resources.value_quantity_value IS 'Extracted from FHIR valueQuantity.value - enables simple numeric queries';
+COMMENT ON COLUMN fhir_resources.value_quantity_unit IS 'Extracted from FHIR valueQuantity.unit';
+COMMENT ON COLUMN fhir_resources.value_string IS 'Extracted from FHIR valueString - for text-based lab results';
+COMMENT ON COLUMN fhir_resources.value_codeable_concept IS 'Extracted from FHIR valueCodeableConcept - for coded results';
+COMMENT ON COLUMN fhir_resources.components IS 'Extracted from FHIR component array - for multi-value observations like blood pressure';
+COMMENT ON COLUMN fhir_resources.interpretation IS 'Extracted from FHIR interpretation - High/Low/Normal indicators';
+COMMENT ON COLUMN fhir_resources.dosage_instruction IS 'Extracted from FHIR MedicationRequest.dosageInstruction';
+COMMENT ON COLUMN fhir_resources.onset_datetime IS 'Extracted from FHIR Condition.onsetDateTime';
+COMMENT ON COLUMN fhir_resources.criticality IS 'Extracted from FHIR AllergyIntolerance.criticality';
+

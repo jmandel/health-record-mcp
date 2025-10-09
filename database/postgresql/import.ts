@@ -51,10 +51,15 @@ async function importEhrData(config: ImportConfig) {
     console.log(`📊 Loaded ${Object.keys(fullEhr.fhir).length} resource types`);
     console.log(`📎 Found ${fullEhr.attachments.length} attachments`);
     
+    // Extract gender from Patient resource
+    const patientResource = (fullEhr.fhir['Patient'] || [])[0];
+    const gender = patientResource?.gender || 'unknown';
+    
     // Get or create patient
     const patient = await getOrCreatePatient(sql, {
       firstName: config.patientFirstName,
-      lastName: config.patientLastName
+      lastName: config.patientLastName,
+      gender: gender
     });
     console.log(`👤 Patient ID: ${patient.id}`);
     
@@ -217,7 +222,7 @@ function extractPatientFhirId(fullEhr: ClientFullEHR): string {
   return patients[0].id;
 }
 
-async function getOrCreatePatient(sql: any, data: { firstName: string; lastName: string }) {
+async function getOrCreatePatient(sql: any, data: { firstName: string; lastName: string; gender?: string }) {
   // First, try to find existing patient
   const [existing] = await sql`
     SELECT id FROM patients 
@@ -227,17 +232,24 @@ async function getOrCreatePatient(sql: any, data: { firstName: string; lastName:
   
   if (existing) {
     console.log(`  Found existing patient: ${data.firstName} ${data.lastName}`);
+    // Update gender if provided
+    if (data.gender) {
+      await sql`
+        UPDATE patients SET gender = ${data.gender}
+        WHERE id = ${existing.id}
+      `;
+    }
     return existing;
   }
   
   // Create new patient if not found
   const [patient] = await sql`
-    INSERT INTO patients (first_name, last_name, family_role)
-    VALUES (${data.firstName}, ${data.lastName}, 'unknown')
+    INSERT INTO patients (first_name, last_name, family_role, gender)
+    VALUES (${data.firstName}, ${data.lastName}, 'unknown', ${data.gender || 'unknown'})
     RETURNING id
   `;
   
-  console.log(`  Created new patient: ${data.firstName} ${data.lastName}`);
+  console.log(`  Created new patient: ${data.firstName} ${data.lastName} (${data.gender || 'unknown'})`);
   return patient;
 }
 

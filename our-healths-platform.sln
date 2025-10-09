@@ -1,0 +1,32 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "api", "api", "{D82C56D6-B2CD-F611-9E31-04638F7EC30E}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "csharp", "csharp", "{450DFED7-3856-7E3A-477B-30DA08061629}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FamilyHealthApi", "api\csharp\FamilyHealthApi\FamilyHealthApi.csproj", "{6442FA0A-30F9-F958-BE80-64923A4DEF19}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6442FA0A-30F9-F958-BE80-64923A4DEF19}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6442FA0A-30F9-F958-BE80-64923A4DEF19}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6442FA0A-30F9-F958-BE80-64923A4DEF19}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6442FA0A-30F9-F958-BE80-64923A4DEF19}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{450DFED7-3856-7E3A-477B-30DA08061629} = {D82C56D6-B2CD-F611-9E31-04638F7EC30E}
+		{6442FA0A-30F9-F958-BE80-64923A4DEF19} = {450DFED7-3856-7E3A-477B-30DA08061629}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {E5EE7CD3-4507-4E27-AFBD-99800B802855}
+	EndGlobalSection
+EndGlobal

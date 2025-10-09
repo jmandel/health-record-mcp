@@ -46,7 +46,7 @@
     "disableClientChecks": true
   },
   "staticSession": {
-    "enabled": false,
-    "dbPath": ""
+    "enabled": true,
+    "dbPath": "./data/my_record.sqlite"
   }
 } 
