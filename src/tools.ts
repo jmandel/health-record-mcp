@@ -132,7 +132,7 @@ export const GrepRecordInputSchema = z.object({
 // --- Grep Output Schemas ---
 
 export const QueryRecordInputSchema = z.object({
-    sql: z.string().min(1).describe("The read-only SQL SELECT statement to execute against the in-memory FHIR data. FHIR resources are stored in the 'fhir_resources' table with columns 'resource_type', 'resource_id', and 'json'. For example, 'SELECT json FROM fhir_resources WHERE resource_type = \"Patient\"' or 'SELECT json FROM fhir_resources WHERE resource_type = \"Observation\" AND json LIKE \"%diabetes%\"'. Best for precisely selecting specific FHIR resources or fields using known structure (e.g., Observations by LOINC). Limited to structured FHIR data.")
+    sql: z.string().min(1).describe("The read-only SQL SELECT statement to execute against the in-memory FHIR data. FHIR resources are stored in the 'fhir_resources' table with columns 'resource_type', 'resource_id', 'json', and 'source' (the health system the record came from, e.g. \"Example Health\"; NULL if unlabeled). For example, 'SELECT json FROM fhir_resources WHERE resource_type = \"Patient\"' or 'SELECT json FROM fhir_resources WHERE resource_type = \"Observation\" AND json LIKE \"%diabetes%\"'. Best for precisely selecting specific FHIR resources or fields using known structure (e.g., Observations by LOINC). Limited to structured FHIR data.")
 });
 export const QueryRecordOutputSchema = z.union([
     z.array(z.record(z.unknown())).describe("An array of rows returned by the SQL query. Each row is an object where keys are column names."),

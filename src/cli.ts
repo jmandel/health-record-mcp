@@ -18,7 +18,7 @@ import { Implementation } from "@modelcontextprotocol/sdk/types.js"; // Import c
 
 // Corrected local module imports (assuming cli.ts is in src/)
 import { ClientFullEHR } from '../clientTypes.js'; // Assumes clientTypes.ts is in project root
-import { sqliteToEhr, ehrToSqlite } from './dbUtils.js'; // Assumes dbUtils.ts is in src/
+import { sqliteToEhr, ehrToSqlite, ensureSchema } from './dbUtils.js'; // Assumes dbUtils.ts is in src/
 import { AppConfig, loadConfig } from './config.ts'; // Import config loading and AppConfig type
 
 // --- Tool Schemas & Logic (Imported) ---
@@ -36,7 +36,8 @@ const SERVER_INFO: Implementation = { name: "EHR-Search-MCP-CLI", version: "0.1.
 
 async function startEhrFetchServer(
     dbPath: string,
-    serverConfig: AppConfig['server'] // Use the server part of AppConfig
+    serverConfig: AppConfig['server'], // Use the server part of AppConfig
+    source: string | null // Label recording which health system this pull came from
 ): Promise<void> {
     return new Promise(async (resolve, reject) => { // Make the outer function async for cert loading
         const app = express();
@@ -112,12 +113,11 @@ async function startEhrFetchServer(
                 }
                 console.error(`[Server] Received EHR data. Resource types: ${Object.keys(clientFullEhr.fhir).length}, Attachments: ${clientFullEhr.attachments.length}`);
 
-                // Check if DB file already exists
+                // resolveExistingDb() already decided whether an existing file is
+                // deleted or appended to, so only re-check for access problems here.
                  try {
                      await fs.access(dbPath);
-                     console.warn(`[Server] Warning: Output database file "${dbPath}" already exists. It will be overwritten.`);
-                     // Optionally delete it first if Database() doesn't overwrite cleanly
-                     // await fs.unlink(dbPath); 
+                     console.error(`[Server] Adding to existing database file "${dbPath}".`);
                  } catch (accessError: any) {
                      if (accessError.code !== 'ENOENT') {
                          throw new Error(`Cannot access target database path "${dbPath}": ${accessError.message}`);
@@ -132,7 +132,7 @@ async function startEhrFetchServer(
 
                 try {
                     console.error('[Server] Populating database...');
-                    await ehrToSqlite(clientFullEhr, db);
+                    await ehrToSqlite(clientFullEhr, db, source);
                     console.error(`[Server] Successfully saved EHR data to ${dbPath}`);
                     // Tell the retriever JS that the POST was successful.
                     // The retriever JS doesn't expect a redirect URL in this flow.
@@ -205,6 +205,133 @@ async function startEhrFetchServer(
     });
 }
 
+// --- Shared: decide what to do when the target DB file already exists ---
+// Used by both --create-db and --import-json. Exits the process on an
+// unrecoverable condition, otherwise returns once the path is ready to write.
+async function resolveExistingDb(
+    dbPath: string,
+    options: { forceOverwrite?: boolean; forceConcat?: boolean }
+): Promise<void> {
+    // Validate flag combination up front, so a contradictory invocation is rejected
+    // regardless of whether the target file happens to exist yet.
+    if (options.forceOverwrite && options.forceConcat) {
+        console.error('[CLI] Error: --force-overwrite and --force-concat cannot be used together.');
+        process.exit(1);
+    }
+
+    try {
+        await fs.access(dbPath); // Check if file exists (throws if not)
+        console.warn(`[CLI] Database file "${dbPath}" already exists.`);
+        if (options.forceOverwrite) {
+            console.warn(`[CLI] --force-overwrite specified. Deleting existing file: ${dbPath}`);
+            try {
+                await fs.unlink(dbPath);
+                console.error(`[CLI] Successfully deleted existing file.`);
+            } catch (unlinkError: any) {
+                console.error(`[CLI] Error deleting existing file "${dbPath}": ${unlinkError.message}`);
+                process.exit(1);
+            }
+        } else if (options.forceConcat) {
+            console.warn(`[CLI] --force-concat specified. New data will be added to the existing file.`);
+            // No action needed here, the database will be opened and appended to later.
+        } else {
+            console.error(`[CLI] Error: Database file "${dbPath}" already exists.`);
+            console.error('[CLI] Use --force-overwrite to delete it or --force-concat to add to it.');
+            process.exit(1);
+        }
+    } catch (accessError: any) {
+        if (accessError.code === 'ENOENT') {
+            // File doesn't exist, which is the normal case, proceed silently.
+            console.error(`[CLI] Database file "${dbPath}" does not exist, will be created.`);
+        } else {
+            // Other access error (e.g., permissions)
+            console.error(`[CLI] Error checking database path "${dbPath}": ${accessError.message}`);
+            process.exit(1);
+        }
+    }
+}
+
+// --- Shared: label pre-existing records that predate the `source` column ---
+// A database built before `source` existed holds records from a known health
+// system, but no record of which one. This stamps those rows in one pass so the
+// history is attributable alongside data ingested later. Only rows with a NULL
+// source are touched, so a database already holding several providers is safe.
+async function backfillSource(
+    dbPath: string,
+    options: { source?: string; backfillSource?: boolean }
+): Promise<void> {
+    if (!options.backfillSource) return;
+
+    if (!options.source) {
+        console.error('[CLI] Error: --backfill-source requires --source <name>.');
+        process.exit(1);
+    }
+
+    try {
+        await fs.access(dbPath);
+    } catch {
+        console.error('[CLI] --backfill-source specified but no existing database to backfill; skipping.');
+        return;
+    }
+
+    const db = new Database(dbPath);
+    try {
+        db.exec('BEGIN TRANSACTION;');
+        ensureSchema(db); // The column may not exist yet on an older file.
+        const resources = db.prepare('UPDATE fhir_resources SET source = ? WHERE source IS NULL').run(options.source).changes;
+        const attachments = db.prepare('UPDATE fhir_attachments SET source = ? WHERE source IS NULL').run(options.source).changes;
+        db.exec('COMMIT;');
+        console.error(`[CLI] Backfilled source="${options.source}" onto ${resources} resource(s) and ${attachments} attachment(s).`);
+    } catch (error: any) {
+        try { db.exec('ROLLBACK;'); } catch { /* nothing to roll back */ }
+        console.error(`[CLI] Error backfilling source: ${error.message}`);
+        process.exit(1);
+    } finally {
+        try { db.close(); } catch (e) { console.error('[CLI] Error closing DB:', e); }
+    }
+}
+
+// --- Function for --import-json mode ---
+// Reads a ClientFullEHR JSON file (as downloaded from the standalone SMART on FHIR
+// web client) and persists it to SQLite via the same ehrToSqlite path --create-db uses.
+async function importJsonToDb(jsonPath: string, dbPath: string, source: string | null): Promise<void> {
+    console.error(`[CLI] Reading ClientFullEHR JSON from: ${jsonPath}`);
+
+    let clientFullEhr: ClientFullEHR;
+    try {
+        const raw = await fs.readFile(jsonPath, 'utf-8');
+        clientFullEhr = JSON.parse(raw);
+    } catch (readError: any) {
+        if (readError.code === 'ENOENT') {
+            console.error(`[CLI] Error: JSON file not found at ${jsonPath}`);
+        } else {
+            console.error(`[CLI] Error reading or parsing "${jsonPath}": ${readError.message}`);
+        }
+        process.exit(1);
+    }
+
+    // Same shape check the /ehr-data endpoint performs; a truncated download should
+    // fail loudly here rather than produce a half-populated database.
+    if (!clientFullEhr || typeof clientFullEhr !== 'object' || !clientFullEhr.fhir || !clientFullEhr.attachments) {
+        console.error(`[CLI] Error: "${jsonPath}" is not a valid ClientFullEHR object (missing 'fhir' or 'attachments').`);
+        process.exit(1);
+    }
+
+    const resourceTypeCount = Object.keys(clientFullEhr.fhir).length;
+    const totalResources = Object.values(clientFullEhr.fhir).reduce((sum, arr) => sum + arr.length, 0);
+    console.error(`[CLI] Loaded EHR data. Resource types: ${resourceTypeCount}, Total resources: ${totalResources}, Attachments: ${clientFullEhr.attachments.length}`);
+
+    console.error(`[CLI] Initializing database at: ${dbPath}`);
+    const db = new Database(dbPath); // Bun automatically creates/opens
+    try {
+        console.error('[CLI] Populating database...');
+        await ehrToSqlite(clientFullEhr, db, source);
+        console.error(`[CLI] Successfully saved EHR data to ${dbPath}`);
+    } finally {
+        try { db.close(); } catch (e) { console.error('[CLI] Error closing DB:', e); }
+    }
+}
+
 // --- Main CLI Function ---
 async function main() {
     const program = new Command();
@@ -216,15 +343,35 @@ async function main() {
         .requiredOption('-d, --db <path>', 'Path to the SQLite database file (read for stdio mode, write for --create-db mode).')
         // Options for --create-db mode
         .option('--create-db', 'Initiate EHR fetch via browser UI and save to the --db path.')
+        // Import an already-downloaded ClientFullEHR JSON (e.g. from https://mcp.fhir.me/ehr-connect)
+        .option('--import-json <path>', 'Import a ClientFullEHR JSON file into the --db path.')
         .option('-c, --config <path>', 'Optional path to config file (used by retriever build and server settings in --create-db mode).', './config.stdio.json') // Default config path
         // .option('--port <port>', 'Port for the temporary web server (for --create-db).', '8088') // Port now comes from config
         // Add new mutually exclusive flags for handling existing DB in --create-db mode
         .option('--force-overwrite', 'If --db exists in --create-db mode, delete it before creating a new one.')
         .option('--force-concat', 'If --db exists in --create-db mode, add new data to the existing file.')
+        .option('--source <name>', 'Label the ingested records with the health system they came from (e.g. "Example Health"). Stored in the "source" column of both tables.')
+        .option('--backfill-source', 'Before ingesting, stamp every record that currently has no source with the --source value. Use once on a database built before the source column existed.')
         .parse(process.argv);
 
     const options = program.opts();
     const dbPath = path.resolve(options.db);
+
+    if (options.importJson) {
+        // --- Import JSON Mode ---
+        console.error('[CLI] Running in --import-json mode.');
+
+        if (options.createDb) {
+            console.error('[CLI] Error: --import-json and --create-db cannot be used together.');
+            process.exit(1);
+        }
+
+        const jsonPath = path.resolve(options.importJson);
+        await resolveExistingDb(dbPath, options);
+        await backfillSource(dbPath, options);
+        await importJsonToDb(jsonPath, dbPath, options.source ?? null);
+        process.exit(0);
+    }
 
     if (options.createDb) {
         // --- Create DB Mode ---
@@ -257,39 +404,8 @@ async function main() {
         // }
 
         // --- Upfront check for existing DB file ---
-        try {
-            await fs.access(dbPath); // Check if file exists (throws if not)
-            console.warn(`[CLI] Database file "${dbPath}" already exists.`);
-            if (options.forceOverwrite && options.forceConcat) {
-                console.error('[CLI] Error: --force-overwrite and --force-concat cannot be used together.');
-                process.exit(1);
-            } else if (options.forceOverwrite) {
-                console.warn(`[CLI] --force-overwrite specified. Deleting existing file: ${dbPath}`);
-                try {
-                    await fs.unlink(dbPath);
-                    console.error(`[CLI] Successfully deleted existing file.`);
-                } catch (unlinkError: any) {
-                    console.error(`[CLI] Error deleting existing file "${dbPath}": ${unlinkError.message}`);
-                    process.exit(1);
-                }
-            } else if (options.forceConcat) {
-                console.warn(`[CLI] --force-concat specified. New data will be added to the existing file.`);
-                // No action needed here, the database will be opened and appended to later.
-            } else {
-                console.error(`[CLI] Error: Database file "${dbPath}" already exists.`);
-                console.error('[CLI] Use --force-overwrite to delete it or --force-concat to add to it.');
-                process.exit(1);
-            }
-        } catch (accessError: any) {
-            if (accessError.code === 'ENOENT') {
-                // File doesn't exist, which is the normal case, proceed silently.
-                console.error(`[CLI] Database file "${dbPath}" does not exist, will be created.`);
-            } else {
-                // Other access error (e.g., permissions)
-                console.error(`[CLI] Error checking database path "${dbPath}": ${accessError.message}`);
-                process.exit(1);
-            }
-        }
+        await resolveExistingDb(dbPath, options);
+        await backfillSource(dbPath, options);
         // --- End upfront check ---
 
         // --- Dynamically build ehretriever.ts for CLI mode ---
@@ -347,7 +463,7 @@ async function main() {
 
         try {
             // Pass dbPath and the loaded server configuration
-            await startEhrFetchServer(dbPath, appConfig.server);
+            await startEhrFetchServer(dbPath, appConfig.server, options.source ?? null);
             console.error(`[CLI] Successfully created database: ${dbPath}`);
             process.exit(0);
         } catch (error: any) {
