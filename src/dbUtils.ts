@@ -10,45 +10,91 @@ import { ClientFullEHR, ClientProcessedAttachment } from '../clientTypes';
  * @param db - An open SQLite database connection
  * @returns The same database instance after population
  */
-export async function ehrToSqlite(fullEhr: ClientFullEHR, db: Database): Promise<Database> {
-    console.log("[DB:POPULATE] Starting database population from FullEHR");
+/**
+ * Creates the schema on a fresh database and migrates an older one in place.
+ *
+ * Two things beyond the original schema:
+ *  - a `source` column on both tables, so records from different health systems
+ *    stay distinguishable once they share a file;
+ *  - a uniqueness constraint on attachments, so re-ingesting a provider updates
+ *    rather than duplicates. Any duplicates left behind by an earlier append are
+ *    collapsed (keeping the lowest rowid) before the index is built.
+ *
+ * Must be called inside a transaction.
+ */
+export function ensureSchema(db: Database): void {
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS fhir_resources (
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            json TEXT NOT NULL,
+            PRIMARY KEY (resource_type, resource_id)
+        );
+        
+        CREATE TABLE IF NOT EXISTS fhir_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            json TEXT NOT NULL,
+            content_raw BLOB,
+            content_plaintext TEXT,
+            FOREIGN KEY (resource_type, resource_id) REFERENCES fhir_resources(resource_type, resource_id)
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_fhir_resources_type ON fhir_resources(resource_type);
+        CREATE INDEX IF NOT EXISTS idx_fhir_attachments_resource ON fhir_attachments(resource_type, resource_id);
+    `);
+
+    // SQLite has no "ADD COLUMN IF NOT EXISTS", so check the table info first.
+    for (const table of ['fhir_resources', 'fhir_attachments']) {
+        const columns = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
+        if (!columns.some(c => c.name === 'source')) {
+            console.log(`[DB:SCHEMA] Adding 'source' column to ${table}`);
+            db.exec(`ALTER TABLE ${table} ADD COLUMN source TEXT`);
+        }
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_fhir_resources_source ON fhir_resources(source);`);
+
+    // Collapse pre-existing duplicates, otherwise the unique index cannot be built.
+    const removed = db.prepare(`
+        DELETE FROM fhir_attachments
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM fhir_attachments
+            GROUP BY resource_type, resource_id, path, content_type
+        )
+    `).run().changes;
+    if (removed > 0) {
+        console.log(`[DB:SCHEMA] Removed ${removed} duplicate attachment row(s) left by an earlier append`);
+    }
+
+    db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fhir_attachments_unique
+            ON fhir_attachments(resource_type, resource_id, path, content_type);
+    `);
+}
+
+export async function ehrToSqlite(fullEhr: ClientFullEHR, db: Database, source: string | null = null): Promise<Database> {
+    console.log(`[DB:POPULATE] Starting database population from FullEHR${source ? ` (source: ${source})` : ''}`);
     
     try {
         // Begin a transaction for better performance
         db.exec('BEGIN TRANSACTION;');
         
-        // Create tables if they don't exist
-        db.exec(`
-            CREATE TABLE IF NOT EXISTS fhir_resources (
-                resource_type TEXT NOT NULL,
-                resource_id TEXT NOT NULL,
-                json TEXT NOT NULL,
-                PRIMARY KEY (resource_type, resource_id)
-            );
-            
-            CREATE TABLE IF NOT EXISTS fhir_attachments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                resource_type TEXT NOT NULL,
-                resource_id TEXT NOT NULL,
-                path TEXT NOT NULL,
-                content_type TEXT NOT NULL,
-                json TEXT NOT NULL,
-                content_raw BLOB,
-                content_plaintext TEXT,
-                FOREIGN KEY (resource_type, resource_id) REFERENCES fhir_resources(resource_type, resource_id)
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_fhir_resources_type ON fhir_resources(resource_type);
-            CREATE INDEX IF NOT EXISTS idx_fhir_attachments_resource ON fhir_attachments(resource_type, resource_id);
-        `);
+        // Create the schema on a fresh file, or migrate an existing one, before
+        // preparing any statements against it.
+        ensureSchema(db);
         
         // Prepare statements for better performance
         const insertResourceStmt = db.prepare(
-            'INSERT OR REPLACE INTO fhir_resources (resource_type, resource_id, json) VALUES (?, ?, ?)'
+            'INSERT OR REPLACE INTO fhir_resources (resource_type, resource_id, json, source) VALUES (?, ?, ?, ?)'
         );
         
+        // OR IGNORE plus the unique index makes re-ingesting a provider idempotent:
+        // an attachment already on file is left alone instead of duplicated.
         const insertAttachmentStmt = db.prepare(
-            'INSERT INTO fhir_attachments (resource_type, resource_id, path, content_type, json, content_raw, content_plaintext) VALUES (?, ?, ?, ?, ?, ?, ?)'
+            'INSERT OR IGNORE INTO fhir_attachments (resource_type, resource_id, path, content_type, json, content_raw, content_plaintext, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
         );
         
         // Insert FHIR resources
@@ -56,7 +102,7 @@ export async function ehrToSqlite(fullEhr: ClientFullEHR, db: Database): Promise
         for (const [resourceType, resources] of Object.entries(fullEhr.fhir)) {
             for (const resource of resources) {
                 if (resource && resource.id) {
-                    insertResourceStmt.run(resourceType, resource.id, JSON.stringify(resource));
+                    insertResourceStmt.run(resourceType, resource.id, JSON.stringify(resource), source);
                     resourceCount++;
                 }
             }
@@ -66,19 +112,21 @@ export async function ehrToSqlite(fullEhr: ClientFullEHR, db: Database): Promise
         // Insert attachments
         if (fullEhr.attachments && fullEhr.attachments.length > 0) {
             let attachmentCount = 0;
+            let skippedCount = 0;
             for (const attachment of fullEhr.attachments) {
-                insertAttachmentStmt.run(
+                const { changes } = insertAttachmentStmt.run(
                     attachment.resourceType,
                     attachment.resourceId,
                     attachment.path,
                     attachment.contentType,
                     attachment.json,
                     attachment.contentBase64,
-                    attachment.contentPlaintext
+                    attachment.contentPlaintext,
+                    source
                 );
-                attachmentCount++;
+                if (changes > 0) attachmentCount++; else skippedCount++;
             }
-            console.log(`[DB:POPULATE] Inserted ${attachmentCount} attachments`);
+            console.log(`[DB:POPULATE] Inserted ${attachmentCount} attachments${skippedCount > 0 ? ` (${skippedCount} already present, skipped)` : ''}`);
         } else {
             console.log('[DB:POPULATE] No attachments to insert');
         }
